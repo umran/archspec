@@ -1,11 +1,11 @@
+pub mod idempotency;
 pub mod input;
 pub mod output;
-pub mod side_effect;
 pub mod transaction;
 
+pub use idempotency::*;
 pub use input::*;
 pub use output::*;
-pub use side_effect::*;
 pub use transaction::*;
 
 use std::collections::BTreeMap;
@@ -21,7 +21,6 @@ pub struct Operation {
     pub inputs: BTreeMap<Id, Input>,
     pub outputs: BTreeMap<Id, Output>,
     pub transactions: BTreeMap<Id, Transaction>,
-    pub side_effects: BTreeMap<Id, SideEffect>,
 
     pub requirements: OperationRequirements,
     pub execution: ExecutionSemantics,
@@ -31,6 +30,7 @@ pub struct Operation {
 pub struct OperationRequirements {
     pub serialization: Vec<SerializationRequirement>,
     pub ordering: Vec<OrderingRequirement>,
+    pub idempotency: Vec<IdempotencyRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,10 +43,22 @@ pub struct OrderingRequirement {
     pub key: ValueRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRequirement {
+    pub key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueRef {
-    pub input: Id,
+    pub source: ValueSource,
     pub path: FieldPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueSource {
+    Input(Id),
+    Output(Id),
+    DataObject(Id),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

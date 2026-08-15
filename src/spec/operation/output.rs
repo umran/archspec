@@ -1,10 +1,11 @@
-use crate::spec::Id;
+use crate::spec::{Id, IdempotencyGuarantee, IdempotencyKeyPropagation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
     Response(ResponseOutput),
     Publication(PublicationOutput),
     Request(RequestOutput),
+    External(ExternalOutput),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,8 @@ pub struct ResponseOutput {
 pub struct PublicationOutput {
     pub topic: Id,
     pub schema: Id,
+
+    pub idempotency_key_propagation: Vec<IdempotencyKeyPropagation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +33,8 @@ pub struct RequestOutput {
 
     /// Whether this invocation may be retried/repeated by the caller.
     pub retry: RetrySemantics,
+
+    pub idempotency_key_propagation: Vec<IdempotencyKeyPropagation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,4 +48,10 @@ pub enum RetrySemantics {
     Unspecified,
     Never,
     MayRepeat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalOutput {
+    pub name: String,
+    pub idempotency: IdempotencyGuarantee,
 }
