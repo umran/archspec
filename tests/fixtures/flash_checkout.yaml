@@ -407,15 +407,14 @@ operations:
       flow.create_order.new:
         steps:
         - kind: transaction
-          value: tx.create_order.new
+          transaction: tx.create_order.new
         - kind: execute_effect_intent
-          value:
-            intent: intent.create_order.publish_created
+          intent: intent.create_order.publish_created
         response: response.create_order
       flow.create_order.replay:
         steps:
         - kind: transaction
-          value: tx.create_order.replay
+          transaction: tx.create_order.replay
         response: response.create_order
     requirements:
       serialization: []
@@ -485,31 +484,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.reserve_inventory.created
-                      path:
-                      - warehouse_id
+                    source:
+                      kind: input
+                      id: input.reserve_inventory.created
+                    path:
+                    - warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.reserve_inventory.created
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.reserve_inventory.created
+                    path:
+                    - sku
           fields:
             kind: only
             fields:
@@ -520,31 +517,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.reserve_inventory.created
-                      path:
-                      - warehouse_id
+                    source:
+                      kind: input
+                      id: input.reserve_inventory.created
+                    path:
+                    - warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.reserve_inventory.created
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.reserve_inventory.created
+                    path:
+                    - sku
           fields:
           - - reserved
         - kind: establish_effect_intent
@@ -553,10 +548,9 @@ operations:
       flow.reserve_inventory:
         steps:
         - kind: transaction
-          value: tx.reserve_inventory
+          transaction: tx.reserve_inventory
         - kind: execute_effect_intent
-          value:
-            intent: intent.reserve_inventory.publish_reserved
+          intent: intent.reserve_inventory.publish_reserved
         response: null
     requirements:
       serialization:
@@ -635,11 +629,9 @@ operations:
       flow.charge_payment:
         steps:
         - kind: execute_effect
-          value:
-            effect: effect.charge_payment.card
+          effect: effect.charge_payment.card
         - kind: execute_effect
-          value:
-            effect: effect.charge_payment.publish_captured
+          effect: effect.charge_payment.publish_captured
         response: null
     requirements:
       serialization:
@@ -704,27 +696,25 @@ operations:
             object: object.order
             predicate:
               kind: eq
+              field:
+              - order_id
               value:
-                field:
-                - order_id
+                kind: value
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.cancel_order.request
-                    path:
-                    - order_id
+                  source:
+                    kind: input
+                    id: input.cancel_order.request
+                  path:
+                  - order_id
         - kind: establish_effect_intent
           intent: intent.cancel_order.publish_cancelled
     flows:
       flow.cancel_order:
         steps:
         - kind: transaction
-          value: tx.cancel_order
+          transaction: tx.cancel_order
         - kind: execute_effect_intent
-          value:
-            intent: intent.cancel_order.publish_cancelled
+          intent: intent.cancel_order.publish_cancelled
         response: response.cancel_order
     requirements:
       serialization: []
@@ -766,22 +756,21 @@ operations:
             object: object.order
             predicate:
               kind: eq
+              field:
+              - order_id
               value:
-                field:
-                - order_id
+                kind: value
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.apply_payment.captured
-                    path:
-                    - order_id
+                  source:
+                    kind: input
+                    id: input.apply_payment.captured
+                  path:
+                  - order_id
     flows:
       flow.apply_payment:
         steps:
         - kind: transaction
-          value: tx.apply_payment
+          transaction: tx.apply_payment
         response: null
     requirements:
       serialization:
@@ -836,31 +825,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - source_warehouse_id
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - source_warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - sku
           mode: exclusive
           order:
             kind: unspecified
@@ -869,31 +856,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - destination_warehouse_id
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - destination_warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - sku
           mode: exclusive
           order:
             kind: unspecified
@@ -902,31 +887,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - source_warehouse_id
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - source_warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - sku
           fields:
             kind: only
             fields:
@@ -936,31 +919,29 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - source_warehouse_id
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - source_warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - sku
           fields:
           - - on_hand
         - kind: write
@@ -968,38 +949,36 @@ operations:
             object: object.stock
             predicate:
               kind: and
-              value:
+              predicates:
               - kind: eq
+                field:
+                - warehouse_id
                 value:
-                  field:
-                  - warehouse_id
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - destination_warehouse_id
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - destination_warehouse_id
               - kind: eq
+                field:
+                - sku
                 value:
-                  field:
-                  - sku
+                  kind: value
                   value:
-                    kind: value
-                    value:
-                      source:
-                        kind: input
-                        id: input.transfer_stock.request
-                      path:
-                      - sku
+                    source:
+                      kind: input
+                      id: input.transfer_stock.request
+                    path:
+                    - sku
           fields:
           - - on_hand
     flows:
       flow.transfer_stock:
         steps:
         - kind: transaction
-          value: tx.transfer_stock
+          transaction: tx.transfer_stock
         response: response.transfer_stock
     requirements:
       serialization: []
