@@ -1,26 +1,51 @@
+pub mod effect;
+pub mod effect_intent;
+pub mod flow;
 pub mod idempotency;
 pub mod input;
-pub mod output;
+pub mod invocation_result;
+pub mod response;
+pub mod state_machine;
 pub mod transaction;
+pub mod value;
 
+pub use effect::*;
+pub use effect_intent::*;
+pub use flow::*;
 pub use idempotency::*;
 pub use input::*;
-pub use output::*;
+pub use invocation_result::*;
+pub use response::*;
+pub use state_machine::*;
 pub use transaction::*;
+pub use value::*;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
-use super::{FieldPath, Id};
+use super::Id;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
     pub service: Id,
     pub description: Option<String>,
 
     pub inputs: BTreeMap<Id, Input>,
-    pub outputs: BTreeMap<Id, Output>,
+
+    /// Logical effects available to this operation.
+    /// Declaration alone does not imply execution.
+    pub effects: BTreeMap<Id, Effect>,
+
+    /// Durable-effect-intent declarations available to this operation.
+    pub effect_intents: BTreeMap<Id, EffectIntent>,
+
+    pub invocation_results: BTreeMap<Id, InvocationResult>,
+    pub responses: BTreeMap<Id, Response>,
+
+    /// Atomic units reusable by invocation flows.
     pub transactions: BTreeMap<Id, Transaction>,
+
+    /// Alternative valid terminal invocation paths.
+    pub flows: BTreeMap<Id, InvocationFlow>,
 
     pub requirements: OperationRequirements,
     pub execution: ExecutionSemantics,
@@ -46,19 +71,13 @@ pub struct OrderingRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyRequirement {
     pub key: IdempotencyKey,
+    pub response: ResponseReplayRequirement,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValueRef {
-    pub source: ValueSource,
-    pub path: FieldPath,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValueSource {
-    Input(Id),
-    Output(Id),
-    DataObject(Id),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseReplayRequirement {
+    Unspecified,
+    ReplayConsistent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

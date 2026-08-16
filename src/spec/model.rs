@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::spec::StateMachine;
+
 use super::{DataModel, Id, Operation, Schema, Service, Topic};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
     pub revision: Revision,
 
@@ -10,6 +11,8 @@ pub struct Model {
     pub schemas: BTreeMap<Id, Schema>,
     pub data_models: BTreeMap<Id, DataModel>,
     pub topics: BTreeMap<Id, Topic>,
+
+    pub state_machines: BTreeMap<Id, StateMachine>,
     pub operations: BTreeMap<Id, Operation>,
 }
 
