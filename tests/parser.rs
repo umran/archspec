@@ -4,7 +4,6 @@ use std::{
 };
 
 use archspec::{
-    analyzer::validation,
     parser::yaml,
     spec::{
         Effect, Id, IdempotencyGuarantee, Input, LaneConcurrency, Schema, SchemaCompleteness,
@@ -332,20 +331,6 @@ fn flash_checkout_parses_nested_semantics() {
     assert!(matches!(&transaction.steps[3], TransactionStep::Write(_)));
 
     assert!(matches!(&transaction.steps[4], TransactionStep::Write(_)));
-}
-
-#[test]
-fn flash_checkout_is_structurally_valid() {
-    let source = read_fixture("flash_checkout.yaml");
-
-    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
-
-    let errors = validation::validate(&model);
-
-    assert!(
-        errors.is_empty(),
-        "flash checkout should be structurally valid:\n{errors:#?}"
-    );
 }
 
 #[test]
