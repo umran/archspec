@@ -1,23 +1,24 @@
-use std::fmt;
-
-use crate::analysis::{Diagnostic, DiagnosticCode, Evidence, Severity, ValidationCode};
+use crate::analysis::{
+    Diagnostic, DiagnosticCode, Evidence, IdDeclaration, Severity, ValidationCode,
+};
 use crate::spec::{FieldPath, Id};
+
+use super::{InputKind, ReferenceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    /// The same globally unique ID was assigned to more than
-    /// one addressable model entity.
-    DuplicateId { id: Id },
+    DuplicateId {
+        id: Id,
+        first: IdDeclaration,
+        second: IdDeclaration,
+    },
 
-    /// A reference does not resolve to any model entity.
     UnknownReference {
         subject: Id,
         reference: Id,
         expected: ReferenceKind,
     },
 
-    /// The referenced ID exists, but identifies the wrong
-    /// kind of model entity.
     InvalidReferenceKind {
         subject: Id,
         reference: Id,
@@ -25,57 +26,79 @@ pub enum ValidationError {
         actual: ReferenceKind,
     },
 
-    /// A field path cannot be resolved against the schema
-    /// against which it was declared.
+    InvalidReferenceOwner {
+        subject: Id,
+        reference: Id,
+        expected_owner: Id,
+        actual_owner: Option<Id>,
+    },
+
     InvalidFieldPath {
         subject: Id,
         schema: Id,
         path: FieldPath,
     },
 
-    /// Schema-fragment derivation contains a cycle.
-    FragmentCycle { cycle: Vec<Id> },
-
-    /// Persistent data objects must use canonical schemas.
-    DataObjectSchemaNotCanonical { object: Id, schema: Id },
-
-    /// A subscription selects a schema that the referenced
-    /// topic does not carry.
-    SubscriptionMessageNotOnTopic { input: Id, topic: Id, schema: Id },
-
-    /// A publication emits a schema not declared as a message
-    /// of its target topic.
-    PublicationMessageNotOnTopic { output: Id, topic: Id, schema: Id },
-
-    /// A globally valid input exists, but does not belong to
-    /// the operation through which it was referenced.
-    InputNotOwnedByOperation {
-        subject: Id,
-        operation: Id,
-        input: Id,
+    FragmentCycle {
+        cycle: Vec<Id>,
     },
 
-    /// A transaction may only operate on objects belonging to
-    /// its declared data-model boundary.
+    DataObjectSchemaNotCanonical {
+        object: Id,
+        schema: Id,
+    },
+
+    SubscriptionMessageNotOnTopic {
+        input: Id,
+        topic: Id,
+        schema: Id,
+    },
+
+    PublicationEffectMessageNotOnTopic {
+        effect: Id,
+        topic: Id,
+        schema: Id,
+    },
+
     TransactionObjectOutsideDataModel {
         transaction: Id,
         data_model: Id,
         object: Id,
+    },
+
+    InvalidInputKind {
+        subject: Id,
+        input: Id,
+        expected: InputKind,
+        actual: InputKind,
     },
 }
 
 impl From<ValidationError> for Diagnostic {
     fn from(error: ValidationError) -> Self {
         match error {
-            ValidationError::DuplicateId { id } => {
-                let message = format!("ID `{id}` is declared more than once.");
+            ValidationError::DuplicateId { id, first, second } => {
+                let first_subject = first.owner.clone().or_else(|| Some(id.clone()));
+
+                let second_subject = second.owner.clone().or_else(|| Some(id.clone()));
 
                 Diagnostic {
                     code: DiagnosticCode::Validation(ValidationCode::DuplicateId),
                     severity: Severity::Error,
-                    subject: Some(id),
-                    message,
-                    evidence: vec![],
+                    subject: Some(id.clone()),
+                    message: format!(
+                        "ID `{id}` is declared more than once in the global model namespace."
+                    ),
+                    evidence: vec![
+                        Evidence {
+                            subject: first_subject,
+                            message: first.describe(),
+                        },
+                        Evidence {
+                            subject: second_subject,
+                            message: second.describe(),
+                        },
+                    ],
                 }
             }
 
@@ -204,50 +227,6 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
-            ValidationError::PublicationMessageNotOnTopic {
-                output,
-                topic,
-                schema,
-            } => {
-                let message = format!(
-                    "Publication output `{output}` publishes schema `{schema}` \
-                     to topic `{topic}`, but the topic does not carry that schema."
-                );
-
-                Diagnostic {
-                    code: DiagnosticCode::Validation(ValidationCode::PublicationMessageNotOnTopic),
-                    severity: Severity::Error,
-                    subject: Some(output),
-                    message,
-                    evidence: vec![Evidence {
-                        subject: Some(topic),
-                        message: format!("Topic does not declare schema `{schema}` as a message."),
-                    }],
-                }
-            }
-
-            ValidationError::InputNotOwnedByOperation {
-                subject,
-                operation,
-                input,
-            } => {
-                let message = format!(
-                    "`{subject}` references input `{input}` through operation \
-                     `{operation}`, but that input belongs to a different operation."
-                );
-
-                Diagnostic {
-                    code: DiagnosticCode::Validation(ValidationCode::InputNotOwnedByOperation),
-                    severity: Severity::Error,
-                    subject: Some(subject),
-                    message,
-                    evidence: vec![Evidence {
-                        subject: Some(input),
-                        message: format!("This input is not owned by operation `{operation}`."),
-                    }],
-                }
-            }
-
             ValidationError::TransactionObjectOutsideDataModel {
                 transaction,
                 data_model,
@@ -271,39 +250,75 @@ impl From<ValidationError> for Diagnostic {
                     }],
                 }
             }
+
+            ValidationError::InvalidInputKind {
+                subject,
+                input,
+                expected,
+                actual,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::InvalidInputKind),
+                severity: Severity::Error,
+                subject: Some(subject),
+                message: format!("`{input}` is referenced as a {expected}, but it is a {actual}."),
+                evidence: vec![Evidence {
+                    subject: Some(input),
+                    message: format!("Expected {expected}, found {actual}."),
+                }],
+            },
+
+            ValidationError::InvalidReferenceOwner {
+                subject,
+                reference,
+                expected_owner,
+                actual_owner,
+            } => {
+                let actual = match &actual_owner {
+                    Some(owner) => {
+                        format!("`{owner}`")
+                    }
+
+                    None => "no owner".to_string(),
+                };
+
+                Diagnostic {
+                    code: DiagnosticCode::Validation(ValidationCode::InvalidReferenceOwner),
+                    severity: Severity::Error,
+                    subject: Some(subject),
+                    message: format!(
+                        "`{reference}` is referenced through `{expected_owner}`, \
+             but is not owned by it."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(reference),
+                        message: format!("Expected owner `{expected_owner}`, found {actual}."),
+                    }],
+                }
+            }
+
+            ValidationError::PublicationEffectMessageNotOnTopic {
+                effect,
+                topic,
+                schema,
+            } => {
+                let message = format!(
+                    "Publication effect `{effect}` publishes schema `{schema}` \
+         to topic `{topic}`, but the topic does not carry that schema."
+                );
+
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::PublicationEffectMessageNotOnTopic,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(effect),
+                    message,
+                    evidence: vec![Evidence {
+                        subject: Some(topic),
+                        message: format!("Topic does not declare schema `{schema}` as a message."),
+                    }],
+                }
+            }
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReferenceKind {
-    Service,
-    Schema,
-    DataModel,
-    DataObject,
-    Topic,
-    Operation,
-    Input,
-    Output,
-    SideEffect,
-    Transaction,
-}
-
-impl fmt::Display for ReferenceKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Service => "service",
-            Self::Schema => "schema",
-            Self::DataModel => "data model",
-            Self::DataObject => "data object",
-            Self::Topic => "topic",
-            Self::Operation => "operation",
-            Self::Input => "input",
-            Self::Output => "output",
-            Self::SideEffect => "side effect",
-            Self::Transaction => "transaction",
-        };
-
-        f.write_str(name)
     }
 }

@@ -43,11 +43,17 @@ pub enum ValidationCode {
     DuplicateId,
     UnknownReference,
     InvalidReferenceKind,
+    InvalidReferenceOwner,
+
     InvalidFieldPath,
     FragmentCycle,
+
     DataObjectSchemaNotCanonical,
+
     SubscriptionMessageNotOnTopic,
-    PublicationMessageNotOnTopic,
-    InputNotOwnedByOperation,
+    PublicationEffectMessageNotOnTopic,
+
     TransactionObjectOutsideDataModel,
+
+    InvalidInputKind,
 }
