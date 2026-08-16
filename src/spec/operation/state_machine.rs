@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::spec::{FieldPath, Id, PublicationEffect, RequestEffect};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateMachine {
     pub subject: StateMachineSubject,
 
@@ -12,7 +15,8 @@ pub struct StateMachine {
     pub transitions: BTreeMap<Id, Transition>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateMachineSubject {
     Object {
         object: Id,
@@ -23,7 +27,8 @@ pub enum StateMachineSubject {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transition {
     pub from: BTreeSet<Id>,
     pub to: Id,
@@ -31,7 +36,8 @@ pub struct Transition {
     pub side_effects: BTreeMap<Id, TransitionSideEffect>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransitionSideEffect {
     Publication(PublicationEffect),
     Request(RequestEffect),

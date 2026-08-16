@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::spec::Id;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InvocationFlow {
     pub steps: Vec<FlowStep>,
 
@@ -9,7 +12,8 @@ pub struct InvocationFlow {
     pub response: Option<Id>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum FlowStep {
     Transaction(Id),
 
@@ -21,12 +25,14 @@ pub enum FlowStep {
     ExecuteEffectIntent(ExecuteEffectIntent),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteEffect {
     pub effect: Id,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteEffectIntent {
     pub intent: Id,
 }

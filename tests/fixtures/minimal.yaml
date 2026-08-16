@@ -1,0 +1,36 @@
+revision: 1
+
+services:
+    checkout:
+        kind: backend
+
+schemas:
+    OrderCreated:
+        kind: canonical
+        description: An order accepted by checkout.
+        completeness: complete
+        fields:
+            order_id:
+                ty:
+                    kind: scalar
+                    value: uuid
+                optional: false
+
+            quantity:
+                ty:
+                    kind: scalar
+                    value: int
+                optional: false
+
+data_models: {}
+
+topics:
+    order_events:
+        messages:
+            - OrderCreated
+        ordering:
+            kind: unordered
+
+state_machines: {}
+
+operations: {}

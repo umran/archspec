@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::spec::StateMachine;
 
 use super::{DataModel, Id, Operation, Schema, Service, Topic};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub revision: Revision,
 
@@ -16,5 +20,6 @@ pub struct Model {
     pub operations: BTreeMap<Id, Operation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Revision(pub u64);

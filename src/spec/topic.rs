@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::{FieldPath, Id};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Topic {
     /// Schemas that may be published to this topic.
     pub messages: BTreeSet<Id>,
@@ -11,7 +14,8 @@ pub struct Topic {
     pub ordering: TopicOrdering,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TopicOrdering {
     /// The model does not provide enough information about ordering.
     Unspecified,
@@ -27,7 +31,8 @@ pub enum TopicOrdering {
     Keyed(TopicKey),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TopicKey {
     /// For each message schema carried by the topic, identifies the
     /// field representing this topic's logical ordering key.

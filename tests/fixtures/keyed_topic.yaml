@@ -1,0 +1,56 @@
+revision: 2
+
+services:
+    checkout:
+        kind: backend
+
+    payments:
+        kind: worker
+
+schemas:
+    OrderEvent:
+        kind: canonical
+        description: A lifecycle event associated with an order.
+        completeness: complete
+        fields:
+            order_id:
+                ty:
+                    kind: scalar
+                    value: uuid
+                optional: false
+
+            event_id:
+                ty:
+                    kind: scalar
+                    value: uuid
+                optional: false
+
+            event_type:
+                ty:
+                    kind: scalar
+                    value: string
+                optional: false
+
+    OrderIdentity:
+        kind: fragment
+        source: OrderEvent
+        mapping:
+            order_id:
+                - order_id
+
+data_models: {}
+
+topics:
+    order_events:
+        messages:
+            - OrderEvent
+
+        ordering:
+            kind: keyed
+            mapping:
+                OrderEvent:
+                    - order_id
+
+state_machines: {}
+
+operations: {}

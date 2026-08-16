@@ -1,0 +1,15 @@
+revision: 1
+
+services:
+    checkout:
+        kind: definitely_not_a_service
+
+schemas: {}
+
+data_models: {}
+
+topics: {}
+
+state_machines: {}
+
+operations: {}

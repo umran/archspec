@@ -1,4 +1,4 @@
-use crate::{analysis::ReferenceKind, spec::Id};
+use crate::{analyzer::ReferenceKind, spec::Id};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdDeclaration {

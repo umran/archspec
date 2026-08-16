@@ -1,12 +1,16 @@
+use serde::{Deserialize, Serialize};
+
 use crate::spec::{FieldPath, Id};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueRef {
     pub source: ValueSource,
     pub path: FieldPath,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum ValueSource {
     Input(Id),
 

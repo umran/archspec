@@ -16,6 +16,7 @@ pub use idempotency::*;
 pub use input::*;
 pub use invocation_result::*;
 pub use response::*;
+use serde::{Deserialize, Serialize};
 pub use state_machine::*;
 pub use transaction::*;
 pub use value::*;
@@ -25,6 +26,8 @@ use std::num::NonZeroU32;
 
 use super::Id;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Operation {
     pub service: Id,
     pub description: Option<String>,
@@ -51,41 +54,48 @@ pub struct Operation {
     pub execution: ExecutionSemantics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRequirements {
     pub serialization: Vec<SerializationRequirement>,
     pub ordering: Vec<OrderingRequirement>,
     pub idempotency: Vec<IdempotencyRequirement>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerializationRequirement {
     pub key: ValueRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderingRequirement {
     pub key: ValueRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdempotencyRequirement {
     pub key: IdempotencyKey,
     pub response: ResponseReplayRequirement,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseReplayRequirement {
     Unspecified,
     ReplayConsistent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionSemantics {
     pub concurrency: OperationConcurrency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum OperationConcurrency {
     Unspecified,
 

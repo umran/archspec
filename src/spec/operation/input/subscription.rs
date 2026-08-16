@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
+use serde::{Deserialize, Serialize};
+
 use crate::spec::Id;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionInput {
     /// Topic from which this subscription receives messages.
     pub topic: Id,
@@ -18,7 +21,8 @@ pub struct SubscriptionInput {
     pub dispatch: DispatchSemantics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum MessageSelector {
     /// Consume every message schema declared by the topic.
     All,
@@ -27,7 +31,8 @@ pub enum MessageSelector {
     Only(BTreeSet<Id>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliverySemantics {
     /// The specification does not provide enough information
     /// to determine duplicate/loss behaviour.
@@ -44,7 +49,8 @@ pub enum DeliverySemantics {
     AtLeastOnce,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DispatchSemantics {
     /// How deliveries are grouped into logical execution lanes.
     pub routing: DispatchRouting,
@@ -53,7 +59,8 @@ pub struct DispatchSemantics {
     pub lane_concurrency: LaneConcurrency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchRouting {
     /// The mapping from deliveries to execution lanes is unknown.
     Unspecified,
@@ -70,7 +77,8 @@ pub enum DispatchRouting {
     ByTopicKey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum LaneConcurrency {
     /// No concurrency fact has been declared.
     Unspecified,

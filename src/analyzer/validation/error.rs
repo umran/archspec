@@ -1,4 +1,4 @@
-use crate::analysis::{
+use crate::analyzer::{
     Diagnostic, DiagnosticCode, Evidence, IdDeclaration, Severity, ValidationCode,
 };
 use crate::spec::{FieldPath, Id};

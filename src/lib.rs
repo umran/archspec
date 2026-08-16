@@ -1,4 +1,5 @@
-pub mod analysis;
+pub mod analyzer;
+pub mod parser;
 pub mod spec;
 
 pub fn run() {
