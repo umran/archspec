@@ -46,6 +46,8 @@ pub enum ValidationCode {
     InvalidReferenceOwner,
 
     InvalidFieldPath,
+    ValueSourceHasNoSchema,
+
     FragmentCycle,
 
     DataObjectSchemaNotCanonical,
@@ -53,7 +55,15 @@ pub enum ValidationCode {
     SubscriptionMessageNotOnTopic,
     PublicationEffectMessageNotOnTopic,
 
+    TopicKeySchemaNotOnTopic,
+    TopicKeyMissingSchema,
+
     TransactionObjectOutsideDataModel,
+    TransactionMissingDataModel,
+
+    StateTransitionSubjectMismatch,
+
+    ResponseInvocationResultSchemaMismatch,
 
     InvalidInputKind,
 }

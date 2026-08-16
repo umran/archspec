@@ -25,14 +25,14 @@ impl std::fmt::Display for InputKind {
     }
 }
 
+struct ReferenceIndex<'a> {
+    entries: BTreeMap<Id, ReferenceInfo<'a>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReferenceInfo<'a> {
     kind: ReferenceKind,
     owner: Option<&'a Id>,
-}
-
-struct ReferenceIndex<'a> {
-    entries: BTreeMap<Id, ReferenceInfo<'a>>,
 }
 
 impl<'a> ReferenceIndex<'a> {
@@ -52,40 +52,39 @@ impl<'a> ReferenceIndex<'a> {
 }
 
 pub fn validate(model: &Model) -> Vec<ValidationError> {
-    // 1. Establish an unambiguous global namespace.
     let errors = validate_global_id_uniqueness(model);
 
     if !errors.is_empty() {
         return errors;
     }
 
-    // 2. Build an index over the now-unambiguous namespace.
     let index = ReferenceIndex::build(model);
 
-    // 3. Ensure all references resolve to valid entity kinds
-    //    with the required ownership relationships.
-    // let errors = validate_references(model, &index);
+    let errors = validate_references(model, &index);
 
-    // if !errors.is_empty() {
-    //     return errors;
-    // }
+    if !errors.is_empty() {
+        return errors;
+    }
 
-    // // 4. Ensure schema derivation itself is well-founded.
-    // let errors = validate_fragment_cycles(model);
+    let errors = validate_fragment_cycles(model);
 
-    // if !errors.is_empty() {
-    //     return errors;
-    // }
+    if !errors.is_empty() {
+        return errors;
+    }
 
-    // // 5. Validate structural invariants that rely on valid refs.
-    // let mut errors = Vec::new();
+    let mut errors = Vec::new();
 
-    // errors.extend(validate_data_models(model));
-    // errors.extend(validate_topics(model));
-    // errors.extend(validate_state_machines(model, &index));
-    // errors.extend(validate_transactions(model, &index));
-    // errors.extend(validate_responses(model));
-    // errors.extend(validate_field_paths(model, &index));
+    errors.extend(validate_data_models(model));
+
+    errors.extend(validate_topics(model));
+
+    errors.extend(validate_state_machines(model));
+
+    errors.extend(validate_transactions(model, &index));
+
+    errors.extend(validate_responses(model));
+
+    errors.extend(validate_field_paths(model, &index));
 
     errors
 }
@@ -115,6 +114,1481 @@ pub fn validate_global_id_uniqueness(model: &Model) -> Vec<ValidationError> {
     });
 
     errors
+}
+
+fn validate_references(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    validate_schema_references(model, index, &mut errors);
+
+    validate_data_model_references(model, index, &mut errors);
+
+    validate_topic_references(model, index, &mut errors);
+
+    validate_state_machine_references(model, index, &mut errors);
+
+    validate_operation_references(model, index, &mut errors);
+
+    errors
+}
+
+fn validate_fragment_cycles(model: &Model) -> Vec<ValidationError> {
+    use std::collections::BTreeSet;
+
+    let mut errors = Vec::new();
+    let mut complete = BTreeSet::<Id>::new();
+
+    for start in model.schemas.keys() {
+        if complete.contains(start) {
+            continue;
+        }
+
+        let mut path = Vec::<Id>::new();
+        let mut positions = BTreeMap::<Id, usize>::new();
+
+        let mut current = start.clone();
+
+        loop {
+            if complete.contains(&current) {
+                break;
+            }
+
+            if let Some(position) = positions.get(&current).copied() {
+                let mut cycle = path[position..].to_vec();
+
+                cycle.push(current.clone());
+
+                errors.push(ValidationError::FragmentCycle { cycle });
+
+                break;
+            }
+
+            let Some(Schema::Fragment(fragment)) = model.schemas.get(&current) else {
+                break;
+            };
+
+            positions.insert(current.clone(), path.len());
+
+            path.push(current.clone());
+            current = fragment.source.clone();
+        }
+
+        complete.extend(path);
+    }
+
+    errors
+}
+
+fn validate_data_models(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for data_model in model.data_models.values() {
+        for (object_id, object) in &data_model.objects {
+            if !matches!(
+                model.schemas.get(&object.schema),
+                Some(Schema::Canonical(_))
+            ) {
+                errors.push(ValidationError::DataObjectSchemaNotCanonical {
+                    object: object_id.clone(),
+                    schema: object.schema.clone(),
+                });
+            }
+        }
+    }
+
+    errors
+}
+
+fn validate_topics(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    validate_subscription_topic_membership(model, &mut errors);
+
+    validate_publication_topic_membership(model, &mut errors);
+
+    validate_topic_ordering_shape(model, &mut errors);
+
+    errors
+}
+
+fn validate_state_machines(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for operation in model.operations.values() {
+        for (transaction_id, transaction) in &operation.transactions {
+            for step in &transaction.steps {
+                let TransactionStep::Transition(step) = step else {
+                    continue;
+                };
+
+                let machine = model
+                    .state_machines
+                    .get(&step.machine)
+                    .expect("references already validated");
+
+                let expected_object = match &machine.subject {
+                    StateMachineSubject::Object { object, .. } => object,
+                };
+
+                if &step.subject.object != expected_object {
+                    errors.push(ValidationError::StateTransitionSubjectMismatch {
+                        transaction: transaction_id.clone(),
+                        machine: step.machine.clone(),
+                        expected_object: expected_object.clone(),
+                        actual_object: step.subject.object.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for operation in model.operations.values() {
+        for (transaction_id, transaction) in &operation.transactions {
+            for step in &transaction.steps {
+                match step {
+                    TransactionStep::Read(read) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &read.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Write(write) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &write.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Insert(insert) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &insert.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Delete(delete) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &delete.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Lock(lock) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &lock.target.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::AcquireUniqueClaim(claim) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &claim.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::Transition(transition) => {
+                        validate_transaction_object(
+                            index,
+                            transaction_id,
+                            transaction,
+                            &transition.subject.object,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::EstablishEffectIntent(_)
+                    | TransactionStep::EstablishInvocationResult(_)
+                    | TransactionStep::ReadInvocationResult(_) => {}
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+fn validate_responses(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for operation in model.operations.values() {
+        for (response_id, response) in &operation.responses {
+            let ResponseSource::InvocationResult { result: result_id } = &response.source else {
+                continue;
+            };
+
+            let result = operation
+                .invocation_results
+                .get(result_id)
+                .expect("references already validated");
+
+            if response.schema != result.schema {
+                errors.push(ValidationError::ResponseInvocationResultSchemaMismatch {
+                    response: response_id.clone(),
+                    response_schema: response.schema.clone(),
+                    result: result_id.clone(),
+                    result_schema: result.schema.clone(),
+                });
+            }
+        }
+    }
+
+    errors
+}
+
+// Validate Field Paths
+
+fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // Schema fragments.
+    for (schema_id, schema) in &model.schemas {
+        let Schema::Fragment(fragment) = schema else {
+            continue;
+        };
+
+        for path in fragment.mapping.values() {
+            validate_schema_path(model, schema_id, &fragment.source, path, &mut errors);
+        }
+    }
+
+    // Data-object identities.
+    for data_model in model.data_models.values() {
+        for (object_id, object) in &data_model.objects {
+            for path in &object.identity {
+                validate_schema_path(model, object_id, &object.schema, path, &mut errors);
+            }
+        }
+    }
+
+    // Topic ordering fields.
+    for (topic_id, topic) in &model.topics {
+        let TopicOrdering::Keyed(key) = &topic.ordering else {
+            continue;
+        };
+
+        for (schema, path) in &key.mapping {
+            validate_schema_path(model, topic_id, schema, path, &mut errors);
+        }
+    }
+
+    // State-machine state fields.
+    for (machine_id, machine) in &model.state_machines {
+        match &machine.subject {
+            StateMachineSubject::Object { object, state } => {
+                validate_object_path(model, index, machine_id, object, state, &mut errors);
+            }
+        }
+    }
+
+    // Operations.
+    for (operation_id, operation) in &model.operations {
+        for requirement in &operation.requirements.serialization {
+            validate_value_ref_path(model, index, operation_id, &requirement.key, &mut errors);
+        }
+
+        for requirement in &operation.requirements.ordering {
+            validate_value_ref_path(model, index, operation_id, &requirement.key, &mut errors);
+        }
+
+        for requirement in &operation.requirements.idempotency {
+            validate_idempotency_key_paths(
+                model,
+                index,
+                operation_id,
+                &requirement.key,
+                &mut errors,
+            );
+        }
+
+        for (result_id, result) in &operation.invocation_results {
+            validate_idempotency_key_paths(model, index, result_id, &result.key, &mut errors);
+        }
+
+        for (effect_id, effect) in &operation.effects {
+            validate_effect_paths(model, index, effect_id, effect, &mut errors);
+        }
+
+        for (transaction_id, transaction) in &operation.transactions {
+            validate_transaction_paths(model, index, transaction_id, transaction, &mut errors);
+        }
+    }
+
+    // Transition-owned effects.
+    for machine in model.state_machines.values() {
+        for transition in machine.transitions.values() {
+            for (effect_id, effect) in &transition.side_effects {
+                validate_transition_effect_paths(model, index, effect_id, effect, &mut errors);
+            }
+        }
+    }
+
+    errors
+}
+
+fn validate_schema_path(
+    model: &Model,
+    subject: &Id,
+    schema: &Id,
+    path: &FieldPath,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !schema_path_resolves(model, schema, path) {
+        errors.push(ValidationError::InvalidFieldPath {
+            subject: subject.clone(),
+            schema: schema.clone(),
+            path: path.clone(),
+        });
+    }
+}
+
+fn validate_object_path(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    object: &Id,
+    path: &FieldPath,
+    errors: &mut Vec<ValidationError>,
+) {
+    let schema = object_schema(model, index, object);
+
+    validate_schema_path(model, subject, schema, path, errors);
+}
+
+fn validate_value_ref_path(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    value: &ValueRef,
+    errors: &mut Vec<ValidationError>,
+) {
+    match &value.source {
+        ValueSource::Input(input_id) => {
+            let input = find_input(model, index, input_id).expect("references already validated");
+
+            match input {
+                Input::Request(request) => {
+                    validate_schema_path(model, subject, &request.schema, &value.path, errors);
+                }
+
+                Input::Subscription(subscription) => {
+                    let topic = model
+                        .topics
+                        .get(&subscription.topic)
+                        .expect("references already validated");
+
+                    match &subscription.messages {
+                        MessageSelector::All => {
+                            for schema in &topic.messages {
+                                validate_schema_path(model, subject, schema, &value.path, errors);
+                            }
+                        }
+
+                        MessageSelector::Only(messages) => {
+                            for schema in messages {
+                                validate_schema_path(model, subject, schema, &value.path, errors);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ValueSource::Effect(effect_id) => {
+            let Some(schema) = effect_schema(model, index, effect_id) else {
+                errors.push(ValidationError::ValueSourceHasNoSchema {
+                    subject: subject.clone(),
+                    source: effect_id.clone(),
+                });
+
+                return;
+            };
+
+            validate_schema_path(model, subject, schema, &value.path, errors);
+        }
+
+        ValueSource::InvocationResult(result_id) => {
+            let info = index.get(result_id).expect("references already validated");
+
+            let operation_id = info.owner.expect("invocation result has an owner");
+
+            let result = model
+                .operations
+                .get(operation_id)
+                .expect("owner operation exists")
+                .invocation_results
+                .get(result_id)
+                .expect("invocation result exists");
+
+            validate_schema_path(model, subject, &result.schema, &value.path, errors);
+        }
+
+        ValueSource::StateMachineSubject(machine_id) => {
+            let machine = model
+                .state_machines
+                .get(machine_id)
+                .expect("references already validated");
+
+            let object = match &machine.subject {
+                StateMachineSubject::Object { object, .. } => object,
+            };
+
+            validate_object_path(model, index, subject, object, &value.path, errors);
+        }
+    }
+}
+
+fn validate_idempotency_key_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    key: &IdempotencyKey,
+    errors: &mut Vec<ValidationError>,
+) {
+    for component in &key.components {
+        validate_value_ref_path(model, index, subject, component, errors);
+    }
+}
+
+fn validate_propagation_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    propagations: &[IdempotencyKeyPropagation],
+    errors: &mut Vec<ValidationError>,
+) {
+    for propagation in propagations {
+        validate_idempotency_key_paths(model, index, subject, &propagation.source, errors);
+
+        validate_idempotency_key_paths(model, index, subject, &propagation.target, errors);
+    }
+}
+
+fn validate_effect_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &Effect,
+    errors: &mut Vec<ValidationError>,
+) {
+    match effect {
+        Effect::Publication(effect) => {
+            validate_propagation_paths(
+                model,
+                index,
+                effect_id,
+                &effect.idempotency_key_propagation,
+                errors,
+            );
+        }
+
+        Effect::Request(effect) => {
+            validate_propagation_paths(
+                model,
+                index,
+                effect_id,
+                &effect.idempotency_key_propagation,
+                errors,
+            );
+        }
+
+        Effect::External(effect) => {
+            if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
+                validate_idempotency_key_paths(model, index, effect_id, key, errors);
+            }
+        }
+    }
+}
+
+fn validate_transition_effect_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &TransitionSideEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    match effect {
+        TransitionSideEffect::Publication(effect) => {
+            validate_propagation_paths(
+                model,
+                index,
+                effect_id,
+                &effect.idempotency_key_propagation,
+                errors,
+            );
+        }
+
+        TransitionSideEffect::Request(effect) => {
+            validate_propagation_paths(
+                model,
+                index,
+                effect_id,
+                &effect.idempotency_key_propagation,
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_transaction_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    transaction_id: &Id,
+    transaction: &Transaction,
+    errors: &mut Vec<ValidationError>,
+) {
+    for step in &transaction.steps {
+        match step {
+            TransactionStep::Read(read) => {
+                validate_selector_paths(model, index, transaction_id, &read.target, errors);
+
+                if let FieldSelection::Only(fields) = &read.fields {
+                    for field in fields {
+                        validate_object_path(
+                            model,
+                            index,
+                            transaction_id,
+                            &read.target.object,
+                            field,
+                            errors,
+                        );
+                    }
+                }
+            }
+
+            TransactionStep::Write(write) => {
+                validate_selector_paths(model, index, transaction_id, &write.target, errors);
+
+                for field in &write.fields {
+                    validate_object_path(
+                        model,
+                        index,
+                        transaction_id,
+                        &write.target.object,
+                        field,
+                        errors,
+                    );
+                }
+            }
+
+            TransactionStep::Insert(_) => {}
+
+            TransactionStep::Delete(delete) => {
+                validate_selector_paths(model, index, transaction_id, &delete.target, errors);
+            }
+
+            TransactionStep::Lock(lock) => {
+                validate_selector_paths(model, index, transaction_id, &lock.target, errors);
+
+                if let LockOrder::By(terms) = &lock.order {
+                    for term in terms {
+                        validate_object_path(
+                            model,
+                            index,
+                            transaction_id,
+                            &lock.target.object,
+                            &term.field,
+                            errors,
+                        );
+                    }
+                }
+            }
+
+            TransactionStep::AcquireUniqueClaim(claim) => {
+                for (field, value) in &claim.mapping {
+                    validate_object_path(
+                        model,
+                        index,
+                        transaction_id,
+                        &claim.object,
+                        field,
+                        errors,
+                    );
+
+                    validate_value_ref_path(model, index, transaction_id, value, errors);
+                }
+            }
+
+            TransactionStep::Transition(transition) => {
+                validate_selector_paths(model, index, transaction_id, &transition.subject, errors);
+            }
+
+            TransactionStep::EstablishEffectIntent(_)
+            | TransactionStep::EstablishInvocationResult(_)
+            | TransactionStep::ReadInvocationResult(_) => {}
+        }
+    }
+}
+
+fn validate_selector_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    selector: &ObjectSelector,
+    errors: &mut Vec<ValidationError>,
+) {
+    validate_predicate_paths(
+        model,
+        index,
+        subject,
+        &selector.object,
+        &selector.predicate,
+        errors,
+    );
+}
+
+fn validate_predicate_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    object: &Id,
+    predicate: &SelectorPredicate,
+    errors: &mut Vec<ValidationError>,
+) {
+    match predicate {
+        SelectorPredicate::All => {}
+
+        SelectorPredicate::Eq { field, value } => {
+            validate_object_path(model, index, subject, object, field, errors);
+
+            if let SelectorValue::Value(value) = value {
+                validate_value_ref_path(model, index, subject, value, errors);
+            }
+        }
+
+        SelectorPredicate::And(predicates) => {
+            for predicate in predicates {
+                validate_predicate_paths(model, index, subject, object, predicate, errors);
+            }
+        }
+    }
+}
+
+// End Validate Field Paths
+
+fn validate_transaction_object(
+    index: &ReferenceIndex<'_>,
+    transaction_id: &Id,
+    transaction: &Transaction,
+    object: &Id,
+    errors: &mut Vec<ValidationError>,
+) {
+    let info = index.get(object).expect("references already validated");
+
+    let Some(data_model) = &transaction.data_model else {
+        errors.push(ValidationError::TransactionMissingDataModel {
+            transaction: transaction_id.clone(),
+            object: object.clone(),
+        });
+
+        return;
+    };
+
+    if info.owner != Some(data_model) {
+        errors.push(ValidationError::TransactionObjectOutsideDataModel {
+            transaction: transaction_id.clone(),
+            data_model: data_model.clone(),
+            object: object.clone(),
+        });
+    }
+}
+
+fn validate_subscription_topic_membership(model: &Model, errors: &mut Vec<ValidationError>) {
+    for operation in model.operations.values() {
+        for (input_id, input) in &operation.inputs {
+            let Input::Subscription(subscription) = input else {
+                continue;
+            };
+
+            let topic = model
+                .topics
+                .get(&subscription.topic)
+                .expect("references already validated");
+
+            let MessageSelector::Only(messages) = &subscription.messages else {
+                continue;
+            };
+
+            for schema in messages {
+                if !topic.messages.contains(schema) {
+                    errors.push(ValidationError::SubscriptionMessageNotOnTopic {
+                        input: input_id.clone(),
+                        topic: subscription.topic.clone(),
+                        schema: schema.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn validate_publication_topic_membership(model: &Model, errors: &mut Vec<ValidationError>) {
+    for operation in model.operations.values() {
+        for (effect_id, effect) in &operation.effects {
+            if let Effect::Publication(publication) = effect {
+                validate_publication_membership(model, effect_id, publication, errors);
+            }
+        }
+    }
+
+    for machine in model.state_machines.values() {
+        for transition in machine.transitions.values() {
+            for (effect_id, effect) in &transition.side_effects {
+                if let TransitionSideEffect::Publication(publication) = effect {
+                    validate_publication_membership(model, effect_id, publication, errors);
+                }
+            }
+        }
+    }
+}
+
+fn validate_topic_ordering_shape(model: &Model, errors: &mut Vec<ValidationError>) {
+    for (topic_id, topic) in &model.topics {
+        let TopicOrdering::Keyed(key) = &topic.ordering else {
+            continue;
+        };
+
+        for schema in key.mapping.keys() {
+            if !topic.messages.contains(schema) {
+                errors.push(ValidationError::TopicKeySchemaNotOnTopic {
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                });
+            }
+        }
+
+        for schema in &topic.messages {
+            if !key.mapping.contains_key(schema) {
+                errors.push(ValidationError::TopicKeyMissingSchema {
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn validate_publication_membership(
+    model: &Model,
+    effect_id: &Id,
+    effect: &PublicationEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    let topic = model
+        .topics
+        .get(&effect.topic)
+        .expect("references already validated");
+
+    if !topic.messages.contains(&effect.schema) {
+        errors.push(ValidationError::PublicationEffectMessageNotOnTopic {
+            effect: effect_id.clone(),
+            topic: effect.topic.clone(),
+            schema: effect.schema.clone(),
+        });
+    }
+}
+
+fn validate_schema_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (schema_id, schema) in &model.schemas {
+        match schema {
+            Schema::Canonical(schema) => {
+                for field in schema.fields.values() {
+                    validate_type_ref_references(schema_id, &field.ty, index, errors);
+                }
+            }
+
+            Schema::Fragment(fragment) => {
+                expect_reference(
+                    index,
+                    schema_id,
+                    &fragment.source,
+                    ReferenceKind::Schema,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn validate_data_model_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for data_model in model.data_models.values() {
+        for (object_id, object) in &data_model.objects {
+            expect_reference(
+                index,
+                object_id,
+                &object.schema,
+                ReferenceKind::Schema,
+                errors,
+            );
+        }
+    }
+}
+
+fn validate_topic_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (topic_id, topic) in &model.topics {
+        for schema in &topic.messages {
+            expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
+        }
+
+        if let TopicOrdering::Keyed(key) = &topic.ordering {
+            for schema in key.mapping.keys() {
+                expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
+            }
+        }
+    }
+}
+
+fn validate_state_machine_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (machine_id, machine) in &model.state_machines {
+        match &machine.subject {
+            StateMachineSubject::Object { object, .. } => {
+                expect_reference(index, machine_id, object, ReferenceKind::DataObject, errors);
+            }
+        }
+
+        expect_owned_reference(
+            index,
+            machine_id,
+            &machine.initial,
+            ReferenceKind::State,
+            machine_id,
+            errors,
+        );
+
+        for (transition_id, transition) in &machine.transitions {
+            for state in &transition.from {
+                expect_owned_reference(
+                    index,
+                    transition_id,
+                    state,
+                    ReferenceKind::State,
+                    machine_id,
+                    errors,
+                );
+            }
+
+            expect_owned_reference(
+                index,
+                transition_id,
+                &transition.to,
+                ReferenceKind::State,
+                machine_id,
+                errors,
+            );
+
+            for (effect_id, effect) in &transition.side_effects {
+                validate_transition_effect_references(model, index, effect_id, effect, errors);
+            }
+        }
+    }
+}
+
+fn validate_operation_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for (operation_id, operation) in &model.operations {
+        expect_reference(
+            index,
+            operation_id,
+            &operation.service,
+            ReferenceKind::Service,
+            errors,
+        );
+
+        for (input_id, input) in &operation.inputs {
+            validate_input_references(index, input_id, input, errors);
+        }
+
+        for (effect_id, effect) in &operation.effects {
+            validate_effect_references(model, index, effect_id, effect, errors);
+        }
+
+        for (intent_id, intent) in &operation.effect_intents {
+            // Effect may be transition-owned.
+            expect_reference(
+                index,
+                intent_id,
+                &intent.effect,
+                ReferenceKind::Effect,
+                errors,
+            );
+        }
+
+        for (result_id, result) in &operation.invocation_results {
+            expect_reference(
+                index,
+                result_id,
+                &result.schema,
+                ReferenceKind::Schema,
+                errors,
+            );
+
+            validate_idempotency_key_references(index, result_id, &result.key, errors);
+        }
+
+        for (response_id, response) in &operation.responses {
+            if expect_owned_reference(
+                index,
+                response_id,
+                &response.request,
+                ReferenceKind::Input,
+                operation_id,
+                errors,
+            ) {
+                validate_request_input_kind(model, index, response_id, &response.request, errors);
+            }
+
+            expect_reference(
+                index,
+                response_id,
+                &response.schema,
+                ReferenceKind::Schema,
+                errors,
+            );
+
+            match &response.source {
+                ResponseSource::Unspecified => {}
+
+                ResponseSource::InvocationResult { result } => {
+                    expect_owned_reference(
+                        index,
+                        response_id,
+                        result,
+                        ReferenceKind::InvocationResult,
+                        operation_id,
+                        errors,
+                    );
+                }
+            }
+        }
+
+        for (transaction_id, transaction) in &operation.transactions {
+            if let Some(data_model) = &transaction.data_model {
+                expect_reference(
+                    index,
+                    transaction_id,
+                    data_model,
+                    ReferenceKind::DataModel,
+                    errors,
+                );
+            }
+
+            validate_transaction_references(
+                index,
+                operation_id,
+                transaction_id,
+                transaction,
+                errors,
+            );
+        }
+
+        for (flow_id, flow) in &operation.flows {
+            validate_flow_references(index, operation_id, flow_id, flow, errors);
+        }
+
+        for requirement in &operation.requirements.serialization {
+            validate_value_ref_reference(index, operation_id, &requirement.key, errors);
+        }
+
+        for requirement in &operation.requirements.ordering {
+            validate_value_ref_reference(index, operation_id, &requirement.key, errors);
+        }
+
+        for requirement in &operation.requirements.idempotency {
+            validate_idempotency_key_references(index, operation_id, &requirement.key, errors);
+        }
+    }
+}
+
+fn validate_effect_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &Effect,
+    errors: &mut Vec<ValidationError>,
+) {
+    match effect {
+        Effect::Publication(publication) => {
+            validate_publication_references(index, effect_id, publication, errors);
+        }
+
+        Effect::Request(request) => {
+            validate_request_effect_references(model, index, effect_id, request, errors);
+        }
+
+        Effect::External(external) => {
+            if let IdempotencyGuarantee::DeduplicatedBy { key } = &external.idempotency {
+                validate_idempotency_key_references(index, effect_id, key, errors);
+            }
+        }
+    }
+}
+
+fn validate_input_references(
+    index: &ReferenceIndex<'_>,
+    input_id: &Id,
+    input: &Input,
+    errors: &mut Vec<ValidationError>,
+) {
+    match input {
+        Input::Request(request) => {
+            expect_reference(
+                index,
+                input_id,
+                &request.schema,
+                ReferenceKind::Schema,
+                errors,
+            );
+        }
+
+        Input::Subscription(subscription) => {
+            expect_reference(
+                index,
+                input_id,
+                &subscription.topic,
+                ReferenceKind::Topic,
+                errors,
+            );
+
+            if let MessageSelector::Only(messages) = &subscription.messages {
+                for schema in messages {
+                    expect_reference(index, input_id, schema, ReferenceKind::Schema, errors);
+                }
+            }
+        }
+    }
+}
+
+fn validate_transaction_references(
+    index: &ReferenceIndex<'_>,
+    operation_id: &Id,
+    transaction_id: &Id,
+    transaction: &Transaction,
+    errors: &mut Vec<ValidationError>,
+) {
+    for step in &transaction.steps {
+        match step {
+            TransactionStep::Read(read) => {
+                validate_selector_references(index, transaction_id, &read.target, errors);
+            }
+
+            TransactionStep::Write(write) => {
+                validate_selector_references(index, transaction_id, &write.target, errors);
+            }
+
+            TransactionStep::Insert(insert) => {
+                expect_reference(
+                    index,
+                    transaction_id,
+                    &insert.object,
+                    ReferenceKind::DataObject,
+                    errors,
+                );
+            }
+
+            TransactionStep::Delete(delete) => {
+                validate_selector_references(index, transaction_id, &delete.target, errors);
+            }
+
+            TransactionStep::Lock(lock) => {
+                validate_selector_references(index, transaction_id, &lock.target, errors);
+            }
+
+            TransactionStep::AcquireUniqueClaim(claim) => {
+                expect_reference(
+                    index,
+                    transaction_id,
+                    &claim.object,
+                    ReferenceKind::DataObject,
+                    errors,
+                );
+
+                for value in claim.mapping.values() {
+                    validate_value_ref_reference(index, transaction_id, value, errors);
+                }
+            }
+
+            TransactionStep::Transition(transition) => {
+                let machine_valid = expect_reference(
+                    index,
+                    transaction_id,
+                    &transition.machine,
+                    ReferenceKind::StateMachine,
+                    errors,
+                );
+
+                let transition_valid = expect_reference(
+                    index,
+                    transaction_id,
+                    &transition.transition,
+                    ReferenceKind::Transition,
+                    errors,
+                );
+
+                if machine_valid && transition_valid {
+                    expect_owned_by(
+                        index,
+                        transaction_id,
+                        &transition.transition,
+                        &transition.machine,
+                        errors,
+                    );
+                }
+
+                validate_selector_references(index, transaction_id, &transition.subject, errors);
+            }
+
+            TransactionStep::EstablishEffectIntent(step) => {
+                expect_owned_reference(
+                    index,
+                    transaction_id,
+                    &step.intent,
+                    ReferenceKind::EffectIntent,
+                    operation_id,
+                    errors,
+                );
+            }
+
+            TransactionStep::EstablishInvocationResult(step) => {
+                expect_owned_reference(
+                    index,
+                    transaction_id,
+                    &step.result,
+                    ReferenceKind::InvocationResult,
+                    operation_id,
+                    errors,
+                );
+            }
+
+            TransactionStep::ReadInvocationResult(step) => {
+                expect_owned_reference(
+                    index,
+                    transaction_id,
+                    &step.result,
+                    ReferenceKind::InvocationResult,
+                    operation_id,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn validate_flow_references(
+    index: &ReferenceIndex<'_>,
+    operation_id: &Id,
+    flow_id: &Id,
+    flow: &InvocationFlow,
+    errors: &mut Vec<ValidationError>,
+) {
+    for step in &flow.steps {
+        match step {
+            FlowStep::Transaction(transaction) => {
+                expect_owned_reference(
+                    index,
+                    flow_id,
+                    transaction,
+                    ReferenceKind::Transaction,
+                    operation_id,
+                    errors,
+                );
+            }
+
+            FlowStep::ExecuteEffect(step) => {
+                // May refer to an operation-owned or
+                // transition-owned effect.
+                expect_reference(index, flow_id, &step.effect, ReferenceKind::Effect, errors);
+            }
+
+            FlowStep::ExecuteEffectIntent(step) => {
+                expect_owned_reference(
+                    index,
+                    flow_id,
+                    &step.intent,
+                    ReferenceKind::EffectIntent,
+                    operation_id,
+                    errors,
+                );
+            }
+        }
+    }
+
+    if let Some(response) = &flow.response {
+        expect_owned_reference(
+            index,
+            flow_id,
+            response,
+            ReferenceKind::Response,
+            operation_id,
+            errors,
+        );
+    }
+}
+
+fn validate_selector_references(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    selector: &ObjectSelector,
+    errors: &mut Vec<ValidationError>,
+) {
+    expect_reference(
+        index,
+        subject,
+        &selector.object,
+        ReferenceKind::DataObject,
+        errors,
+    );
+
+    validate_predicate_references(index, subject, &selector.predicate, errors);
+}
+
+fn validate_predicate_references(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    predicate: &SelectorPredicate,
+    errors: &mut Vec<ValidationError>,
+) {
+    match predicate {
+        SelectorPredicate::All => {}
+
+        SelectorPredicate::Eq { value, .. } => {
+            if let SelectorValue::Value(value) = value {
+                validate_value_ref_reference(index, subject, value, errors);
+            }
+        }
+
+        SelectorPredicate::And(predicates) => {
+            for predicate in predicates {
+                validate_predicate_references(index, subject, predicate, errors);
+            }
+        }
+    }
+}
+
+fn validate_transition_effect_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &TransitionSideEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    match effect {
+        TransitionSideEffect::Publication(publication) => {
+            validate_publication_references(index, effect_id, publication, errors);
+        }
+
+        TransitionSideEffect::Request(request) => {
+            validate_request_effect_references(model, index, effect_id, request, errors);
+        }
+    }
+}
+
+fn validate_request_effect_references(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &RequestEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    expect_reference(
+        index,
+        effect_id,
+        &effect.schema,
+        ReferenceKind::Schema,
+        errors,
+    );
+
+    let operation_valid = expect_reference(
+        index,
+        effect_id,
+        &effect.target.operation,
+        ReferenceKind::Operation,
+        errors,
+    );
+
+    let input_valid = expect_reference(
+        index,
+        effect_id,
+        &effect.target.input,
+        ReferenceKind::Input,
+        errors,
+    );
+
+    if operation_valid && input_valid {
+        expect_owned_by(
+            index,
+            effect_id,
+            &effect.target.input,
+            &effect.target.operation,
+            errors,
+        );
+    }
+
+    if input_valid {
+        validate_request_input_kind(model, index, effect_id, &effect.target.input, errors);
+    }
+
+    for propagation in &effect.idempotency_key_propagation {
+        validate_idempotency_key_references(index, effect_id, &propagation.source, errors);
+
+        validate_idempotency_key_references(index, effect_id, &propagation.target, errors);
+    }
+}
+
+fn validate_publication_references(
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+    effect: &PublicationEffect,
+    errors: &mut Vec<ValidationError>,
+) {
+    expect_reference(
+        index,
+        effect_id,
+        &effect.topic,
+        ReferenceKind::Topic,
+        errors,
+    );
+
+    expect_reference(
+        index,
+        effect_id,
+        &effect.schema,
+        ReferenceKind::Schema,
+        errors,
+    );
+
+    for propagation in &effect.idempotency_key_propagation {
+        validate_idempotency_key_references(index, effect_id, &propagation.source, errors);
+
+        validate_idempotency_key_references(index, effect_id, &propagation.target, errors);
+    }
+}
+
+fn validate_idempotency_key_references(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    key: &IdempotencyKey,
+    errors: &mut Vec<ValidationError>,
+) {
+    for component in &key.components {
+        validate_value_ref_reference(index, subject, component, errors);
+    }
+}
+
+fn validate_value_ref_reference(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    value: &ValueRef,
+    errors: &mut Vec<ValidationError>,
+) {
+    match &value.source {
+        ValueSource::Input(input) => {
+            expect_reference(index, subject, input, ReferenceKind::Input, errors);
+        }
+
+        ValueSource::Effect(effect) => {
+            expect_reference(index, subject, effect, ReferenceKind::Effect, errors);
+        }
+
+        ValueSource::InvocationResult(result) => {
+            expect_reference(
+                index,
+                subject,
+                result,
+                ReferenceKind::InvocationResult,
+                errors,
+            );
+        }
+
+        ValueSource::StateMachineSubject(machine) => {
+            expect_reference(index, subject, machine, ReferenceKind::StateMachine, errors);
+        }
+    }
+}
+
+fn validate_type_ref_references(
+    subject: &Id,
+    ty: &TypeRef,
+    index: &ReferenceIndex<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match ty {
+        TypeRef::Scalar(_) => {}
+
+        TypeRef::Schema(schema) => {
+            expect_reference(index, subject, schema, ReferenceKind::Schema, errors);
+        }
+
+        TypeRef::List(inner) => {
+            validate_type_ref_references(subject, inner, index, errors);
+        }
+    }
+}
+
+fn validate_request_input_kind(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    input_id: &Id,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(input) = find_input(model, index, input_id) else {
+        return;
+    };
+
+    let actual = input_kind(input);
+
+    if actual != InputKind::Request {
+        errors.push(ValidationError::InvalidInputKind {
+            subject: subject.clone(),
+            input: input_id.clone(),
+            expected: InputKind::Request,
+            actual,
+        });
+    }
 }
 
 fn visit_declarations<'a>(
@@ -198,29 +1672,19 @@ fn visit_declarations<'a>(
     }
 }
 
-fn expect_owned_by(
+fn expect_owned_reference(
     index: &ReferenceIndex<'_>,
     subject: &Id,
     reference: &Id,
+    expected_kind: ReferenceKind,
     expected_owner: &Id,
     errors: &mut Vec<ValidationError>,
 ) -> bool {
-    let Some(info) = index.get(reference) else {
-        return false;
-    };
-
-    if info.owner != Some(expected_owner) {
-        errors.push(ValidationError::InvalidReferenceOwner {
-            subject: subject.clone(),
-            reference: reference.clone(),
-            expected_owner: expected_owner.clone(),
-            actual_owner: info.owner.cloned(),
-        });
-
+    if !expect_reference(index, subject, reference, expected_kind, errors) {
         return false;
     }
 
-    true
+    expect_owned_by(index, subject, reference, expected_owner, errors)
 }
 
 fn expect_reference(
@@ -252,4 +1716,164 @@ fn expect_reference(
     }
 
     true
+}
+
+fn expect_owned_by(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    reference: &Id,
+    expected_owner: &Id,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    let Some(info) = index.get(reference) else {
+        return false;
+    };
+
+    if info.owner != Some(expected_owner) {
+        errors.push(ValidationError::InvalidReferenceOwner {
+            subject: subject.clone(),
+            reference: reference.clone(),
+            expected_owner: expected_owner.clone(),
+            actual_owner: info.owner.cloned(),
+        });
+
+        return false;
+    }
+
+    true
+}
+
+fn input_kind(input: &Input) -> InputKind {
+    match input {
+        Input::Request(_) => InputKind::Request,
+        Input::Subscription(_) => InputKind::Subscription,
+    }
+}
+
+fn find_input<'a>(model: &'a Model, index: &ReferenceIndex<'a>, input: &Id) -> Option<&'a Input> {
+    let info = index.get(input)?;
+    let owner = info.owner?;
+
+    model.operations.get(owner)?.inputs.get(input)
+}
+
+fn schema_path_resolves(model: &Model, schema: &Id, path: &FieldPath) -> bool {
+    if path.0.is_empty() {
+        return false;
+    }
+
+    resolve_schema_components(model, schema, &path.0)
+}
+
+fn resolve_schema_components(model: &Model, schema_id: &Id, components: &[String]) -> bool {
+    if components.is_empty() {
+        return true;
+    }
+
+    let schema = model
+        .schemas
+        .get(schema_id)
+        .expect("references already validated");
+
+    match schema {
+        Schema::Canonical(schema) => {
+            let Some(field) = schema.fields.get(&components[0]) else {
+                return false;
+            };
+
+            if components.len() == 1 {
+                return true;
+            }
+
+            resolve_type_components(model, &field.ty, &components[1..])
+        }
+
+        Schema::Fragment(fragment) => {
+            let Some(mapped) = fragment.mapping.get(&components[0]) else {
+                return false;
+            };
+
+            let mut source_path = mapped.0.clone();
+
+            source_path.extend_from_slice(&components[1..]);
+
+            resolve_schema_components(model, &fragment.source, &source_path)
+        }
+    }
+}
+
+fn resolve_type_components(model: &Model, ty: &TypeRef, components: &[String]) -> bool {
+    if components.is_empty() {
+        return true;
+    }
+
+    match ty {
+        TypeRef::Schema(schema) => resolve_schema_components(model, schema, components),
+
+        // V1 does not define traversal through collections.
+        TypeRef::List(_) | TypeRef::Scalar(_) => false,
+    }
+}
+
+fn object_schema<'a>(model: &'a Model, index: &ReferenceIndex<'_>, object: &Id) -> &'a Id {
+    let info = index.get(object).expect("references already validated");
+
+    let data_model_id = info.owner.expect("data objects have data-model owners");
+
+    let data_model = model
+        .data_models
+        .get(data_model_id)
+        .expect("data-model owner exists");
+
+    &data_model
+        .objects
+        .get(object)
+        .expect("data object exists")
+        .schema
+}
+
+fn effect_schema<'a>(
+    model: &'a Model,
+    index: &ReferenceIndex<'_>,
+    effect_id: &Id,
+) -> Option<&'a Id> {
+    let info = index.get(effect_id).expect("references already validated");
+
+    let owner = info.owner.expect("effects have owners");
+
+    let owner_info = index.get(owner).expect("effect owner exists");
+
+    match owner_info.kind {
+        ReferenceKind::Operation => {
+            let effect = model.operations.get(owner)?.effects.get(effect_id)?;
+
+            match effect {
+                Effect::Publication(effect) => Some(&effect.schema),
+
+                Effect::Request(effect) => Some(&effect.schema),
+
+                Effect::External(_) => None,
+            }
+        }
+
+        ReferenceKind::Transition => {
+            for machine in model.state_machines.values() {
+                let Some(transition) = machine.transitions.get(owner) else {
+                    continue;
+                };
+
+                let effect = transition.side_effects.get(effect_id)?;
+
+                return match effect {
+                    TransitionSideEffect::Publication(effect) => Some(&effect.schema),
+
+                    TransitionSideEffect::Request(effect) => Some(&effect.schema),
+                };
+            }
+
+            None
+        }
+
+        _ => None,
+    }
 }
