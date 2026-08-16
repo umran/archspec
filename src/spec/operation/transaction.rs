@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::{FieldPath, Id};
 
@@ -6,7 +6,11 @@ use super::ValueRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
-    pub data_model: Id,
+    /// None is permitted when the transaction only establishes
+    /// framework-level durable state such as an EffectIntent or
+    /// InvocationResult.
+    pub data_model: Option<Id>,
+
     pub isolation: TransactionIsolation,
     pub steps: Vec<TransactionStep>,
 }
@@ -26,6 +30,12 @@ pub enum TransactionStep {
     Insert(Insert),
     Delete(Delete),
     Lock(Lock),
+
+    AcquireUniqueClaim(UniqueClaim),
+    Transition(StateTransition),
+    EstablishEffectIntent(EstablishEffectIntent),
+    EstablishInvocationResult(EstablishInvocationResult),
+    ReadInvocationResult(ReadInvocationResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +117,7 @@ pub enum SelectorPredicate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorValue {
-    Input(ValueRef),
+    Value(ValueRef),
     Literal(Literal),
 }
 
@@ -116,4 +126,39 @@ pub enum Literal {
     String(String),
     Bool(bool),
     Int(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueClaim {
+    pub object: Id,
+
+    /// Object identity field -> invocation value.
+    ///
+    /// The checker verifies that this covers the object's complete
+    /// declared identity and therefore establishes a unique claim.
+    pub mapping: BTreeMap<FieldPath, ValueRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTransition {
+    pub machine: Id,
+    pub transition: Id,
+
+    /// Selects the concrete persistent machine instance.
+    pub subject: ObjectSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstablishEffectIntent {
+    pub intent: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstablishInvocationResult {
+    pub result: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadInvocationResult {
+    pub result: Id,
 }
