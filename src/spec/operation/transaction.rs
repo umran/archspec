@@ -85,7 +85,7 @@ pub enum LockMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "terms", rename_all = "snake_case")]
 pub enum LockOrder {
     Unspecified,
     By(Vec<OrderingTerm>),
@@ -106,7 +106,7 @@ pub enum OrderingDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "fields", rename_all = "snake_case")]
 pub enum FieldSelection {
     All,
     Only(BTreeSet<FieldPath>),
@@ -120,7 +120,7 @@ pub struct ObjectSelector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SelectorPredicate {
     All,
 
@@ -129,7 +129,9 @@ pub enum SelectorPredicate {
         value: SelectorValue,
     },
 
-    And(Vec<SelectorPredicate>),
+    And {
+        predicates: Vec<SelectorPredicate>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

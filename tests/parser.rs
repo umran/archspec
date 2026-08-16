@@ -4,8 +4,12 @@ use std::{
 };
 
 use archspec::{
+    analyzer::validation,
     parser::yaml,
-    spec::{Id, Schema, SchemaCompleteness, ServiceKind, TopicOrdering},
+    spec::{
+        Effect, Id, IdempotencyGuarantee, Input, LaneConcurrency, Schema, SchemaCompleteness,
+        ServiceKind, TopicOrdering, TransactionStep,
+    },
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -206,4 +210,168 @@ fn rejects_invalid_service_kind() {
         message.contains("definitely_not_a_service"),
         "error should mention the invalid value, got: {message}"
     );
+}
+
+#[test]
+fn parses_flash_checkout_model() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    assert_eq!(model.revision.0, 1);
+
+    assert_eq!(model.services.len(), 3);
+    assert_eq!(model.schemas.len(), 12);
+    assert_eq!(model.data_models.len(), 2);
+    assert_eq!(model.topics.len(), 1);
+    assert_eq!(model.state_machines.len(), 1);
+    assert_eq!(model.operations.len(), 6);
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.create_order".into()))
+    );
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.reserve_inventory".into()))
+    );
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.charge_payment".into()))
+    );
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.cancel_order".into()))
+    );
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.apply_payment".into()))
+    );
+
+    assert!(
+        model
+            .operations
+            .contains_key(&Id("operation.transfer_stock".into()))
+    );
+}
+
+#[test]
+fn flash_checkout_parses_nested_semantics() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    // Subscription + MessageSelector + DispatchSemantics +
+    // LaneConcurrency.
+    let reserve_inventory = model
+        .operations
+        .get(&Id("operation.reserve_inventory".into()))
+        .expect("reserve_inventory should exist");
+
+    let input = reserve_inventory
+        .inputs
+        .get(&Id("input.reserve_inventory.created".into()))
+        .expect("reserve_inventory subscription should exist");
+
+    let Input::Subscription(subscription) = input else {
+        panic!("reserve_inventory input should be a subscription");
+    };
+
+    let LaneConcurrency::Bounded(concurrency) = subscription.dispatch.lane_concurrency else {
+        panic!("subscription lane concurrency should be bounded");
+    };
+
+    assert_eq!(concurrency.get(), 1);
+
+    // Effect + nested IdempotencyGuarantee.
+    let charge_payment = model
+        .operations
+        .get(&Id("operation.charge_payment".into()))
+        .expect("charge_payment should exist");
+
+    let effect = charge_payment
+        .effects
+        .get(&Id("effect.charge_payment.card".into()))
+        .expect("card charge effect should exist");
+
+    let Effect::External(effect) = effect else {
+        panic!("card charge should be an external effect");
+    };
+
+    assert_eq!(effect.idempotency, IdempotencyGuarantee::NotDeduplicated);
+
+    // TransactionStep + SelectorPredicate + SelectorValue +
+    // FieldSelection + LockOrder.
+    let transfer_stock = model
+        .operations
+        .get(&Id("operation.transfer_stock".into()))
+        .expect("transfer_stock should exist");
+
+    let transaction = transfer_stock
+        .transactions
+        .get(&Id("tx.transfer_stock".into()))
+        .expect("transfer_stock transaction should exist");
+
+    assert_eq!(transaction.steps.len(), 5);
+
+    assert!(matches!(&transaction.steps[0], TransactionStep::Lock(_)));
+
+    assert!(matches!(&transaction.steps[1], TransactionStep::Lock(_)));
+
+    assert!(matches!(&transaction.steps[2], TransactionStep::Read(_)));
+
+    assert!(matches!(&transaction.steps[3], TransactionStep::Write(_)));
+
+    assert!(matches!(&transaction.steps[4], TransactionStep::Write(_)));
+}
+
+#[test]
+fn flash_checkout_is_structurally_valid() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let errors = validation::validate(&model);
+
+    assert!(
+        errors.is_empty(),
+        "flash checkout should be structurally valid:\n{errors:#?}"
+    );
+}
+
+#[test]
+fn flash_checkout_round_trips_through_yaml() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let original = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let serialized = yaml::serialize(&original).expect("flash checkout model should serialize");
+
+    let reparsed = yaml::parse(&serialized).expect("serialized flash checkout model should parse");
+
+    assert_eq!(original, reparsed);
+}
+
+#[test]
+fn flash_checkout_serialization_is_canonical() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let first = yaml::serialize(&model).expect("flash checkout model should serialize");
+
+    let reparsed = yaml::parse(&first).expect("canonical YAML should parse");
+
+    let second = yaml::serialize(&reparsed).expect("reparsed model should serialize");
+
+    assert_eq!(first, second);
 }

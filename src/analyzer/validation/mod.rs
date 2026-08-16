@@ -781,7 +781,7 @@ fn validate_predicate_paths(
             }
         }
 
-        SelectorPredicate::And(predicates) => {
+        SelectorPredicate::And { predicates } => {
             for predicate in predicates {
                 validate_predicate_paths(model, index, subject, object, predicate, errors);
             }
@@ -1326,7 +1326,7 @@ fn validate_flow_references(
 ) {
     for step in &flow.steps {
         match step {
-            FlowStep::Transaction(transaction) => {
+            FlowStep::Transaction { transaction } => {
                 expect_owned_reference(
                     index,
                     flow_id,
@@ -1337,17 +1337,17 @@ fn validate_flow_references(
                 );
             }
 
-            FlowStep::ExecuteEffect(step) => {
+            FlowStep::ExecuteEffect { effect } => {
                 // May refer to an operation-owned or
                 // transition-owned effect.
-                expect_reference(index, flow_id, &step.effect, ReferenceKind::Effect, errors);
+                expect_reference(index, flow_id, &effect, ReferenceKind::Effect, errors);
             }
 
-            FlowStep::ExecuteEffectIntent(step) => {
+            FlowStep::ExecuteEffectIntent { intent } => {
                 expect_owned_reference(
                     index,
                     flow_id,
-                    &step.intent,
+                    &intent,
                     ReferenceKind::EffectIntent,
                     operation_id,
                     errors,
@@ -1400,7 +1400,7 @@ fn validate_predicate_references(
             }
         }
 
-        SelectorPredicate::And(predicates) => {
+        SelectorPredicate::And { predicates } => {
             for predicate in predicates {
                 validate_predicate_references(index, subject, predicate, errors);
             }

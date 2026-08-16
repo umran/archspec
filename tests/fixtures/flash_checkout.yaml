@@ -1,0 +1,1010 @@
+revision: 1
+services:
+  service.checkout:
+    kind: backend
+  service.inventory:
+    kind: backend
+  service.payments:
+    kind: worker
+schemas:
+  schema.CreateOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      idempotency_key:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      sku:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+  schema.CreateOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      status:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+  schema.CancelOrderRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.CancelOrderResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      status:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+  schema.TransferStockRequest:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      source_warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      destination_warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      sku:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+  schema.TransferStockResponse:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      accepted:
+        ty:
+          kind: scalar
+          value: bool
+        optional: false
+  schema.OrderCreated:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      event_id:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      sku:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+  schema.InventoryReserved:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      event_id:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      sku:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      quantity:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+  schema.PaymentCaptured:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      event_id:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+  schema.OrderCancelled:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      event_id:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+  schema.OrderRecord:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      status:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      amount:
+        ty:
+          kind: scalar
+          value: decimal
+        optional: false
+  schema.StockRecord:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      warehouse_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
+      sku:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      on_hand:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+      reserved:
+        ty:
+          kind: scalar
+          value: int
+        optional: false
+data_models:
+  data.checkout:
+    objects:
+      object.order:
+        schema: schema.OrderRecord
+        identity:
+        - - order_id
+        requirements:
+          history:
+          - linearizable
+  data.inventory:
+    objects:
+      object.stock:
+        schema: schema.StockRecord
+        identity:
+        - - warehouse_id
+        - - sku
+        requirements:
+          history:
+          - linearizable
+topics:
+  topic.order_events:
+    messages:
+    - schema.InventoryReserved
+    - schema.OrderCancelled
+    - schema.OrderCreated
+    - schema.PaymentCaptured
+    ordering:
+      kind: keyed
+      mapping:
+        schema.InventoryReserved:
+        - order_id
+        schema.OrderCancelled:
+        - order_id
+        schema.OrderCreated:
+        - order_id
+        schema.PaymentCaptured:
+        - order_id
+state_machines:
+  machine.order_lifecycle:
+    subject:
+      kind: object
+      object: object.order
+      state:
+      - status
+    states:
+    - state.order.cancelled
+    - state.order.paid
+    - state.order.pending
+    initial: state.order.pending
+    transitions:
+      transition.order.cancel:
+        from:
+        - state.order.pending
+        to: state.order.cancelled
+        side_effects: {}
+      transition.order.mark_paid:
+        from:
+        - state.order.pending
+        to: state.order.paid
+        side_effects: {}
+operations:
+  operation.create_order:
+    service: service.checkout
+    description: Create an order and durably arrange publication of OrderCreated.
+    inputs:
+      input.create_order.request:
+        kind: request
+        schema: schema.CreateOrderRequest
+    effects:
+      effect.create_order.publish_created:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.OrderCreated
+        idempotency_key_propagation:
+        - source:
+            components:
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - idempotency_key
+          target:
+            components:
+            - source:
+                kind: effect
+                id: effect.create_order.publish_created
+              path:
+              - event_id
+    effect_intents:
+      intent.create_order.publish_created:
+        effect: effect.create_order.publish_created
+        execution: recoverable
+    invocation_results:
+      result.create_order:
+        key:
+          components:
+          - source:
+              kind: input
+              id: input.create_order.request
+            path:
+            - idempotency_key
+        schema: schema.CreateOrderResponse
+    responses:
+      response.create_order:
+        request: input.create_order.request
+        schema: schema.CreateOrderResponse
+        source:
+          kind: invocation_result
+          result: result.create_order
+    transactions:
+      tx.create_order.new:
+        data_model: data.checkout
+        isolation: read_committed
+        steps:
+        - kind: acquire_unique_claim
+          object: object.order
+          mapping:
+            ? - order_id
+            : source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - order_id
+        - kind: insert
+          object: object.order
+        - kind: establish_effect_intent
+          intent: intent.create_order.publish_created
+        - kind: establish_invocation_result
+          result: result.create_order
+      tx.create_order.replay:
+        data_model: null
+        isolation: unspecified
+        steps:
+        - kind: read_invocation_result
+          result: result.create_order
+    flows:
+      flow.create_order.new:
+        steps:
+        - kind: transaction
+          value: tx.create_order.new
+        - kind: execute_effect_intent
+          value:
+            intent: intent.create_order.publish_created
+        response: response.create_order
+      flow.create_order.replay:
+        steps:
+        - kind: transaction
+          value: tx.create_order.replay
+        response: response.create_order
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.create_order.request
+            path:
+            - idempotency_key
+        response: replay_consistent
+    execution:
+      concurrency:
+        kind: unbounded
+  operation.reserve_inventory:
+    service: service.inventory
+    description: Reserve stock for an OrderCreated event.
+    inputs:
+      input.reserve_inventory.created:
+        kind: subscription
+        topic: topic.order_events
+        messages:
+          kind: only
+          schemas:
+          - schema.OrderCreated
+        delivery: at_least_once
+        dispatch:
+          routing: by_topic_key
+          lane_concurrency:
+            kind: bounded
+            value: 1
+    effects:
+      effect.reserve_inventory.publish_reserved:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.InventoryReserved
+        idempotency_key_propagation:
+        - source:
+            components:
+            - source:
+                kind: input
+                id: input.reserve_inventory.created
+              path:
+              - event_id
+          target:
+            components:
+            - source:
+                kind: effect
+                id: effect.reserve_inventory.publish_reserved
+              path:
+              - event_id
+    effect_intents:
+      intent.reserve_inventory.publish_reserved:
+        effect: effect.reserve_inventory.publish_reserved
+        execution: recoverable
+    invocation_results: {}
+    responses: {}
+    transactions:
+      tx.reserve_inventory:
+        data_model: data.inventory
+        isolation: read_committed
+        steps:
+        - kind: read
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.reserve_inventory.created
+                      path:
+                      - warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.reserve_inventory.created
+                      path:
+                      - sku
+          fields:
+            kind: only
+            fields:
+            - - on_hand
+            - - reserved
+        - kind: write
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.reserve_inventory.created
+                      path:
+                      - warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.reserve_inventory.created
+                      path:
+                      - sku
+          fields:
+          - - reserved
+        - kind: establish_effect_intent
+          intent: intent.reserve_inventory.publish_reserved
+    flows:
+      flow.reserve_inventory:
+        steps:
+        - kind: transaction
+          value: tx.reserve_inventory
+        - kind: execute_effect_intent
+          value:
+            intent: intent.reserve_inventory.publish_reserved
+        response: null
+    requirements:
+      serialization:
+      - key:
+          source:
+            kind: input
+            id: input.reserve_inventory.created
+          path:
+          - order_id
+      ordering:
+      - key:
+          source:
+            kind: input
+            id: input.reserve_inventory.created
+          path:
+          - order_id
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.reserve_inventory.created
+            path:
+            - event_id
+        response: unspecified
+    execution:
+      concurrency:
+        kind: unbounded
+  operation.charge_payment:
+    service: service.payments
+    description: Charge the card after inventory reservation.
+    inputs:
+      input.charge_payment.reserved:
+        kind: subscription
+        topic: topic.order_events
+        messages:
+          kind: only
+          schemas:
+          - schema.InventoryReserved
+        delivery: at_least_once
+        dispatch:
+          routing: by_topic_key
+          lane_concurrency:
+            kind: bounded
+            value: 1
+    effects:
+      effect.charge_payment.card:
+        kind: external
+        name: payment-provider.charge
+        idempotency:
+          kind: not_deduplicated
+      effect.charge_payment.publish_captured:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.PaymentCaptured
+        idempotency_key_propagation:
+        - source:
+            components:
+            - source:
+                kind: input
+                id: input.charge_payment.reserved
+              path:
+              - event_id
+          target:
+            components:
+            - source:
+                kind: effect
+                id: effect.charge_payment.publish_captured
+              path:
+              - event_id
+    effect_intents: {}
+    invocation_results: {}
+    responses: {}
+    transactions: {}
+    flows:
+      flow.charge_payment:
+        steps:
+        - kind: execute_effect
+          value:
+            effect: effect.charge_payment.card
+        - kind: execute_effect
+          value:
+            effect: effect.charge_payment.publish_captured
+        response: null
+    requirements:
+      serialization:
+      - key:
+          source:
+            kind: input
+            id: input.charge_payment.reserved
+          path:
+          - order_id
+      ordering:
+      - key:
+          source:
+            kind: input
+            id: input.charge_payment.reserved
+          path:
+          - order_id
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.charge_payment.reserved
+            path:
+            - event_id
+        response: unspecified
+    execution:
+      concurrency:
+        kind: unbounded
+  operation.cancel_order:
+    service: service.checkout
+    description: Cancel a pending order and publish OrderCancelled.
+    inputs:
+      input.cancel_order.request:
+        kind: request
+        schema: schema.CancelOrderRequest
+    effects:
+      effect.cancel_order.publish_cancelled:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.OrderCancelled
+        idempotency_key_propagation: []
+    effect_intents:
+      intent.cancel_order.publish_cancelled:
+        effect: effect.cancel_order.publish_cancelled
+        execution: recoverable
+    invocation_results: {}
+    responses:
+      response.cancel_order:
+        request: input.cancel_order.request
+        schema: schema.CancelOrderResponse
+        source:
+          kind: unspecified
+    transactions:
+      tx.cancel_order:
+        data_model: data.checkout
+        isolation: read_committed
+        steps:
+        - kind: transition
+          machine: machine.order_lifecycle
+          transition: transition.order.cancel
+          subject:
+            object: object.order
+            predicate:
+              kind: eq
+              value:
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.cancel_order.request
+                    path:
+                    - order_id
+        - kind: establish_effect_intent
+          intent: intent.cancel_order.publish_cancelled
+    flows:
+      flow.cancel_order:
+        steps:
+        - kind: transaction
+          value: tx.cancel_order
+        - kind: execute_effect_intent
+          value:
+            intent: intent.cancel_order.publish_cancelled
+        response: response.cancel_order
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+    execution:
+      concurrency:
+        kind: unbounded
+  operation.apply_payment:
+    service: service.checkout
+    description: Advance a pending order to paid on PaymentCaptured.
+    inputs:
+      input.apply_payment.captured:
+        kind: subscription
+        topic: topic.order_events
+        messages:
+          kind: only
+          schemas:
+          - schema.PaymentCaptured
+        delivery: at_least_once
+        dispatch:
+          routing: by_topic_key
+          lane_concurrency:
+            kind: bounded
+            value: 1
+    effects: {}
+    effect_intents: {}
+    invocation_results: {}
+    responses: {}
+    transactions:
+      tx.apply_payment:
+        data_model: data.checkout
+        isolation: read_committed
+        steps:
+        - kind: transition
+          machine: machine.order_lifecycle
+          transition: transition.order.mark_paid
+          subject:
+            object: object.order
+            predicate:
+              kind: eq
+              value:
+                field:
+                - order_id
+                value:
+                  kind: value
+                  value:
+                    source:
+                      kind: input
+                      id: input.apply_payment.captured
+                    path:
+                    - order_id
+    flows:
+      flow.apply_payment:
+        steps:
+        - kind: transaction
+          value: tx.apply_payment
+        response: null
+    requirements:
+      serialization:
+      - key:
+          source:
+            kind: input
+            id: input.apply_payment.captured
+          path:
+          - order_id
+      ordering:
+      - key:
+          source:
+            kind: input
+            id: input.apply_payment.captured
+          path:
+          - order_id
+      idempotency:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.apply_payment.captured
+            path:
+            - event_id
+        response: unspecified
+    execution:
+      concurrency:
+        kind: unbounded
+  operation.transfer_stock:
+    service: service.inventory
+    description: Move stock between warehouses.
+    inputs:
+      input.transfer_stock.request:
+        kind: request
+        schema: schema.TransferStockRequest
+    effects: {}
+    effect_intents: {}
+    invocation_results: {}
+    responses:
+      response.transfer_stock:
+        request: input.transfer_stock.request
+        schema: schema.TransferStockResponse
+        source:
+          kind: unspecified
+    transactions:
+      tx.transfer_stock:
+        data_model: data.inventory
+        isolation: read_committed
+        steps:
+        - kind: lock
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - source_warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - sku
+          mode: exclusive
+          order:
+            kind: unspecified
+        - kind: lock
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - destination_warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - sku
+          mode: exclusive
+          order:
+            kind: unspecified
+        - kind: read
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - source_warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - sku
+          fields:
+            kind: only
+            fields:
+            - - on_hand
+        - kind: write
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - source_warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - sku
+          fields:
+          - - on_hand
+        - kind: write
+          target:
+            object: object.stock
+            predicate:
+              kind: and
+              value:
+              - kind: eq
+                value:
+                  field:
+                  - warehouse_id
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - destination_warehouse_id
+              - kind: eq
+                value:
+                  field:
+                  - sku
+                  value:
+                    kind: value
+                    value:
+                      source:
+                        kind: input
+                        id: input.transfer_stock.request
+                      path:
+                      - sku
+          fields:
+          - - on_hand
+    flows:
+      flow.transfer_stock:
+        steps:
+        - kind: transaction
+          value: tx.transfer_stock
+        response: response.transfer_stock
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+    execution:
+      concurrency:
+        kind: unbounded

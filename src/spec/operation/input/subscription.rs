@@ -22,7 +22,7 @@ pub struct SubscriptionInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "schemas", rename_all = "snake_case")]
 pub enum MessageSelector {
     /// Consume every message schema declared by the topic.
     All,
