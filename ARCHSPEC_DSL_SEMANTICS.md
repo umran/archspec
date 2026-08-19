@@ -51,7 +51,7 @@ Even these declarations describe guarantees, not necessarily observed runtime be
 
 ### 1.3 Requirements are conditional on model conformance
 
-Any proof produced by Archspec is conditional on the real implementation satisfying the declarations used by the proof. A proof based on `serializable`, `recoverable`, or `deduplicated_by`, for example, is invalid if the concrete implementation does not actually provide those semantics.
+Any proof produced by Archspec is conditional on the real implementation satisfying the declarations used by the proof. A proof based on `serializable`, deterministic provenance, or `deduplicated_by`, for example, is invalid if the concrete implementation does not actually provide those semantics.
 
 ---
 
@@ -211,7 +211,7 @@ A data object is a logical class of persistent object instances.
 
 ### `identity`
 
-`identity` is the complete logical identity of one object instance.
+`identity` is the complete, non-empty logical identity of one object instance.
 
 The vector contains the components of a **single composite identity**.
 
@@ -229,7 +229,7 @@ means the object is identified by the tuple:
 
 It does **not** mean that `tenant_id` and `account_id` are alternative independent keys.
 
-Object identity is important for selector precision, unique claims, conflict analysis, linearizability domains, and lock reasoning.
+Object identity is important for selector precision, insertion uniqueness, conflict analysis, linearizability domains, and lock reasoning. The declared identity is intrinsic to the logical object model: two distinct successfully created instances cannot share the same complete identity.
 
 ### `ObjectRequirements.history`
 
@@ -331,7 +331,7 @@ This distinction is central to ambiguous-ordering analysis.
 
 An operation is a logical unit of application behavior owned by one service.
 
-Its declaration contains possible invocation sources, effects, durable primitives, transactions, flows, requirements, and execution facts.
+Its declaration contains possible invocation sources, effects, transaction artifacts, transactions, flows, requirements, and execution facts.
 
 `description` is documentation only and has no proof semantics.
 
@@ -349,7 +349,7 @@ An effect appearing in `operation.effects` is an effect the operation **may exec
 
 Declaration alone does not mean the effect occurs.
 
-Execution is represented by a flow step, a durable effect-intent path, or another construct that explicitly associates the effect with behavior.
+Execution is represented by a flow step, an effect-intent path, or another construct that explicitly associates the effect with behavior.
 
 ### Transactions are declarations, not executions
 
@@ -542,15 +542,27 @@ The requirement means:
 
 > Repeated attempts representing the same logical invocation must not cause externally distinguishable duplicate logical work beyond what the declared idempotency contract permits.
 
-The solver must follow duplicate/retry paths through transactions, publications, requests, external effects, and durable intent recovery.
+The solver must analyze the complete admitted retry path through transactions, transaction artifacts, publications, requests, and external effects.
 
-The requirement is not discharged merely because the operation has a field named `idempotency_key`.
+A transaction may contribute to the proof in two distinct ways:
+
+1. **natural replayability**, derived from the transaction's declared semantics and deterministic provenance; or
+2. **explicit durable keyed commit deduplication**, declared with `DeduplicatedBy { key }` on the transaction.
+
+These mechanisms are not interchangeable. A transaction that merely prevents a second commit is not necessarily naturally replayable, because a retry may need to reproduce transaction artifacts required by later flow steps.
+
+The requirement is not discharged merely because the operation has a field named `idempotency_key`, because an `InvocationResult` exists, or because an `EffectIntent` exists.
 
 ### `ResponseReplayRequirement::replay_consistent`
 
-When replay consistency is required, retries for the same idempotency key must return the same logical response rather than recomputing a potentially different response from mutable state.
+When replay consistency is required, retries for the same logical invocation must resolve the same logical response.
 
-A durable immutable `InvocationResult` is the DSL primitive intended to support this proof.
+A response sourced from an `InvocationResult` is replay-consistent only when the solver can establish a safe path to the same logical result. V1 recognizes two principal routes:
+
+1. the establishing transaction is naturally replayable and the result derivation is replay-deterministic; or
+2. the establishing transaction is `DeduplicatedBy { key }`, and the exact result produced by the prior successful keyed commit is durably retained and recovered.
+
+`ResponseSource::InvocationResult` does not, by itself, imply durable memoization or transaction idempotency.
 
 ### `response: unspecified`
 
@@ -587,7 +599,6 @@ No global concurrency fact is available.
 ---
 
 ## 11. Value references
-
 ### `ValueRef`
 
 A value reference consists of:
@@ -595,11 +606,13 @@ A value reference consists of:
 - a `ValueSource`,
 - and a `FieldPath` relative to that source's schema.
 
-It identifies a logical value and is the main mechanism for linking keys and predicates across the model.
+It identifies a logical value and is the main mechanism for linking keys, predicates, and deterministic provenance across the model.
 
 ### `ValueSource::input`
 
 References a field in the current invocation's input payload.
+
+An input reference is not automatically replay-stable merely because two attempts share an idempotency key. Replay stability must follow from the operation's declared idempotency equivalence or other established provenance facts.
 
 ### `ValueSource::effect`
 
@@ -611,13 +624,23 @@ An external effect has no inspectable payload schema in the current DSL and ther
 
 ### `ValueSource::invocation_result`
 
-References a field in a durable invocation result.
+References a field in a logical `InvocationResult` available to the current invocation.
+
+Availability may come from production earlier in the current flow, deterministic reconstruction by a naturally replayable establishing transaction, or recovery from an explicitly keyed committed transaction. The source kind does not itself imply independent durable storage.
 
 ### `ValueSource::state_machine_subject`
 
 References a field on the persistent object governed by the identified state-machine subject.
 
-The path is interpreted against that subject object's schema.
+The path is interpreted against that subject object's schema. Mutable subject state is not automatically replay-stable.
+
+### `ValueSource::transaction_read`
+
+References a field observed by a named `Read` earlier in the same transaction execution.
+
+Transaction-read results are transaction-local provenance sources. They are not durable cross-transaction artifacts and are not available to later transactions merely because the surrounding flow continues.
+
+V1 permits them in the semantic model but does not use a provenance chain that reaches a transaction read to prove natural transaction replayability. See §18.
 
 ---
 
@@ -719,33 +742,31 @@ The guarantee is scoped to equality of that logical key. It does not imply order
 
 ---
 
-## 14. Durable effect intents
+## 14. Effect intents
 
 ### `EffectIntent`
 
-An effect intent associates a logical effect with durable execution state.
+An effect intent is a **logical transaction artifact** describing an intended effect execution.
 
-It is useful for outbox-style or recoverable side-effect execution.
+An effect intent is not inherently synonymous with a durable database record, and declaring one does not establish it. `EstablishEffectIntent` establishes the logical artifact as part of a transaction execution.
 
-Declaring an intent does not establish it. `EstablishEffectIntent` does.
+The current `IntentExecutionSemantics::{Unspecified, Recoverable}` model is superseded by this revision. An intent declaration does not imply an invisible independent executor or independent rediscovery mechanism.
 
-### `IntentExecutionSemantics::unspecified`
+### Intent derivation
 
-The intent may be durably established, but the model provides no guarantee that abandoned pending work is independently rediscovered after the creating invocation disappears.
+The establishment site should declare how the intent's logical contents are produced through a `Derivation` declaration.
 
-### `recoverable`
+If the intent is deterministically derived from replay-stable provenance and the establishing transaction is naturally replayable, a retry may reconstruct the same logical intent without requiring the intent payload itself to have been durably materialized.
 
-Once established, pending work remains durably discoverable and eligible for retry independently of the invocation that created it.
-
-This is a **recoverability/retry guarantee**, not an exactly-once guarantee and not a guarantee of eventual success.
-
-A recoverable intent can cause the underlying effect to be attempted repeatedly. Idempotency analysis must therefore account for duplicates at the effect boundary.
+If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exact intent produced by the first successful logical commit is retained with that commit and recovered when the transaction step is encountered again under the same key.
 
 ### `ExecuteEffectIntent`
 
-A flow step executing an intent performs/attempts the work represented by the established intent.
+A flow step executing an intent performs or attempts the work represented by the logical intent available to the current invocation.
 
-The durable intent remains the recovery anchor; the flow step is not equivalent to a claim that the effect can execute only once.
+`ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
+
+Reconstructing or recovering the same intent does **not** prove that repeating the external effect is safe. A crash after an external effect succeeds but before completion is durably known may still lead to another effect attempt. Effect-level idempotency/retry semantics must handle that uncertainty.
 
 ---
 
@@ -753,23 +774,29 @@ The durable intent remains the recovery anchor; the flow step is not equivalent 
 
 ### `InvocationResult`
 
-An invocation result is a durable logical result identified by an `IdempotencyKey` and shaped by a schema.
+An invocation result is a logical transaction artifact shaped by a declared schema.
 
-It is intended as the immutable replay anchor for request idempotency.
+It is semantically separate from transaction idempotency. Establishing an invocation result does **not**, by itself, prevent the enclosing transaction from executing or committing again.
 
-The semantic contract is that an established invocation result represents the stable logical result associated with that key. A conforming implementation must not silently replace the result for the same logical replay identity with a different result.
+An invocation result is not inherently synonymous with a durable database record. Its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit.
+
+An artifact-level idempotency key, if still present in an interim implementation shape, must not be interpreted as an independent transaction-deduplication or durability guarantee. The revised structural model may remove that field entirely.
 
 ### `EstablishInvocationResult`
 
-Establishes the durable invocation result as part of the surrounding transaction.
+Establishes the logical result produced by the surrounding transaction execution.
 
-When combined with other transaction steps, establishment participates in the same atomic transaction boundary.
+The establishment site should declare result-value provenance through `Derivation`.
+
+If the transaction is naturally replayable and the result derivation is replay-deterministic, a retry may reproduce the same logical result without independent durable result storage.
+
+If the transaction is `DeduplicatedBy { key }`, the exact result produced by the first successful commit is retained with `Commit(T,K)` and recovered on replay instead of being recomputed.
 
 ### `ReadInvocationResult`
 
-Reads the previously established durable invocation result.
+The explicit transaction step `ReadInvocationResult` is removed by the revised model unless a separate concrete semantic use case is established.
 
-Because invocation-result storage is framework-level durable state, a transaction containing only framework-level result/intent operations may omit `data_model`.
+A later transaction may reference an available result directly through `ValueSource::InvocationResult`.
 
 ### `Response`
 
@@ -783,27 +810,33 @@ No replay-consistency proof may be derived solely from the response declaration.
 
 ### `ResponseSource::invocation_result`
 
-The response is obtained from the referenced durable invocation result.
+The response is obtained from the logical invocation result available to the current invocation.
 
-This allows the verifier to use the result as a stable replay source, subject to key/schema consistency and the operation's idempotency structure.
+The solver may treat that response as replay-consistent only when it can prove that the same logical result will be reconstructed or recovered on retry.
 
 ---
 
-## 16. Invocation flows
+## 16. Invocation flows and transaction artifacts
 
 ### `InvocationFlow.steps`
 
 Steps execute in the order declared within that flow.
 
-Current flow-step kinds are:
+Current flow-step kinds remain:
 
 - `transaction`
 - `execute_effect`
 - `execute_effect_intent`
 
+No explicit `RecoverInvocationResult` or `RecoverEffectIntent` flow step is introduced.
+
 ### `transaction`
 
-Executes the referenced operation-local transaction.
+Executes or resolves the referenced operation-local transaction.
+
+For an ordinary transaction, this means executing the transaction body.
+
+For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commit already exists, the step resolves that prior commit instead of committing the body again and restores the artifacts retained by that commit.
 
 ### `execute_effect`
 
@@ -813,9 +846,31 @@ A direct effect execution is not automatically durable or retry-safe. The verifi
 
 ### `execute_effect_intent`
 
-Executes work through the referenced durable intent.
+Executes the referenced logical effect intent currently available to the invocation.
 
-This is distinct from directly executing its effect because the intent may have been established atomically with transaction state and may be recoverable after invocation failure.
+The intent may have been produced by an earlier transaction in this invocation, reconstructed by naturally replaying that transaction, or recovered from an explicitly keyed transaction commit.
+
+### Transaction-artifact visibility
+
+A successful transaction may make `InvocationResult` and `EffectIntent` artifacts available to subsequent flow steps and subsequent transactions in the same invocation.
+
+Conceptually, the invocation carries an abstract artifact context:
+
+```text
+ArtifactContext
+    InvocationResult R -> logical result value
+    EffectIntent E     -> logical effect intent
+```
+
+This context is semantic bookkeeping, not a new DSL workflow construct.
+
+Artifact availability may arise from:
+
+1. production earlier in the current invocation;
+2. deterministic reconstruction during natural transaction replay; or
+3. recovery from a prior `Commit(T,K)` for an explicitly deduplicated transaction.
+
+Transaction-read results are excluded: they remain local to the transaction execution that produced them.
 
 ### `response`
 
@@ -825,29 +880,99 @@ The response declaration itself does not imply every preceding external effect s
 
 ---
 
-## 17. Transactions
+## 17. Transactions, replayability, and explicit idempotency
 
 ### `Transaction`
 
 A transaction is one atomic commit/abort unit.
 
-Its object accesses are interpreted against its declared `data_model`.
-
-Its steps are logically ordered as written.
+Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
 
 Atomicity does not imply serializability, and serializability does not imply linearizability.
+
+Framework transaction artifacts established by the transaction participate in the same logical atomic boundary as application-state mutations.
 
 ### `data_model: <id>`
 
 The transaction operates against the identified logical transactional state boundary.
 
-Object reads/writes/locks/transitions must refer to objects belonging to that data model.
+Object reads/writes/locks/inserts/deletes/transitions must refer to objects belonging to that data model.
 
 ### `data_model: null`
 
-Permitted for a transaction that only manipulates framework-level durable state such as invocation results or effect intents.
+Permitted when the transaction performs no application `DataObject` access and only produces or consumes framework transaction artifacts.
 
 It must not be used to imply atomic application-object access with no declared transactional boundary.
+
+### Transaction idempotency guarantee
+
+A transaction should expose an `IdempotencyGuarantee` independently of any invocation-result or effect-intent declaration.
+
+#### `unspecified`
+
+No explicit keyed transaction-commit deduplication fact is available.
+
+The analyzer may still prove **natural replayability** from the transaction's declared semantics.
+
+#### `not_deduplicated`
+
+The architecture explicitly declares that the execution environment provides no keyed transaction-commit deduplication for this transaction.
+
+The analyzer may still prove natural replayability.
+
+#### `deduplicated_by`
+
+For transaction declaration `T` and evaluated key `K`, the execution environment guarantees a durable logical commit identity:
+
+```text
+Commit(T,K)
+```
+
+At most one logical execution of `T(K)` may successfully commit.
+
+On the first successful execution, application state, `Commit(T,K)`, and the exact transaction artifacts produced by that execution commit atomically.
+
+If `Commit(T,K)` already exists on a later encounter:
+
+- the transaction body is not committed again;
+- the prior logical commit is resolved;
+- artifacts retained by that commit are restored to the invocation artifact context.
+
+Concurrent attempts with the same `(T,K)` must not both successfully commit.
+
+This is a concrete implementation/conformance obligation, not a claim that arbitrary transaction code is mathematically idempotent.
+
+### Natural replayability
+
+Natural replayability is derived, not declared with a boolean.
+
+A transaction is naturally replayable only when the verifier can establish that another execution for the same logical invocation can safely reproduce the same logical transaction outcome and any artifacts required by later flow steps.
+
+This is stronger than merely showing that a second commit cannot happen.
+
+A one-shot guard that makes a second attempt abort may establish at-most-once commit behavior while still preventing the flow from reconstructing artifacts after a crash. Such a guard therefore does not, by itself, prove natural replayability.
+
+V1 may use deterministic target/value provenance and mutation semantics where sufficient. If required facts are absent, natural replayability is `Unknown`.
+
+### Artifact replay after a transaction
+
+For an artifact required after a crash, V1 accepts either:
+
+```text
+A. reconstruction
+   establishing transaction naturally replayable
+   +
+   artifact derivation replay-deterministic
+
+OR
+
+B. recovery
+   establishing transaction DeduplicatedBy(K)
+   +
+   artifact retained by Commit(T,K)
+```
+
+Otherwise the artifact's retry availability/consistency is not proven.
 
 ### Isolation
 
@@ -861,7 +986,7 @@ No isolation fact may be assumed.
 
 Reads do not observe uncommitted writes from other transactions.
 
-The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races unless prevented by stronger facts such as locks, unique claims, atomic write semantics, or serialization.
+The verifier must still consider anomalies permitted by read-committed execution, including non-repeatable reads and concurrent read/modify/write races unless prevented by stronger facts such as locks, atomic mutation semantics, uniqueness, or serialization.
 
 Read committed is not serializable.
 
@@ -877,59 +1002,137 @@ Committed transactions admit an equivalent serial execution order.
 
 Serializable does **not** by itself imply real-time precedence and therefore does not automatically prove linearizability.
 
+Serializable execution also does not imply that a transaction is replayable across separate invocation attempts.
+
 ### Transaction step order
 
 The declared step sequence represents logical program order inside the transaction.
 
-This is especially important for lock-order/deadlock analysis and for reasoning about when durable framework primitives are established relative to application state.
+This is especially important for lock-order/deadlock analysis, transaction-read provenance, state transitions, and reasoning about when transaction artifacts are established relative to application state.
 
 ---
 
-## 18. Object selectors and predicates
+## 18. Deterministic derivation and transaction reads
+
+### `Derivation`
+
+The revised DSL introduces a small provenance declaration for opaque value computation:
+
+```rust
+pub enum Derivation {
+    Unspecified,
+    Deterministic { from: Vec<ValueRef> },
+}
+```
+
+`Deterministic { from }` means:
+
+> The produced values are a deterministic function solely of the declared source values.
+
+It does **not** assert that those source values are replay-stable.
+
+The verifier separately determines replay stability of provenance roots.
+
+Therefore:
+
+```text
+deterministic derivation
+        +
+replay-stable provenance
+        ↓
+replay-deterministic produced value
+```
+
+### Transaction read results
+
+A `Read` should identify a transaction-local result so later steps in the same transaction can reference fields from that result through `ValueSource::TransactionRead`.
+
+A transaction-read result is an observation of transaction state, not a replay-stability guarantee.
+
+Validation should require that a transaction-read source:
+
+- refers to a read in the same transaction;
+- refers only to fields selected by that read; and
+- is used only after that read in transaction program order.
+
+### V1 read-dependent replay rule
+
+V1 is deliberately conservative:
+
+> If the provenance closure of a persistent mutation target, mutation value, or transaction artifact reaches a `TransactionRead`, V1 does not use that path to prove natural transaction replayability.
+
+The result is `Unknown`, not necessarily `Violated`.
+
+Determinism of the computation is insufficient. The value observed by the read may differ on retry even when no other process modified it.
+
+In particular, a transaction can read a field and then deterministically write a function of that value back to the same object:
+
+```text
+Read A.counter -> r
+Write A.counter = f(r.counter)
+```
+
+For deterministic `f(x) = x + 1`, the first execution may observe `5` and commit `6`, while the retry observes `6` and commits `7`. The computation is deterministic but the transaction is not naturally replayable.
+
+A future solver may attempt a stronger invariance proof. Such a proof must account for both:
+
+1. mutations by other admitted executions between attempts; and
+2. the establishing transaction's own effect on the state it later re-reads.
+
+For a read observation function `R` and transaction state transformation `T`, absence of external writers is insufficient; the solver may need to establish an invariant corresponding to `R(S) = R(T(S))` over the relevant admitted states, together with any required interleaving guarantees.
+
+---
+
+## 19. Object selectors and predicates
 
 ### `ObjectSelector`
 
-An object selector identifies zero or more instances of one `DataObject`.
+A selector identifies which instances of one declared `DataObject` a transaction step addresses.
 
-It contains the object type and a predicate.
-
-A selector is not assumed to identify exactly one instance unless its predicate can be proven to constrain the complete declared object identity.
+The selector is a logical predicate, not a claim about a particular database query plan or index.
 
 ### `SelectorPredicate::all`
 
-Selects all instances of the object.
+Selects every modeled instance of the object satisfying no narrower condition.
+
+This is a broad selector and may imply many concrete object accesses.
 
 ### `eq`
 
-Constrains one object field path to equal the specified selector value.
+Requires the selected object's field to equal either:
+
+- a `ValueRef`, or
+- a literal.
+
+The equality is a logical predicate over modeled values.
+
+Because the selector explicitly exposes its literals and `ValueRef`s, selector provenance should be derived structurally rather than asserted with a separate `deterministic` flag.
 
 ### `and`
 
 All nested predicates must hold.
 
-The current predicate language has no explicit `or`, range, inequality, or negation semantics.
+The list is conjunctive. It does not define short-circuit evaluation order or physical query evaluation order.
 
-### `SelectorValue::value`
+### Selector precision and object identity
 
-Uses a `ValueRef` from the invocation/model.
+A selector constraining every field of a `DataObject.identity` to one logical value identifies at most one logical object instance.
 
-### `SelectorValue::literal`
+A selector constraining only part of a composite identity may match multiple logical instances.
 
-Uses a literal constant.
-
-Current literal kinds are `string`, `bool`, and `int`.
-
-Selector equality does not itself imply a lock or atomic check. It only describes the logical target set.
+A verifier must not treat partial identity coverage as single-object selection.
 
 ---
 
-## 19. Read, write, insert, and delete steps
+## 20. Read, write, insert, and delete steps
 
 ### `Read`
 
 Reads the selected object instances.
 
 `fields` describes the read set visible to conflict analysis.
+
+The revised model should also name the transaction-local read result so later steps in the same transaction can use it as deterministic provenance.
 
 #### `FieldSelection::all`
 
@@ -945,23 +1148,31 @@ Reads only the listed field paths for the modeled semantics.
 
 Mutates the listed fields of the selected object instances.
 
-The DSL records the write set, not the new values.
+The revised model should declare the provenance of the values written through `Derivation`.
 
-A write declaration does not by itself say whether the implementation uses compare-and-swap, a blind update, an increment, or another physical primitive.
+A deterministic derivation describes value computation, not replayability by itself. Natural replay analysis must additionally establish replay stability of the selected target and all derivation roots.
+
+A write whose derivation is `Unspecified` normally leaves natural replayability `Unknown` when that mutation matters to the proof.
 
 ### `Insert`
 
 Creates a new instance of the declared object type.
 
-The current step does not encode field assignments. Identity/value lineage must therefore come from other declarations, such as a unique claim or surrounding operation semantics, when needed by a proof.
+The revised model should declare inserted-value provenance through `Derivation` but must **not** redeclare object identity.
+
+`DataObject.identity` already defines the strict non-empty logical identity of every object instance. Two distinct successful inserts cannot create two logical instances with the same complete identity. A separate `AcquireUniqueClaim`/`UniqueClaim` primitive is therefore redundant and is removed by the revised model.
+
+Whether retrying a conflicting insert can participate in a natural replayability proof depends on the final duplicate-identity/insert outcome semantics. Until that behavior is explicitly defined, V1 must not infer full transaction replayability merely from object identity uniqueness.
 
 ### `Delete`
 
 Deletes the instances selected by the object selector.
 
+Deletion replay behavior depends on what the model guarantees when the selected instance is already absent. Unless sufficient semantics establish a reproducible outcome, the verifier must not silently treat deletion as naturally replayable merely because applying deletion twice leaves no object.
+
 ---
 
-## 20. Locks
+## 21. Locks
 
 ### `Lock`
 
@@ -1005,29 +1216,6 @@ A `by` order within one selector does not automatically reconcile contradictory 
 
 ---
 
-## 21. Unique claims
-
-### `AcquireUniqueClaim`
-
-A unique claim establishes exclusive uniqueness for one logical object identity.
-
-`mapping` maps object identity field paths to invocation values.
-
-The mapping must cover the complete declared identity of the object.
-
-If the full identity is covered, the verifier may treat competing attempts with the same mapped identity as contending for the same unique claim: they cannot both successfully establish distinct ownership of that one logical identity.
-
-A unique claim is commonly implementable with a unique constraint, conditional insert, compare-and-set reservation, or another equivalent mechanism, but the DSL is implementation-independent.
-
-A unique claim:
-
-- is scoped to the declared object identity;
-- does not serialize different identities;
-- does not establish business ordering;
-- and does not substitute for a lock on unrelated mutable fields.
-
----
-
 ## 22. State machines
 
 ### `StateMachine`
@@ -1064,35 +1252,63 @@ Selects a concrete persistent machine instance and applies the named transition.
 
 The transition's `from` condition and update to `to` are interpreted as one logical state transition within the surrounding transaction.
 
-The state machine declares **legality**, not concurrency safety. Two individually legal transitions can still race. The verifier must use isolation, locks, serialization, ordering, or other facts to prove that concurrent execution cannot produce an illegal history.
+The state machine declares legality, not concurrency safety. Two individually legal transitions can still race. The verifier must use isolation, locks, serialization, ordering, or other facts to prove that concurrent execution cannot produce an illegal history.
+
+### V1 transition replay rule
+
+A transaction containing any `Transition` is **not naturally replayable in V1**.
+
+Once a transition-containing transaction has committed, its state-dependent transition cannot be assumed to execute again in a way that reproduces the original transaction outcome and artifacts. A transition that prevents a second commit may provide an at-most-once gate, but that is not sufficient for flow crash recovery.
+
+Accordingly, under the V1 contract:
+
+> Every transaction containing a `Transition` MUST declare explicit durable keyed transaction idempotency with `DeduplicatedBy { key }`.
+
+The purpose is not merely to suppress a second transition. The keyed commit acts as the durable recovery boundary: after a successful commit, later encounters resolve the prior `Commit(T,K)` and recover its retained transaction artifacts without reapplying the transition.
 
 ### Transition side effects
 
 A transition may declare publication or request side effects associated with taking that transition.
 
-These are logical effects of the transition. Their declaration does not magically make an external transport participate in the local database transaction.
+For replay semantics, these side effects are treated as **implicitly established effect-intent transaction artifacts** when the transition successfully commits. They are not direct external executions inside the application-state transaction.
 
-The verifier must not infer exactly-once or atomic external delivery merely from the fact that an effect is attached to a transition.
+Therefore transition side effects commit logically with the transition as intents, enter the invocation artifact context, and are subject to the same retention/recovery rules as explicitly established `EffectIntent`s.
 
-If crash-safe atomic coupling is required, the model must contain a structure that actually establishes that guarantee.
+The current Rust `TransitionSideEffect` representation may require a structural adjustment so an implicitly established intent has a stable logical identity that can be referenced by a later `ExecuteEffectIntent` step. That is an implementation-shape requirement; it does not change the semantics above.
+
+In particular, consider:
+
+```text
+Transaction T
+    Transition pending -> paid
+        establishes effect intent E
+COMMIT
+
+ExecuteEffectIntent E
+```
+
+If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, natural replay cannot be relied on to reproduce `E`, because V1 will not replay the transition transaction naturally. `DeduplicatedBy { key }` ensures that retrying `T` resolves the prior commit and restores `E`, allowing the flow to continue.
+
+This still does not imply exactly-once external execution. Effect-level idempotency/retry analysis remains necessary.
 
 ---
 
-## 23. Framework durable state versus application data
+## 23. Framework transaction artifacts versus application data
 
-Effect intents and invocation results are framework-level durable primitives.
+`InvocationResult` and `EffectIntent` are framework-level **logical transaction artifacts**, not inherently durable primitives.
 
-This is why a transaction containing only operations such as:
+They may participate atomically in a transaction without belonging to the application `DataModel` namespace.
 
-- `EstablishEffectIntent`
-- `EstablishInvocationResult`
-- `ReadInvocationResult`
-
-may have `data_model: null`.
+A transaction containing only framework artifact-establishment operations may therefore have `data_model: null`.
 
 Once a transaction reads, writes, locks, inserts, deletes, or transitions an application `DataObject`, its application transactional boundary must be declared.
 
-Framework durability should not be interpreted as a hidden global transaction spanning arbitrary application data models.
+Artifact durability depends on the replay mechanism:
+
+- a naturally replayable transaction may reconstruct replay-deterministic artifacts;
+- a transaction `DeduplicatedBy { key }` must durably retain the exact artifacts of its successful `Commit(T,K)` because its body is not committed again on replay.
+
+This framework retention must not be interpreted as a hidden global transaction spanning arbitrary application data models.
 
 ---
 
@@ -1112,9 +1328,14 @@ The solver must preserve these distinctions:
 | **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. |
 | **Atomic transaction vs external side effect** | Local atomic commit does not imply an external publication/request is atomic with it. |
 | **Idempotency lineage vs deduplication** | Propagating a key lets the analyzer trace identity; only a guarantee/mechanism actually deduplicates. |
-| **Recoverability vs exactly once** | A durable intent can be retried after failure, which often increases duplicate-execution risk. |
+| **Deterministic derivation vs replay stability** | The same sources produce the same value, but those source values may differ on retry. |
+| **Natural replayability vs at-most-once commit** | Preventing a second commit does not guarantee that a retry can reconstruct the original outcome or artifacts. |
+| **Natural replay vs keyed recovery** | Natural replay recomputes the same logical outcome; keyed transaction idempotency resolves a prior durable commit without committing the body again. |
+| **Artifact availability vs intrinsic durability** | An artifact may be reconstructed naturally or recovered from a keyed commit; its declaration alone does not imply durable storage. |
+| **Transaction read determinism vs read invariance** | A deterministic computation from a read can still change on retry because the observed state may have changed, including due to the transaction itself. |
 | **Object identity vs ordering key** | They may coincide, but neither declaration automatically implies the other. |
-| **State-machine legality vs race safety** | A valid transition graph does not ensure concurrent transitions are safely coordinated. |
+| **State-machine legality vs replayability** | A legal transition graph does not imply that a transition-containing transaction can be naturally replayed after commit. |
+| **Effect-intent recovery vs exactly once** | Recovering the same intent does not establish whether the external effect already occurred or whether another attempt is safe. |
 
 ---
 
