@@ -21,6 +21,7 @@ pub enum ReferenceKind {
     InvocationResult,
     Response,
     Transaction,
+    TransactionRead,
     InvocationFlow,
 }
 
@@ -46,6 +47,7 @@ impl fmt::Display for ReferenceKind {
             Self::InvocationResult => "invocation result",
             Self::Response => "response",
             Self::Transaction => "transaction",
+            Self::TransactionRead => "transaction read",
             Self::InvocationFlow => "invocation flow",
         };
 

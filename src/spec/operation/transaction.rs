@@ -1,20 +1,29 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{FieldPath, Id};
 
-use super::ValueRef;
+use super::{Derivation, IdempotencyGuarantee, ValueRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
-    /// None is permitted when the transaction only establishes
-    /// framework-level durable state such as an EffectIntent or
-    /// InvocationResult.
+    /// None is permitted when the transaction performs no application
+    /// DataObject access and only produces or consumes framework
+    /// transaction artifacts.
     pub data_model: Option<Id>,
 
     pub isolation: TransactionIsolation,
+
+    /// Explicit durable keyed commit deduplication provided by the
+    /// execution environment.
+    ///
+    /// This is independent of any invocation-result or effect-intent
+    /// declaration. `Unspecified` and `NotDeduplicated` leave the
+    /// analyzer free to prove natural replayability from the body.
+    pub idempotency: IdempotencyGuarantee,
+
     pub steps: Vec<TransactionStep>,
 }
 
@@ -36,16 +45,20 @@ pub enum TransactionStep {
     Delete(Delete),
     Lock(Lock),
 
-    AcquireUniqueClaim(UniqueClaim),
     Transition(StateTransition),
     EstablishEffectIntent(EstablishEffectIntent),
     EstablishInvocationResult(EstablishInvocationResult),
-    ReadInvocationResult(ReadInvocationResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Read {
+    /// Transaction-local identity of this observation.
+    ///
+    /// Later steps in the same transaction may reference the observed
+    /// values through `ValueSource::TransactionRead`.
+    pub result: Id,
+
     pub target: ObjectSelector,
     pub fields: FieldSelection,
 }
@@ -55,12 +68,21 @@ pub struct Read {
 pub struct Write {
     pub target: ObjectSelector,
     pub fields: BTreeSet<FieldPath>,
+
+    /// Provenance of the values written.
+    pub values: Derivation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Insert {
     pub object: Id,
+
+    /// Provenance of the inserted contents.
+    ///
+    /// An insert never redeclares object identity: `DataObject.identity`
+    /// is already the complete logical identity of every instance.
+    pub values: Derivation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,18 +173,6 @@ pub enum Literal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UniqueClaim {
-    pub object: Id,
-
-    /// Object identity field -> invocation value.
-    ///
-    /// The checker verifies that this covers the object's complete
-    /// declared identity and therefore establishes a unique claim.
-    pub mapping: BTreeMap<FieldPath, ValueRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StateTransition {
     pub machine: Id,
     pub transition: Id,
@@ -175,16 +185,16 @@ pub struct StateTransition {
 #[serde(deny_unknown_fields)]
 pub struct EstablishEffectIntent {
     pub intent: Id,
+
+    /// Provenance of the intent's logical contents.
+    pub values: Derivation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EstablishInvocationResult {
     pub result: Id,
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReadInvocationResult {
-    pub result: Id,
+    /// Provenance of the result's logical contents.
+    pub values: Derivation,
 }

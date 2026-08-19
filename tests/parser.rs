@@ -6,8 +6,9 @@ use std::{
 use archspec::{
     parser::yaml,
     spec::{
-        Effect, Id, IdempotencyGuarantee, Input, LaneConcurrency, Schema, SchemaCompleteness,
-        ServiceKind, TopicOrdering, TransactionStep,
+        CompletionRequirement, Derivation, Effect, Id, IdempotencyGuarantee, Input,
+        LaneConcurrency, Schema, SchemaCompleteness, ServiceKind, TopicOrdering, TransactionStep,
+        TransitionSideEffect, ValueSource,
     },
 };
 
@@ -220,7 +221,7 @@ fn parses_flash_checkout_model() {
     assert_eq!(model.revision.0, 1);
 
     assert_eq!(model.services.len(), 3);
-    assert_eq!(model.schemas.len(), 12);
+    assert_eq!(model.schemas.len(), 13);
     assert_eq!(model.data_models.len(), 2);
     assert_eq!(model.topics.len(), 1);
     assert_eq!(model.state_machines.len(), 1);
@@ -359,4 +360,213 @@ fn flash_checkout_serialization_is_canonical() {
     let second = yaml::serialize(&reparsed).expect("reparsed model should serialize");
 
     assert_eq!(first, second);
+}
+
+#[test]
+fn flash_checkout_parses_keyed_transaction_idempotency() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let transaction = model
+        .operations
+        .get(&Id("operation.create_order".into()))
+        .expect("create_order should exist")
+        .transactions
+        .get(&Id("tx.create_order.new".into()))
+        .expect("create_order transaction should exist");
+
+    let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency else {
+        panic!("create_order transaction should declare keyed commit deduplication");
+    };
+
+    assert_eq!(key.components.len(), 1);
+
+    assert_eq!(
+        key.components[0].source,
+        ValueSource::Input(Id("input.create_order.request".into()))
+    );
+
+    assert_eq!(
+        key.components[0].path.0,
+        vec!["idempotency_key".to_string()]
+    );
+
+    // The artifact carries no key of its own; durable identity comes
+    // from the committing transaction.
+    let result = model
+        .operations
+        .get(&Id("operation.create_order".into()))
+        .unwrap()
+        .invocation_results
+        .get(&Id("result.create_order".into()))
+        .expect("create_order result should exist");
+
+    assert_eq!(result.schema, Id("schema.CreateOrderResponse".into()));
+}
+
+#[test]
+fn flash_checkout_parses_transaction_read_provenance() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let transaction = model
+        .operations
+        .get(&Id("operation.reserve_inventory".into()))
+        .expect("reserve_inventory should exist")
+        .transactions
+        .get(&Id("tx.reserve_inventory".into()))
+        .expect("reserve_inventory transaction should exist");
+
+    let TransactionStep::Read(read) = &transaction.steps[0] else {
+        panic!("first step should be a read");
+    };
+
+    assert_eq!(read.result, Id("read.reserve_inventory.stock".into()));
+
+    let TransactionStep::Write(write) = &transaction.steps[1] else {
+        panic!("second step should be a write");
+    };
+
+    let Derivation::Deterministic { from } = &write.values else {
+        panic!("write should declare deterministic value provenance");
+    };
+
+    assert_eq!(
+        from[0].source,
+        ValueSource::TransactionRead(Id("read.reserve_inventory.stock".into()))
+    );
+
+    // Provenance is declared even where V1 will not use it to prove
+    // natural replayability.
+    assert_eq!(from[0].path.0, vec!["reserved".to_string()]);
+}
+
+#[test]
+fn flash_checkout_parses_transition_side_effect_intent() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let transition = model
+        .state_machines
+        .get(&Id("machine.order_lifecycle".into()))
+        .expect("order lifecycle should exist")
+        .transitions
+        .get(&Id("transition.order.mark_paid".into()))
+        .expect("mark_paid transition should exist");
+
+    let effect = transition
+        .side_effects
+        .get(&Id("effect.order.paid".into()))
+        .expect("mark_paid should declare a side effect");
+
+    assert!(matches!(effect, TransitionSideEffect::Publication(_)));
+
+    // The operation names that implicitly established intent so a flow
+    // step can execute it.
+    let apply_payment = model
+        .operations
+        .get(&Id("operation.apply_payment".into()))
+        .expect("apply_payment should exist");
+
+    let intent = apply_payment
+        .effect_intents
+        .get(&Id("intent.apply_payment.order_paid".into()))
+        .expect("apply_payment should declare the transition intent");
+
+    assert_eq!(intent.effect, Id("effect.order.paid".into()));
+
+    // The transaction establishes no intent explicitly.
+    let transaction = apply_payment
+        .transactions
+        .get(&Id("tx.apply_payment".into()))
+        .expect("apply_payment transaction should exist");
+
+    assert!(
+        transaction
+            .steps
+            .iter()
+            .all(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)))
+    );
+}
+
+#[test]
+fn flash_checkout_parses_unspecified_derivation() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let transaction = model
+        .operations
+        .get(&Id("operation.transfer_stock".into()))
+        .expect("transfer_stock should exist")
+        .transactions
+        .get(&Id("tx.transfer_stock".into()))
+        .expect("transfer_stock transaction should exist");
+
+    assert_eq!(transaction.idempotency, IdempotencyGuarantee::Unspecified);
+
+    let TransactionStep::Write(write) = &transaction.steps[4] else {
+        panic!("fifth step should be the destination write");
+    };
+
+    assert_eq!(write.values, Derivation::Unspecified);
+}
+
+#[test]
+fn flash_checkout_parses_recoverability_requirements() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    // Request-driven: no retry driver is modeled, so only resumability
+    // is required.
+    let create_order = model
+        .operations
+        .get(&Id("operation.create_order".into()))
+        .expect("create_order should exist");
+
+    let requirement = &create_order.requirements.recoverability[0];
+
+    assert_eq!(requirement.completion, CompletionRequirement::Resumable);
+
+    assert_eq!(
+        requirement.key.components[0].source,
+        ValueSource::Input(Id("input.create_order.request".into()))
+    );
+
+    // Subscription-driven with at-least-once delivery: completion is
+    // required outright.
+    let apply_payment = model
+        .operations
+        .get(&Id("operation.apply_payment".into()))
+        .expect("apply_payment should exist");
+
+    let requirement = &apply_payment.requirements.recoverability[0];
+
+    assert_eq!(requirement.completion, CompletionRequirement::Guaranteed);
+
+    assert_eq!(
+        requirement.key.components[0].path.0,
+        vec!["event_id".to_string()]
+    );
+
+    // Recoverability is independent of idempotency: both are declared
+    // here, keyed by the same logical invocation identity.
+    assert_eq!(apply_payment.requirements.idempotency.len(), 1);
+
+    assert_eq!(
+        apply_payment.requirements.idempotency[0].key,
+        requirement.key
+    );
+
+    // An operation may require neither.
+    let transfer_stock = model
+        .operations
+        .get(&Id("operation.transfer_stock".into()))
+        .expect("transfer_stock should exist");
+
+    assert!(transfer_stock.requirements.recoverability.is_empty());
 }

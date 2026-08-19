@@ -570,6 +570,71 @@ No replay-stability requirement is declared for the response.
 
 This does not waive the operation's idempotency requirement for side effects.
 
+### `RecoverabilityRequirement`
+
+A recoverability requirement keyed by an `IdempotencyKey` means:
+
+> The logical invocation identified by that key must reach terminal execution of a declared flow.
+
+Recoverability is a **progress** obligation. Idempotency is a **safety** obligation. They are deliberately separate requirements because neither implies the other.
+
+An idempotency requirement constrains what repeated attempts may do. It is satisfied vacuously by never retrying at all: an invocation that crashes after its transaction commits and is never re-driven produces no duplicate work, and therefore violates nothing. Idempotency consequently says nothing about whether the remaining steps of an interrupted flow ever execute.
+
+This is exactly the gap left by §14 and §22. Consider:
+
+```text
+Transaction T   DeduplicatedBy(K)
+    Transition pending -> paid
+        establishes effect intent E
+COMMIT
+
+<crash>
+
+ExecuteEffectIntent E
+```
+
+The keyed commit makes `E` *recoverable*, and the operation's idempotency requirement is satisfied. But nothing in the model yet obliges anyone to come back and execute `E`. The order is durably `paid` and the payment capture never happens. A recoverability requirement is what makes that outcome a declared violation rather than an unremarked silence.
+
+The key identifies the retry-equivalence class in the same sense as §12: attempts sharing the key are attempts at the same logical invocation, so re-driving one of them continues that invocation rather than starting a new one.
+
+The requirement does not name a flow. An invocation takes one of the operation's alternative flows (§7), and a resumed attempt reaching the terminal step of any admitted flow discharges the obligation. Which flows remain admissible after a partial execution is the open question recorded in the revision draft; the requirement is deliberately stated so as not to prejudge it.
+
+### `completion: resumable`
+
+An interrupted attempt must be **able** to resume and drive a declared flow to its terminal step.
+
+For every prefix at which the invocation may fail, the solver must establish that a continuation exists:
+
+- each already-committed transaction resolves on re-encounter, by natural replay or by `Commit(T,K)` (§17);
+- every artifact a later step consumes is replay-available by route A or route B of §17;
+- no step is left in a state from which the flow cannot proceed.
+
+`resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Archspec does not model.
+
+### `completion: guaranteed`
+
+In addition to resumability, the architecture must guarantee that the logical invocation **is** re-driven until a declared flow terminates.
+
+This is a liveness obligation and additionally requires a modeled retry driver, such as:
+
+- `delivery: at_least_once` on the triggering subscription, or
+- an inbound `RequestEffect` whose `retry` is `may_repeat`.
+
+Two cautions apply.
+
+First, the driver facts in the current DSL are duplicate-delivery facts, not bounded-liveness facts. §8.2 states that `at_least_once` "does not encode retry timing, retry count, backoff, or a bounded eventual-delivery liveness guarantee." A `guaranteed` proof is therefore conditional on the delivery abstraction genuinely redelivering until the invocation succeeds, in the sense of §1.3.
+
+Second, a request input alone supplies no driver. The caller is outside the model, so `guaranteed` on a request-only operation is normally not dischargeable unless the calling side is itself modeled as a `may_repeat` request effect.
+
+### Idempotency versus recoverability
+
+A recoverability requirement makes retries *expected* rather than merely *possible*. It therefore strengthens the case for also declaring an idempotency requirement, but the DSL does not couple them:
+
+- **recoverability without idempotency** is coherent where repeating the work is harmless;
+- **idempotency without recoverability** is coherent where best-effort completion is acceptable.
+
+Neither implies exactly-once external execution. Driving a flow to termination still leaves the effect-level uncertainty described in §14: an external effect may have succeeded before a crash without that success being durably known.
+
 ---
 
 ## 10. Operation execution concurrency
@@ -607,6 +672,24 @@ A value reference consists of:
 - and a `FieldPath` relative to that source's schema.
 
 It identifies a logical value and is the main mechanism for linking keys, predicates, and deterministic provenance across the model.
+
+### Reference scope
+
+A value reference is evaluated by some set of invocations, and may only name a source those invocations can actually observe.
+
+The evaluating invocations are determined by where the reference is declared:
+
+- a reference declared within an operation — in its requirements, its effects, or its transactions — is evaluated by invocations of **that operation**;
+- a reference declared on a state-machine transition side effect is evaluated by invocations of **whichever operation applies that transition**.
+
+From that scope:
+
+- `input` and `invocation_result` must name declarations of an admitted operation. Another operation's input is never the "current invocation's input payload", and another operation's result is never available to this invocation.
+- `effect` must name an effect of an admitted operation, or a transition side effect of a transition an admitted operation applies.
+- `state_machine_subject` is unrestricted. State machines are global, and any operation may address the persistent objects they govern.
+- `transaction_read` is restricted further, to the transaction execution that produces it. See §18.
+
+This is a structural coherence rule, not a replay-stability claim. A reference being observable says nothing about whether its value is stable across retries.
 
 ### `ValueSource::input`
 
@@ -1274,7 +1357,16 @@ For replay semantics, these side effects are treated as **implicitly established
 
 Therefore transition side effects commit logically with the transition as intents, enter the invocation artifact context, and are subject to the same retention/recovery rules as explicitly established `EffectIntent`s.
 
-The current Rust `TransitionSideEffect` representation may require a structural adjustment so an implicitly established intent has a stable logical identity that can be referenced by a later `ExecuteEffectIntent` step. That is an implementation-shape requirement; it does not change the semantics above.
+An implicitly established intent needs a stable logical identity so a later `ExecuteEffectIntent` step can name it. That identity is supplied by an operation-level `EffectIntent` whose `effect` is the transition side effect. The operation declares the handle; the transition establishes the artifact.
+
+Two rules keep that identity well defined:
+
+1. **Uniqueness.** An operation may declare at most one `EffectIntent` for a given transition side effect. A transition establishes exactly one logical intent per side effect, so two competing declarations would leave no rule for deciding which one the commit fills.
+2. **Establishability.** An operation may declare such an intent only if one of its transactions applies the owning transition. Otherwise nothing in the operation could ever establish it, and the handle names an artifact that never enters the invocation artifact context.
+
+Neither rule constrains explicitly established intents. Two `EffectIntent`s may name the same operation-owned effect, because each is established by its own `EstablishEffectIntent` step and the two are therefore distinguishable.
+
+Conversely, a transition side effect must **not** be established explicitly, and must not be executed by a direct `ExecuteEffect` step. Establishment is the transition's, and execution is `ExecuteEffectIntent`'s.
 
 In particular, consider:
 
@@ -1336,6 +1428,9 @@ The solver must preserve these distinctions:
 | **Object identity vs ordering key** | They may coincide, but neither declaration automatically implies the other. |
 | **State-machine legality vs replayability** | A legal transition graph does not imply that a transition-containing transaction can be naturally replayed after commit. |
 | **Effect-intent recovery vs exactly once** | Recovering the same intent does not establish whether the external effect already occurred or whether another attempt is safe. |
+| **Idempotency vs recoverability** | Idempotency bounds what retries may do and is satisfied by never retrying; recoverability obliges the flow to actually reach its terminal step. |
+| **Resumable vs guaranteed completion** | Being able to resume is a property of the flow's artifacts; being re-driven requires a modeled retry driver. |
+| **Duplicate-delivery fact vs liveness** | `at_least_once` and `may_repeat` say a retry may happen, not that retries continue until success. |
 
 ---
 

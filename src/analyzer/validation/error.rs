@@ -46,6 +46,14 @@ pub enum ValidationError {
         source: Id,
     },
 
+    /// A ValueRef names a source that the invocations evaluating it
+    /// cannot observe, such as another operation's input.
+    ValueSourceOutOfScope {
+        subject: Id,
+        source: Id,
+        owner: Id,
+    },
+
     FragmentCycle {
         cycle: Vec<Id>,
     },
@@ -88,11 +96,76 @@ pub enum ValidationError {
         object: Id,
     },
 
+    /// A ValueRef names a transaction-read result outside the
+    /// transaction execution that produces it.
+    TransactionReadOutsideTransaction {
+        subject: Id,
+        read: Id,
+    },
+
+    /// A ValueRef names a transaction-read result that does not
+    /// precede its use in transaction program order.
+    TransactionReadOutOfOrder {
+        transaction: Id,
+        read: Id,
+    },
+
+    /// A ValueRef names a field the read did not select.
+    TransactionReadFieldNotSelected {
+        transaction: Id,
+        read: Id,
+        path: FieldPath,
+    },
+
     StateTransitionSubjectMismatch {
         transaction: Id,
         machine: Id,
         expected_object: Id,
         actual_object: Id,
+    },
+
+    /// V1 requires every transition-containing transaction to declare
+    /// durable keyed commit deduplication.
+    TransitionTransactionNotDeduplicated {
+        transaction: Id,
+        machine: Id,
+        transition: Id,
+    },
+
+    /// A transition side effect is established implicitly by the
+    /// transition and must not be established explicitly.
+    TransitionEffectIntentExplicitlyEstablished {
+        transaction: Id,
+        intent: Id,
+        effect: Id,
+    },
+
+    /// An operation declares more than one effect intent for the same
+    /// transition side effect, leaving the implicitly established
+    /// artifact without a single logical identity.
+    AmbiguousTransitionEffectIntent {
+        operation: Id,
+        effect: Id,
+        intents: Vec<Id>,
+    },
+
+    /// An operation declares an effect intent for a transition side
+    /// effect, but applies no transition that could establish it.
+    UnestablishableTransitionEffectIntent {
+        operation: Id,
+        intent: Id,
+        effect: Id,
+        transition: Id,
+    },
+
+    EmptyObjectIdentity {
+        object: Id,
+    },
+
+    /// An operation requires that its invocations reach terminal
+    /// execution, but declares no flow that could terminate.
+    RecoverabilityRequiresFlow {
+        operation: Id,
     },
 
     ResponseInvocationResultSchemaMismatch {
@@ -278,6 +351,31 @@ impl From<ValidationError> for Diagnostic {
                         subject: Some(source),
                         message:
                             "A field path can only be resolved from a structurally typed value source."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::ValueSourceOutOfScope {
+                subject,
+                source,
+                owner,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::ValueSourceOutOfScope,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(subject.clone()),
+                    message: format!(
+                        "`{subject}` references `{source}`, which belongs to \
+                         `{owner}` and is not observable by the invocations \
+                         that evaluate this reference."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(owner),
+                        message:
+                            "A value reference may only name inputs, effects, and invocation results reachable from the operation whose invocation evaluates it."
                                 .to_string(),
                     }],
                 }
@@ -480,6 +578,76 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
+            ValidationError::TransactionReadOutsideTransaction {
+                subject,
+                read,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransactionReadOutsideTransaction,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(subject.clone()),
+                    message: format!(
+                        "`{subject}` references transaction-read result `{read}` \
+                         outside the transaction execution that produces it."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(read),
+                        message:
+                            "A transaction-read result is local to its transaction execution and never becomes a durable cross-transaction artifact."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::TransactionReadOutOfOrder {
+                transaction,
+                read,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransactionReadOutOfOrder,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction.clone()),
+                    message: format!(
+                        "Transaction `{transaction}` references transaction-read \
+                         result `{read}` before the step that reads it."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(read),
+                        message:
+                            "A transaction-read result may only be referenced by steps that follow the read in transaction program order."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::TransactionReadFieldNotSelected {
+                transaction,
+                read,
+                path,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransactionReadFieldNotSelected,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction),
+                    message: format!(
+                        "Transaction-read result `{read}` is referenced through \
+                         field path `{path}`, which the read does not select."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(read),
+                        message: format!(
+                            "This read does not include `{path}` in its field selection."
+                        ),
+                    }],
+                }
+            }
+
             ValidationError::StateTransitionSubjectMismatch {
                 transaction,
                 machine,
@@ -512,6 +680,165 @@ impl From<ValidationError> for Diagnostic {
                                     .to_string(),
                         },
                     ],
+                }
+            }
+
+            ValidationError::TransitionTransactionNotDeduplicated {
+                transaction,
+                machine,
+                transition,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransitionTransactionNotDeduplicated,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction.clone()),
+                    message: format!(
+                        "Transaction `{transaction}` applies transition \
+                         `{transition}` but declares no durable keyed commit \
+                         deduplication."
+                    ),
+                    evidence: vec![
+                        Evidence {
+                            subject: Some(transition),
+                            message: format!(
+                                "This transition of `{machine}` changes the state \
+                                 it is evaluated against, so the transaction \
+                                 cannot be naturally replayed."
+                            ),
+                        },
+                        Evidence {
+                            subject: Some(transaction),
+                            message:
+                                "A transition-containing transaction must declare `deduplicated_by` so a later encounter can resolve the prior commit and recover its artifacts."
+                                    .to_string(),
+                        },
+                    ],
+                }
+            }
+
+            ValidationError::TransitionEffectIntentExplicitlyEstablished {
+                transaction,
+                intent,
+                effect,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransitionEffectIntentExplicitlyEstablished,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction),
+                    message: format!(
+                        "Transaction establishes effect intent `{intent}`, but its \
+                         effect `{effect}` is a transition side effect."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(effect),
+                        message:
+                            "A transition side effect is established implicitly by a successful transition, not by an explicit establishment step."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::AmbiguousTransitionEffectIntent {
+                operation,
+                effect,
+                intents,
+            } => {
+                let evidence = intents
+                    .iter()
+                    .map(|intent| Evidence {
+                        subject: Some(intent.clone()),
+                        message: format!(
+                            "`{intent}` claims the intent established by this \
+                             transition side effect."
+                        ),
+                    })
+                    .collect();
+
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::AmbiguousTransitionEffectIntent,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(operation.clone()),
+                    message: format!(
+                        "Operation `{operation}` declares more than one effect \
+                         intent for transition side effect `{effect}`."
+                    ),
+                    evidence,
+                }
+            }
+
+            ValidationError::UnestablishableTransitionEffectIntent {
+                operation,
+                intent,
+                effect,
+                transition,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::UnestablishableTransitionEffectIntent,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(operation.clone()),
+                    message: format!(
+                        "Operation `{operation}` declares effect intent \
+                         `{intent}` for transition side effect `{effect}`, but \
+                         applies no transition that would establish it."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(transition.clone()),
+                        message: format!(
+                            "No transaction in `{operation}` applies transition \
+                             `{transition}`, which owns this side effect."
+                        ),
+                    }],
+                }
+            }
+
+            ValidationError::EmptyObjectIdentity {
+                object,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::EmptyObjectIdentity,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(object.clone()),
+                    message: format!(
+                        "Data object `{object}` declares an empty identity."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(object),
+                        message:
+                            "Every data object must declare the complete, non-empty logical identity of one instance."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::RecoverabilityRequiresFlow {
+                operation,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::RecoverabilityRequiresFlow,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(operation.clone()),
+                    message: format!(
+                        "Operation `{operation}` declares a recoverability \
+                         requirement but declares no invocation flow."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(operation),
+                        message:
+                            "Recoverability obliges an invocation to reach the terminal step of a declared flow, so at least one flow must exist."
+                                .to_string(),
+                    }],
                 }
             }
 

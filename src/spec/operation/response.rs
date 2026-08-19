@@ -16,7 +16,11 @@ pub enum ResponseSource {
     /// No replay-stability claim can be derived.
     Unspecified,
 
-    /// The logical response is obtained from an immutable,
-    /// durable invocation result.
+    /// The response is obtained from the logical invocation result
+    /// available to the current invocation.
+    ///
+    /// This source does not by itself imply durable memoization;
+    /// replay consistency must be proven from the establishing
+    /// transaction's replay semantics.
     InvocationResult { result: Id },
 }

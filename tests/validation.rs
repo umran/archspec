@@ -8,8 +8,10 @@ use archspec::{
     analyzer::validation::{self, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        FieldPath, FlowStep, Id, Input, MessageSelector, Model, Schema, SchemaFragment,
-        TopicOrdering, TransactionStep, ValueSource,
+        CompletionRequirement, Derivation, EffectIntent, EstablishEffectIntent, FieldPath,
+        FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageSelector, Model,
+        RecoverabilityRequirement, Schema, SchemaFragment, TopicOrdering, TransactionStep,
+        ValueRef, ValueSource,
     },
 };
 
@@ -480,6 +482,601 @@ fn rejects_field_reference_into_untyped_external_effect() {
         vec![ValidationError::ValueSourceHasNoSchema {
             subject: id("operation.charge_payment"),
             source: id("effect.charge_payment.card"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transition_transaction_without_keyed_idempotency() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.apply_payment"))
+        .unwrap();
+
+    transaction.idempotency = IdempotencyGuarantee::Unspecified;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransitionTransactionNotDeduplicated {
+            transaction: id("tx.apply_payment"),
+            machine: id("machine.order_lifecycle"),
+            transition: id("transition.order.mark_paid"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_explicit_establishment_of_transition_effect_intent() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.apply_payment"))
+        .unwrap();
+
+    transaction
+        .steps
+        .push(TransactionStep::EstablishEffectIntent(
+            EstablishEffectIntent {
+                intent: id("intent.apply_payment.order_paid"),
+                values: Derivation::Unspecified,
+            },
+        ));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![
+            ValidationError::TransitionEffectIntentExplicitlyEstablished {
+                transaction: id("tx.apply_payment"),
+                intent: id("intent.apply_payment.order_paid"),
+                effect: id("effect.order.paid"),
+            }
+        ]
+    );
+}
+
+#[test]
+fn rejects_direct_execution_of_transition_side_effect() {
+    let mut model = load_flash_checkout();
+
+    let flow = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .flows
+        .get_mut(&id("flow.apply_payment"))
+        .unwrap();
+
+    flow.steps[1] = FlowStep::ExecuteEffect {
+        effect: id("effect.order.paid"),
+    };
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidReferenceOwner {
+            subject: id("flow.apply_payment"),
+            reference: id("effect.order.paid"),
+            expected_owner: id("operation.apply_payment"),
+            actual_owner: Some(id("transition.order.mark_paid")),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transaction_read_used_outside_a_transaction() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap();
+
+    operation.requirements.serialization[0].key.source =
+        ValueSource::TransactionRead(id("read.reserve_inventory.stock"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadOutsideTransaction {
+            subject: id("operation.reserve_inventory"),
+            read: id("read.reserve_inventory.stock"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transaction_read_from_another_transaction() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.transfer_stock"))
+        .unwrap();
+
+    let TransactionStep::Write(write) = &mut transaction.steps[3] else {
+        panic!("expected the source-warehouse write");
+    };
+
+    let Derivation::Deterministic { from } = &mut write.values else {
+        panic!("expected a deterministic derivation");
+    };
+
+    from[0].source = ValueSource::TransactionRead(id("read.reserve_inventory.stock"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidReferenceOwner {
+            subject: id("tx.transfer_stock"),
+            reference: id("read.reserve_inventory.stock"),
+            expected_owner: id("tx.transfer_stock"),
+            actual_owner: Some(id("tx.reserve_inventory")),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transaction_read_referenced_before_the_read() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.reserve_inventory"))
+        .unwrap();
+
+    // Move the mutation ahead of the read it derives its values from.
+    transaction.steps.swap(0, 1);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadOutOfOrder {
+            transaction: id("tx.reserve_inventory"),
+            read: id("read.reserve_inventory.stock"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_reference_to_field_the_read_did_not_select() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.reserve_inventory"))
+        .unwrap();
+
+    let TransactionStep::Write(write) = &mut transaction.steps[1] else {
+        panic!("expected the stock write");
+    };
+
+    let Derivation::Deterministic { from } = &mut write.values else {
+        panic!("expected a deterministic derivation");
+    };
+
+    // `warehouse_id` resolves against the object schema, but the read
+    // selects only `on_hand` and `reserved`.
+    from[0].path = FieldPath(vec!["warehouse_id".to_owned()]);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadFieldNotSelected {
+            transaction: id("tx.reserve_inventory"),
+            read: id("read.reserve_inventory.stock"),
+            path: FieldPath(vec!["warehouse_id".to_owned()]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transaction_read_result_colliding_with_another_id() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.reserve_inventory"))
+        .unwrap();
+
+    let TransactionStep::Read(read) = &mut transaction.steps[0] else {
+        panic!("expected the stock read");
+    };
+
+    read.result = id("object.stock");
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("object.stock")
+    ));
+}
+
+#[test]
+fn rejects_data_object_without_identity() {
+    let mut model = load_flash_checkout();
+
+    model
+        .data_models
+        .get_mut(&id("data.checkout"))
+        .unwrap()
+        .objects
+        .get_mut(&id("object.order"))
+        .unwrap()
+        .identity
+        .clear();
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EmptyObjectIdentity {
+            object: id("object.order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_recoverability_requirement_with_no_flow() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap();
+
+    operation
+        .requirements
+        .recoverability
+        .push(RecoverabilityRequirement {
+            key: IdempotencyKey {
+                components: vec![ValueRef {
+                    source: ValueSource::Input(id("input.charge_payment.reserved")),
+                    path: FieldPath(vec!["event_id".to_owned()]),
+                }],
+            },
+            completion: CompletionRequirement::Guaranteed,
+        });
+
+    operation.flows.clear();
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::RecoverabilityRequiresFlow {
+            operation: id("operation.charge_payment"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_invalid_recoverability_key_field_path() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap();
+
+    operation.requirements.recoverability[0].key.components[0].path =
+        FieldPath(vec!["does_not_exist".to_owned()]);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("operation.apply_payment"),
+            schema: id("schema.PaymentCaptured"),
+            path: FieldPath(vec!["does_not_exist".to_owned()]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_unknown_reference_in_recoverability_key() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap();
+
+    operation.requirements.recoverability[0].key.components[0].source =
+        ValueSource::Input(id("input.missing"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnknownReference {
+            subject: id("operation.apply_payment"),
+            reference: id("input.missing"),
+            expected: ReferenceKind::Input,
+        }]
+    );
+}
+
+#[test]
+fn rejects_transaction_read_in_recoverability_key() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap();
+
+    operation.requirements.recoverability[0].key.components[0].source =
+        ValueSource::TransactionRead(id("read.reserve_inventory.stock"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadOutsideTransaction {
+            subject: id("operation.reserve_inventory"),
+            read: id("read.reserve_inventory.stock"),
+        }]
+    );
+}
+
+/// Retarget the first component of `tx.reserve_inventory`'s write
+/// derivation, which is the fixture's provenance site.
+fn set_reserve_write_source(model: &mut Model, source: ValueSource, path: &[&str]) {
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.reserve_inventory"))
+        .unwrap();
+
+    let TransactionStep::Write(write) = &mut transaction.steps[1] else {
+        panic!("expected the stock write");
+    };
+
+    let Derivation::Deterministic { from } = &mut write.values else {
+        panic!("expected a deterministic derivation");
+    };
+
+    from[0] = ValueRef {
+        source,
+        path: FieldPath(path.iter().map(|part| (*part).to_owned()).collect()),
+    };
+}
+
+#[test]
+fn rejects_value_ref_to_another_operations_input() {
+    let mut model = load_flash_checkout();
+
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::Input(id("input.create_order.request")),
+        &["quantity"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.reserve_inventory"),
+            source: id("input.create_order.request"),
+            owner: id("operation.create_order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_value_ref_to_another_operations_invocation_result() {
+    let mut model = load_flash_checkout();
+
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::InvocationResult(id("result.create_order")),
+        &["order_id"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.reserve_inventory"),
+            source: id("result.create_order"),
+            owner: id("operation.create_order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_value_ref_to_another_operations_effect() {
+    let mut model = load_flash_checkout();
+
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::Effect(id("effect.create_order.publish_created")),
+        &["order_id"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.reserve_inventory"),
+            source: id("effect.create_order.publish_created"),
+            owner: id("operation.create_order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_value_ref_to_transition_effect_the_operation_does_not_apply() {
+    let mut model = load_flash_checkout();
+
+    // reserve_inventory applies no transition, so the mark_paid side
+    // effect's payload is not observable by its invocations.
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::Effect(id("effect.order.paid")),
+        &["order_id"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.reserve_inventory"),
+            source: id("effect.order.paid"),
+            owner: id("transition.order.mark_paid"),
+        }]
+    );
+}
+
+#[test]
+fn accepts_value_ref_to_state_machine_subject_from_any_operation() {
+    let mut model = load_flash_checkout();
+
+    // State machines are global; reserve_inventory may address the
+    // object one governs even though it applies no transition.
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
+        &["status"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_foreign_input_in_a_transaction_commit_key() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.create_order.new"))
+        .unwrap();
+
+    let IdempotencyGuarantee::DeduplicatedBy { key } = &mut transaction.idempotency else {
+        panic!("expected a keyed transaction");
+    };
+
+    key.components[0] = ValueRef {
+        source: ValueSource::Input(id("input.apply_payment.captured")),
+        path: FieldPath(vec!["event_id".to_owned()]),
+    };
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.create_order.new"),
+            source: id("input.apply_payment.captured"),
+            owner: id("operation.apply_payment"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_ambiguous_intents_for_one_transition_side_effect() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap();
+
+    operation.effect_intents.insert(
+        id("intent.apply_payment.order_paid.duplicate"),
+        EffectIntent {
+            effect: id("effect.order.paid"),
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::AmbiguousTransitionEffectIntent {
+            operation: id("operation.apply_payment"),
+            effect: id("effect.order.paid"),
+            intents: vec![
+                id("intent.apply_payment.order_paid"),
+                id("intent.apply_payment.order_paid.duplicate"),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn rejects_transition_effect_intent_the_operation_cannot_establish() {
+    let mut model = load_flash_checkout();
+
+    // cancel_order applies transition.order.cancel, never mark_paid,
+    // so it can never establish that transition's side effect.
+    model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap()
+        .effect_intents
+        .insert(
+            id("intent.cancel_order.order_paid"),
+            EffectIntent {
+                effect: id("effect.order.paid"),
+            },
+        );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnestablishableTransitionEffectIntent {
+            operation: id("operation.cancel_order"),
+            intent: id("intent.cancel_order.order_paid"),
+            effect: id("effect.order.paid"),
+            transition: id("transition.order.mark_paid"),
         }]
     );
 }

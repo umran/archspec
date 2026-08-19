@@ -36,6 +36,14 @@ pub struct Transition {
     pub side_effects: BTreeMap<Id, TransitionSideEffect>,
 }
 
+/// An effect associated with taking a transition.
+///
+/// A side effect is not executed inside the application-state
+/// transaction. A successful transition implicitly establishes it as
+/// a logical `EffectIntent` artifact, subject to the same retention
+/// and recovery rules as an explicitly established intent. An
+/// operation references it by declaring an `EffectIntent` naming this
+/// effect, and executes it with `ExecuteEffectIntent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransitionSideEffect {

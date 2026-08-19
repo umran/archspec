@@ -222,6 +222,21 @@ schemas:
           kind: scalar
           value: uuid
         optional: false
+  schema.OrderPaid:
+    kind: canonical
+    description: null
+    completeness: complete
+    fields:
+      event_id:
+        ty:
+          kind: scalar
+          value: string
+        optional: false
+      order_id:
+        ty:
+          kind: scalar
+          value: uuid
+        optional: false
   schema.OrderRecord:
     kind: canonical
     description: null
@@ -293,6 +308,7 @@ topics:
     - schema.InventoryReserved
     - schema.OrderCancelled
     - schema.OrderCreated
+    - schema.OrderPaid
     - schema.PaymentCaptured
     ordering:
       kind: keyed
@@ -302,6 +318,8 @@ topics:
         schema.OrderCancelled:
         - order_id
         schema.OrderCreated:
+        - order_id
+        schema.OrderPaid:
         - order_id
         schema.PaymentCaptured:
         - order_id
@@ -327,7 +345,12 @@ state_machines:
         from:
         - state.order.pending
         to: state.order.paid
-        side_effects: {}
+        side_effects:
+          effect.order.paid:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.OrderPaid
+            idempotency_key_propagation: []
 operations:
   operation.create_order:
     service: service.checkout
@@ -359,16 +382,8 @@ operations:
     effect_intents:
       intent.create_order.publish_created:
         effect: effect.create_order.publish_created
-        execution: recoverable
     invocation_results:
       result.create_order:
-        key:
-          components:
-          - source:
-              kind: input
-              id: input.create_order.request
-            path:
-            - idempotency_key
         schema: schema.CreateOrderResponse
     responses:
       response.create_order:
@@ -381,28 +396,56 @@ operations:
       tx.create_order.new:
         data_model: data.checkout
         isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - idempotency_key
         steps:
-        - kind: acquire_unique_claim
+        - kind: insert
           object: object.order
-          mapping:
-            ? - order_id
-            : source:
+          values:
+            kind: deterministic
+            from:
+            - source:
                 kind: input
                 id: input.create_order.request
               path:
               - order_id
-        - kind: insert
-          object: object.order
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - amount
         - kind: establish_effect_intent
           intent: intent.create_order.publish_created
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - order_id
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - idempotency_key
         - kind: establish_invocation_result
           result: result.create_order
-      tx.create_order.replay:
-        data_model: null
-        isolation: unspecified
-        steps:
-        - kind: read_invocation_result
-          result: result.create_order
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.create_order.request
+              path:
+              - order_id
     flows:
       flow.create_order.new:
         steps:
@@ -410,11 +453,6 @@ operations:
           transaction: tx.create_order.new
         - kind: execute_effect_intent
           intent: intent.create_order.publish_created
-        response: response.create_order
-      flow.create_order.replay:
-        steps:
-        - kind: transaction
-          transaction: tx.create_order.replay
         response: response.create_order
     requirements:
       serialization: []
@@ -428,6 +466,15 @@ operations:
             path:
             - idempotency_key
         response: replay_consistent
+      recoverability:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.create_order.request
+            path:
+            - idempotency_key
+        completion: resumable
     execution:
       concurrency:
         kind: unbounded
@@ -471,15 +518,17 @@ operations:
     effect_intents:
       intent.reserve_inventory.publish_reserved:
         effect: effect.reserve_inventory.publish_reserved
-        execution: recoverable
     invocation_results: {}
     responses: {}
     transactions:
       tx.reserve_inventory:
         data_model: data.inventory
         isolation: read_committed
+        idempotency:
+          kind: not_deduplicated
         steps:
         - kind: read
+          result: read.reserve_inventory.stock
           target:
             object: object.stock
             predicate:
@@ -542,8 +591,34 @@ operations:
                     - sku
           fields:
           - - reserved
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_read
+                id: read.reserve_inventory.stock
+              path:
+              - reserved
+            - source:
+                kind: input
+                id: input.reserve_inventory.created
+              path:
+              - quantity
         - kind: establish_effect_intent
           intent: intent.reserve_inventory.publish_reserved
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.reserve_inventory.created
+              path:
+              - order_id
+            - source:
+                kind: input
+                id: input.reserve_inventory.created
+              path:
+              - event_id
     flows:
       flow.reserve_inventory:
         steps:
@@ -576,6 +651,15 @@ operations:
             path:
             - event_id
         response: unspecified
+      recoverability:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.reserve_inventory.created
+            path:
+            - event_id
+        completion: guaranteed
     execution:
       concurrency:
         kind: unbounded
@@ -657,6 +741,7 @@ operations:
             path:
             - event_id
         response: unspecified
+      recoverability: []
     execution:
       concurrency:
         kind: unbounded
@@ -676,7 +761,6 @@ operations:
     effect_intents:
       intent.cancel_order.publish_cancelled:
         effect: effect.cancel_order.publish_cancelled
-        execution: recoverable
     invocation_results: {}
     responses:
       response.cancel_order:
@@ -688,6 +772,15 @@ operations:
       tx.cancel_order:
         data_model: data.checkout
         isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source:
+                kind: input
+                id: input.cancel_order.request
+              path:
+              - order_id
         steps:
         - kind: transition
           machine: machine.order_lifecycle
@@ -708,6 +801,14 @@ operations:
                   - order_id
         - kind: establish_effect_intent
           intent: intent.cancel_order.publish_cancelled
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.cancel_order.request
+              path:
+              - order_id
     flows:
       flow.cancel_order:
         steps:
@@ -720,6 +821,7 @@ operations:
       serialization: []
       ordering: []
       idempotency: []
+      recoverability: []
     execution:
       concurrency:
         kind: unbounded
@@ -741,13 +843,24 @@ operations:
             kind: bounded
             value: 1
     effects: {}
-    effect_intents: {}
+    effect_intents:
+      intent.apply_payment.order_paid:
+        effect: effect.order.paid
     invocation_results: {}
     responses: {}
     transactions:
       tx.apply_payment:
         data_model: data.checkout
         isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source:
+                kind: input
+                id: input.apply_payment.captured
+              path:
+              - event_id
         steps:
         - kind: transition
           machine: machine.order_lifecycle
@@ -771,6 +884,8 @@ operations:
         steps:
         - kind: transaction
           transaction: tx.apply_payment
+        - kind: execute_effect_intent
+          intent: intent.apply_payment.order_paid
         response: null
     requirements:
       serialization:
@@ -796,6 +911,15 @@ operations:
             path:
             - event_id
         response: unspecified
+      recoverability:
+      - key:
+          components:
+          - source:
+              kind: input
+              id: input.apply_payment.captured
+            path:
+            - event_id
+        completion: guaranteed
     execution:
       concurrency:
         kind: unbounded
@@ -819,6 +943,8 @@ operations:
       tx.transfer_stock:
         data_model: data.inventory
         isolation: read_committed
+        idempotency:
+          kind: unspecified
         steps:
         - kind: lock
           target:
@@ -883,6 +1009,7 @@ operations:
           order:
             kind: unspecified
         - kind: read
+          result: read.transfer_stock.source_stock
           target:
             object: object.stock
             predicate:
@@ -944,6 +1071,19 @@ operations:
                     - sku
           fields:
           - - on_hand
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: transaction_read
+                id: read.transfer_stock.source_stock
+              path:
+              - on_hand
+            - source:
+                kind: input
+                id: input.transfer_stock.request
+              path:
+              - quantity
         - kind: write
           target:
             object: object.stock
@@ -974,6 +1114,8 @@ operations:
                     - sku
           fields:
           - - on_hand
+          values:
+            kind: unspecified
     flows:
       flow.transfer_stock:
         steps:
@@ -984,6 +1126,7 @@ operations:
       serialization: []
       ordering: []
       idempotency: []
+      recoverability: []
     execution:
       concurrency:
         kind: unbounded

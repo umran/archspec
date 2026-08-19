@@ -47,6 +47,7 @@ pub enum ValidationCode {
 
     InvalidFieldPath,
     ValueSourceHasNoSchema,
+    ValueSourceOutOfScope,
 
     FragmentCycle,
 
@@ -61,7 +62,19 @@ pub enum ValidationCode {
     TransactionObjectOutsideDataModel,
     TransactionMissingDataModel,
 
+    TransactionReadOutsideTransaction,
+    TransactionReadOutOfOrder,
+    TransactionReadFieldNotSelected,
+
     StateTransitionSubjectMismatch,
+    TransitionTransactionNotDeduplicated,
+    TransitionEffectIntentExplicitlyEstablished,
+    AmbiguousTransitionEffectIntent,
+    UnestablishableTransitionEffectIntent,
+
+    EmptyObjectIdentity,
+
+    RecoverabilityRequiresFlow,
 
     ResponseInvocationResultSchemaMismatch,
 

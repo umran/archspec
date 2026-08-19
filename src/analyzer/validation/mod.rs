@@ -2,7 +2,7 @@ pub mod error;
 pub mod id_declaration;
 pub mod reference;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::*;
 
@@ -25,8 +25,92 @@ impl std::fmt::Display for InputKind {
     }
 }
 
+/// The transaction execution a value reference is evaluated in.
+///
+/// Transaction-read results are only meaningful inside the transaction
+/// execution that produces them, and only after the read itself.
+#[derive(Debug, Clone, Copy)]
+struct TransactionScope<'a> {
+    id: &'a Id,
+    transaction: &'a Transaction,
+
+    /// Index of the step whose values are being validated.
+    step: usize,
+}
+
+impl<'a> TransactionScope<'a> {
+    fn read(&self, result: &Id) -> Option<(usize, &'a Read)> {
+        self.transaction
+            .steps
+            .iter()
+            .enumerate()
+            .find_map(|(position, step)| match step {
+                TransactionStep::Read(read) if &read.result == result => Some((position, read)),
+
+                _ => None,
+            })
+    }
+}
+
+/// The invocation context a value reference is evaluated in.
+///
+/// A value reference may only name sources that the invocations
+/// evaluating it can actually observe.
+#[derive(Debug, Clone, Copy)]
+enum ValueScope<'a> {
+    /// Evaluated by invocations of one operation.
+    Operation(&'a Id),
+
+    /// Declared on a state-machine transition, and therefore evaluated
+    /// by invocations of whichever operation applies that transition.
+    Transition(&'a Id),
+}
+
+/// Everything a value reference is validated against.
+#[derive(Debug, Clone, Copy)]
+struct ValueContext<'a> {
+    scope: ValueScope<'a>,
+
+    /// Set when the reference appears inside a transaction body.
+    transaction: Option<TransactionScope<'a>>,
+}
+
+impl<'a> ValueContext<'a> {
+    fn operation(operation: &'a Id) -> Self {
+        Self {
+            scope: ValueScope::Operation(operation),
+            transaction: None,
+        }
+    }
+
+    fn transition(transition: &'a Id) -> Self {
+        Self {
+            scope: ValueScope::Transition(transition),
+            transaction: None,
+        }
+    }
+
+    fn in_transaction(self, id: &'a Id, transaction: &'a Transaction, step: usize) -> Self {
+        Self {
+            transaction: Some(TransactionScope {
+                id,
+                transaction,
+                step,
+            }),
+            ..self
+        }
+    }
+}
+
 struct ReferenceIndex<'a> {
     entries: BTreeMap<Id, ReferenceInfo<'a>>,
+
+    /// Operations that apply each declared transition.
+    ///
+    /// A transition side effect is established by whichever operation
+    /// applies the transition, so this determines what a value
+    /// reference declared on that transition may observe.
+    transition_appliers: BTreeMap<&'a Id, BTreeSet<&'a Id>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,11 +127,57 @@ impl<'a> ReferenceIndex<'a> {
             entries.insert(id.clone(), ReferenceInfo { kind, owner });
         });
 
-        Self { entries }
+        let mut transition_appliers: BTreeMap<&Id, BTreeSet<&Id>> = BTreeMap::new();
+
+        for (operation_id, operation) in &model.operations {
+            for transaction in operation.transactions.values() {
+                for step in &transaction.steps {
+                    let TransactionStep::Transition(step) = step else {
+                        continue;
+                    };
+
+                    transition_appliers
+                        .entry(&step.transition)
+                        .or_default()
+                        .insert(operation_id);
+                }
+            }
+        }
+
+        Self {
+            entries,
+            transition_appliers,
+        }
     }
 
     fn get(&self, id: &Id) -> Option<ReferenceInfo<'a>> {
         self.entries.get(id).copied()
+    }
+
+    fn applies_transition(&self, operation: &Id, transition: &Id) -> bool {
+        self.transition_appliers
+            .get(transition)
+            .is_some_and(|operations| operations.iter().any(|applier| *applier == operation))
+    }
+
+    /// Whether invocations evaluating a reference in `scope` belong to
+    /// `operation`.
+    fn scope_admits_operation(&self, scope: ValueScope<'_>, operation: &Id) -> bool {
+        match scope {
+            ValueScope::Operation(id) => id == operation,
+
+            ValueScope::Transition(transition) => self.applies_transition(operation, transition),
+        }
+    }
+
+    /// Whether invocations evaluating a reference in `scope` can observe
+    /// the payload of an effect owned by `transition`.
+    fn scope_admits_transition(&self, scope: ValueScope<'_>, transition: &Id) -> bool {
+        match scope {
+            ValueScope::Operation(operation) => self.applies_transition(operation, transition),
+
+            ValueScope::Transition(id) => id == transition,
+        }
     }
 }
 
@@ -83,6 +213,10 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
     errors.extend(validate_transactions(model, &index));
 
     errors.extend(validate_responses(model));
+
+    errors.extend(validate_operation_requirements(model));
+
+    errors.extend(validate_effect_intents(model, &index));
 
     errors.extend(validate_field_paths(model, &index));
 
@@ -133,8 +267,6 @@ fn validate_references(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Validat
 }
 
 fn validate_fragment_cycles(model: &Model) -> Vec<ValidationError> {
-    use std::collections::BTreeSet;
-
     let mut errors = Vec::new();
     let mut complete = BTreeSet::<Id>::new();
 
@@ -191,6 +323,14 @@ fn validate_data_models(model: &Model) -> Vec<ValidationError> {
                 errors.push(ValidationError::DataObjectSchemaNotCanonical {
                     object: object_id.clone(),
                     schema: object.schema.clone(),
+                });
+            }
+
+            // Insert uniqueness and selector precision both rest on a
+            // complete declared identity.
+            if object.identity.is_empty() {
+                errors.push(ValidationError::EmptyObjectIdentity {
+                    object: object_id.clone(),
                 });
             }
         }
@@ -250,6 +390,11 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
 
     for operation in model.operations.values() {
         for (transaction_id, transaction) in &operation.transactions {
+            let deduplicated = matches!(
+                transaction.idempotency,
+                IdempotencyGuarantee::DeduplicatedBy { .. }
+            );
+
             for step in &transaction.steps {
                 match step {
                     TransactionStep::Read(read) => {
@@ -302,16 +447,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                         );
                     }
 
-                    TransactionStep::AcquireUniqueClaim(claim) => {
-                        validate_transaction_object(
-                            index,
-                            transaction_id,
-                            transaction,
-                            &claim.object,
-                            &mut errors,
-                        );
-                    }
-
                     TransactionStep::Transition(transition) => {
                         validate_transaction_object(
                             index,
@@ -320,13 +455,137 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                             &transition.subject.object,
                             &mut errors,
                         );
+
+                        // A committed transition changes the state it was
+                        // evaluated against, so V1 cannot replay the
+                        // transaction naturally to reproduce its outcome
+                        // or its artifacts. The durable keyed commit is
+                        // the recovery boundary.
+                        if !deduplicated {
+                            errors.push(ValidationError::TransitionTransactionNotDeduplicated {
+                                transaction: transaction_id.clone(),
+                                machine: transition.machine.clone(),
+                                transition: transition.transition.clone(),
+                            });
+                        }
                     }
 
-                    TransactionStep::EstablishEffectIntent(_)
-                    | TransactionStep::EstablishInvocationResult(_)
-                    | TransactionStep::ReadInvocationResult(_) => {}
+                    TransactionStep::EstablishEffectIntent(step) => {
+                        validate_established_intent(
+                            index,
+                            transaction_id,
+                            operation,
+                            &step.intent,
+                            &mut errors,
+                        );
+                    }
+
+                    TransactionStep::EstablishInvocationResult(_) => {}
                 }
             }
+        }
+    }
+
+    errors
+}
+
+/// A transition side effect is established implicitly by a successful
+/// transition, so it must not also be established explicitly.
+fn validate_established_intent(
+    index: &ReferenceIndex<'_>,
+    transaction_id: &Id,
+    operation: &Operation,
+    intent_id: &Id,
+    errors: &mut Vec<ValidationError>,
+) {
+    let intent = operation
+        .effect_intents
+        .get(intent_id)
+        .expect("references already validated");
+
+    let info = index
+        .get(&intent.effect)
+        .expect("references already validated");
+
+    let Some(owner) = info.owner else {
+        return;
+    };
+
+    let owner_info = index.get(owner).expect("effect owner exists");
+
+    if owner_info.kind == ReferenceKind::Transition {
+        errors.push(
+            ValidationError::TransitionEffectIntentExplicitlyEstablished {
+                transaction: transaction_id.clone(),
+                intent: intent_id.clone(),
+                effect: intent.effect.clone(),
+            },
+        );
+    }
+}
+
+/// A transition establishes exactly one logical intent for each of its
+/// side effects, so an operation's handle on that artifact must be
+/// unambiguous and must actually be establishable.
+fn validate_effect_intents(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        let mut by_transition_effect: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
+
+        for (intent_id, intent) in &operation.effect_intents {
+            let info = index
+                .get(&intent.effect)
+                .expect("references already validated");
+
+            let Some(owner) = info.owner else {
+                continue;
+            };
+
+            let owner_info = index.get(owner).expect("effect owner exists");
+
+            if owner_info.kind != ReferenceKind::Transition {
+                continue;
+            }
+
+            by_transition_effect
+                .entry(&intent.effect)
+                .or_default()
+                .push(intent_id);
+
+            if !index.applies_transition(operation_id, owner) {
+                errors.push(ValidationError::UnestablishableTransitionEffectIntent {
+                    operation: operation_id.clone(),
+                    intent: intent_id.clone(),
+                    effect: intent.effect.clone(),
+                    transition: owner.clone(),
+                });
+            }
+        }
+
+        for (effect, intents) in by_transition_effect {
+            if intents.len() > 1 {
+                errors.push(ValidationError::AmbiguousTransitionEffectIntent {
+                    operation: operation_id.clone(),
+                    effect: effect.clone(),
+                    intents: intents.into_iter().cloned().collect(),
+                });
+            }
+        }
+    }
+
+    errors
+}
+
+fn validate_operation_requirements(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for (operation_id, operation) in &model.operations {
+        // Terminal execution is defined relative to a declared flow.
+        if !operation.requirements.recoverability.is_empty() && operation.flows.is_empty() {
+            errors.push(ValidationError::RecoverabilityRequiresFlow {
+                operation: operation_id.clone(),
+            });
         }
     }
 
@@ -409,11 +668,25 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
     // Operations.
     for (operation_id, operation) in &model.operations {
         for requirement in &operation.requirements.serialization {
-            validate_value_ref_path(model, index, operation_id, &requirement.key, &mut errors);
+            validate_value_ref_path(
+                model,
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                &mut errors,
+            );
         }
 
         for requirement in &operation.requirements.ordering {
-            validate_value_ref_path(model, index, operation_id, &requirement.key, &mut errors);
+            validate_value_ref_path(
+                model,
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                &mut errors,
+            );
         }
 
         for requirement in &operation.requirements.idempotency {
@@ -421,29 +694,58 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 model,
                 index,
                 operation_id,
+                ValueContext::operation(operation_id),
                 &requirement.key,
                 &mut errors,
             );
         }
 
-        for (result_id, result) in &operation.invocation_results {
-            validate_idempotency_key_paths(model, index, result_id, &result.key, &mut errors);
+        for requirement in &operation.requirements.recoverability {
+            validate_idempotency_key_paths(
+                model,
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                &mut errors,
+            );
         }
 
         for (effect_id, effect) in &operation.effects {
-            validate_effect_paths(model, index, effect_id, effect, &mut errors);
+            validate_effect_paths(
+                model,
+                index,
+                effect_id,
+                ValueContext::operation(operation_id),
+                effect,
+                &mut errors,
+            );
         }
 
         for (transaction_id, transaction) in &operation.transactions {
-            validate_transaction_paths(model, index, transaction_id, transaction, &mut errors);
+            validate_transaction_paths(
+                model,
+                index,
+                operation_id,
+                transaction_id,
+                transaction,
+                &mut errors,
+            );
         }
     }
 
     // Transition-owned effects.
     for machine in model.state_machines.values() {
-        for transition in machine.transitions.values() {
+        for (transition_id, transition) in &machine.transitions {
             for (effect_id, effect) in &transition.side_effects {
-                validate_transition_effect_paths(model, index, effect_id, effect, &mut errors);
+                validate_transition_effect_paths(
+                    model,
+                    index,
+                    effect_id,
+                    ValueContext::transition(transition_id),
+                    effect,
+                    &mut errors,
+                );
             }
         }
     }
@@ -484,6 +786,7 @@ fn validate_value_ref_path(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     value: &ValueRef,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -560,6 +863,62 @@ fn validate_value_ref_path(
 
             validate_object_path(model, index, subject, object, &value.path, errors);
         }
+
+        ValueSource::TransactionRead(result_id) => {
+            // Structural defects are reported by the reference pass.
+            let Some(scope) = context.transaction else {
+                return;
+            };
+
+            let Some((_, read)) = scope.read(result_id) else {
+                return;
+            };
+
+            if let FieldSelection::Only(fields) = &read.fields
+                && !fields
+                    .iter()
+                    .any(|field| field_selection_covers(field, &value.path))
+            {
+                errors.push(ValidationError::TransactionReadFieldNotSelected {
+                    transaction: scope.id.clone(),
+                    read: result_id.clone(),
+                    path: value.path.clone(),
+                });
+
+                return;
+            }
+
+            validate_object_path(
+                model,
+                index,
+                subject,
+                &read.target.object,
+                &value.path,
+                errors,
+            );
+        }
+    }
+}
+
+/// A read of a field also observes the values nested beneath it.
+fn field_selection_covers(selected: &FieldPath, path: &FieldPath) -> bool {
+    path.0.starts_with(&selected.0)
+}
+
+fn validate_derivation_paths(
+    model: &Model,
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    context: ValueContext<'_>,
+    derivation: &Derivation,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Derivation::Deterministic { from } = derivation else {
+        return;
+    };
+
+    for value in from {
+        validate_value_ref_path(model, index, subject, context, value, errors);
     }
 }
 
@@ -567,11 +926,12 @@ fn validate_idempotency_key_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     key: &IdempotencyKey,
     errors: &mut Vec<ValidationError>,
 ) {
     for component in &key.components {
-        validate_value_ref_path(model, index, subject, component, errors);
+        validate_value_ref_path(model, index, subject, context, component, errors);
     }
 }
 
@@ -579,13 +939,14 @@ fn validate_propagation_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     propagations: &[IdempotencyKeyPropagation],
     errors: &mut Vec<ValidationError>,
 ) {
     for propagation in propagations {
-        validate_idempotency_key_paths(model, index, subject, &propagation.source, errors);
+        validate_idempotency_key_paths(model, index, subject, context, &propagation.source, errors);
 
-        validate_idempotency_key_paths(model, index, subject, &propagation.target, errors);
+        validate_idempotency_key_paths(model, index, subject, context, &propagation.target, errors);
     }
 }
 
@@ -593,6 +954,7 @@ fn validate_effect_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &Effect,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -602,6 +964,7 @@ fn validate_effect_paths(
                 model,
                 index,
                 effect_id,
+                context,
                 &effect.idempotency_key_propagation,
                 errors,
             );
@@ -612,6 +975,7 @@ fn validate_effect_paths(
                 model,
                 index,
                 effect_id,
+                context,
                 &effect.idempotency_key_propagation,
                 errors,
             );
@@ -619,7 +983,7 @@ fn validate_effect_paths(
 
         Effect::External(effect) => {
             if let IdempotencyGuarantee::DeduplicatedBy { key } = &effect.idempotency {
-                validate_idempotency_key_paths(model, index, effect_id, key, errors);
+                validate_idempotency_key_paths(model, index, effect_id, context, key, errors);
             }
         }
     }
@@ -629,6 +993,7 @@ fn validate_transition_effect_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &TransitionSideEffect,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -638,6 +1003,7 @@ fn validate_transition_effect_paths(
                 model,
                 index,
                 effect_id,
+                context,
                 &effect.idempotency_key_propagation,
                 errors,
             );
@@ -648,6 +1014,7 @@ fn validate_transition_effect_paths(
                 model,
                 index,
                 effect_id,
+                context,
                 &effect.idempotency_key_propagation,
                 errors,
             );
@@ -658,14 +1025,32 @@ fn validate_transition_effect_paths(
 fn validate_transaction_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
+    operation_id: &Id,
     transaction_id: &Id,
     transaction: &Transaction,
     errors: &mut Vec<ValidationError>,
 ) {
-    for step in &transaction.steps {
+    let operation = ValueContext::operation(operation_id);
+
+    // The commit key is evaluated for the invocation before the body
+    // executes, so it may not observe transaction state.
+    if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
+        validate_idempotency_key_paths(model, index, transaction_id, operation, key, errors);
+    }
+
+    for (step_index, step) in transaction.steps.iter().enumerate() {
+        let context = operation.in_transaction(transaction_id, transaction, step_index);
+
         match step {
             TransactionStep::Read(read) => {
-                validate_selector_paths(model, index, transaction_id, &read.target, errors);
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &read.target,
+                    errors,
+                );
 
                 if let FieldSelection::Only(fields) = &read.fields {
                     for field in fields {
@@ -682,7 +1067,14 @@ fn validate_transaction_paths(
             }
 
             TransactionStep::Write(write) => {
-                validate_selector_paths(model, index, transaction_id, &write.target, errors);
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &write.target,
+                    errors,
+                );
 
                 for field in &write.fields {
                     validate_object_path(
@@ -694,16 +1086,48 @@ fn validate_transaction_paths(
                         errors,
                     );
                 }
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &write.values,
+                    errors,
+                );
             }
 
-            TransactionStep::Insert(_) => {}
+            TransactionStep::Insert(insert) => {
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &insert.values,
+                    errors,
+                );
+            }
 
             TransactionStep::Delete(delete) => {
-                validate_selector_paths(model, index, transaction_id, &delete.target, errors);
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &delete.target,
+                    errors,
+                );
             }
 
             TransactionStep::Lock(lock) => {
-                validate_selector_paths(model, index, transaction_id, &lock.target, errors);
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &lock.target,
+                    errors,
+                );
 
                 if let LockOrder::By(terms) = &lock.order {
                     for term in terms {
@@ -719,28 +1143,38 @@ fn validate_transaction_paths(
                 }
             }
 
-            TransactionStep::AcquireUniqueClaim(claim) => {
-                for (field, value) in &claim.mapping {
-                    validate_object_path(
-                        model,
-                        index,
-                        transaction_id,
-                        &claim.object,
-                        field,
-                        errors,
-                    );
-
-                    validate_value_ref_path(model, index, transaction_id, value, errors);
-                }
-            }
-
             TransactionStep::Transition(transition) => {
-                validate_selector_paths(model, index, transaction_id, &transition.subject, errors);
+                validate_selector_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &transition.subject,
+                    errors,
+                );
             }
 
-            TransactionStep::EstablishEffectIntent(_)
-            | TransactionStep::EstablishInvocationResult(_)
-            | TransactionStep::ReadInvocationResult(_) => {}
+            TransactionStep::EstablishEffectIntent(step) => {
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &step.values,
+                    errors,
+                );
+            }
+
+            TransactionStep::EstablishInvocationResult(step) => {
+                validate_derivation_paths(
+                    model,
+                    index,
+                    transaction_id,
+                    context,
+                    &step.values,
+                    errors,
+                );
+            }
         }
     }
 }
@@ -749,6 +1183,7 @@ fn validate_selector_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     selector: &ObjectSelector,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -756,6 +1191,7 @@ fn validate_selector_paths(
         model,
         index,
         subject,
+        context,
         &selector.object,
         &selector.predicate,
         errors,
@@ -766,6 +1202,7 @@ fn validate_predicate_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     object: &Id,
     predicate: &SelectorPredicate,
     errors: &mut Vec<ValidationError>,
@@ -777,13 +1214,13 @@ fn validate_predicate_paths(
             validate_object_path(model, index, subject, object, field, errors);
 
             if let SelectorValue::Value(value) = value {
-                validate_value_ref_path(model, index, subject, value, errors);
+                validate_value_ref_path(model, index, subject, context, value, errors);
             }
         }
 
         SelectorPredicate::And { predicates } => {
             for predicate in predicates {
-                validate_predicate_paths(model, index, subject, object, predicate, errors);
+                validate_predicate_paths(model, index, subject, context, object, predicate, errors);
             }
         }
     }
@@ -1018,7 +1455,14 @@ fn validate_state_machine_references(
             );
 
             for (effect_id, effect) in &transition.side_effects {
-                validate_transition_effect_references(model, index, effect_id, effect, errors);
+                validate_transition_effect_references(
+                    model,
+                    index,
+                    effect_id,
+                    ValueContext::transition(transition_id),
+                    effect,
+                    errors,
+                );
             }
         }
     }
@@ -1043,7 +1487,14 @@ fn validate_operation_references(
         }
 
         for (effect_id, effect) in &operation.effects {
-            validate_effect_references(model, index, effect_id, effect, errors);
+            validate_effect_references(
+                model,
+                index,
+                effect_id,
+                ValueContext::operation(operation_id),
+                effect,
+                errors,
+            );
         }
 
         for (intent_id, intent) in &operation.effect_intents {
@@ -1065,8 +1516,6 @@ fn validate_operation_references(
                 ReferenceKind::Schema,
                 errors,
             );
-
-            validate_idempotency_key_references(index, result_id, &result.key, errors);
         }
 
         for (response_id, response) in &operation.responses {
@@ -1116,6 +1565,16 @@ fn validate_operation_references(
                 );
             }
 
+            if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
+                validate_idempotency_key_references(
+                    index,
+                    transaction_id,
+                    ValueContext::operation(operation_id),
+                    key,
+                    errors,
+                );
+            }
+
             validate_transaction_references(
                 index,
                 operation_id,
@@ -1130,15 +1589,43 @@ fn validate_operation_references(
         }
 
         for requirement in &operation.requirements.serialization {
-            validate_value_ref_reference(index, operation_id, &requirement.key, errors);
+            validate_value_ref_reference(
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                errors,
+            );
         }
 
         for requirement in &operation.requirements.ordering {
-            validate_value_ref_reference(index, operation_id, &requirement.key, errors);
+            validate_value_ref_reference(
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                errors,
+            );
         }
 
         for requirement in &operation.requirements.idempotency {
-            validate_idempotency_key_references(index, operation_id, &requirement.key, errors);
+            validate_idempotency_key_references(
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                errors,
+            );
+        }
+
+        for requirement in &operation.requirements.recoverability {
+            validate_idempotency_key_references(
+                index,
+                operation_id,
+                ValueContext::operation(operation_id),
+                &requirement.key,
+                errors,
+            );
         }
     }
 }
@@ -1147,21 +1634,22 @@ fn validate_effect_references(
     model: &Model,
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &Effect,
     errors: &mut Vec<ValidationError>,
 ) {
     match effect {
         Effect::Publication(publication) => {
-            validate_publication_references(index, effect_id, publication, errors);
+            validate_publication_references(index, effect_id, context, publication, errors);
         }
 
         Effect::Request(request) => {
-            validate_request_effect_references(model, index, effect_id, request, errors);
+            validate_request_effect_references(model, index, effect_id, context, request, errors);
         }
 
         Effect::External(external) => {
             if let IdempotencyGuarantee::DeduplicatedBy { key } = &external.idempotency {
-                validate_idempotency_key_references(index, effect_id, key, errors);
+                validate_idempotency_key_references(index, effect_id, context, key, errors);
             }
         }
     }
@@ -1209,14 +1697,28 @@ fn validate_transaction_references(
     transaction: &Transaction,
     errors: &mut Vec<ValidationError>,
 ) {
-    for step in &transaction.steps {
+    for (step_index, step) in transaction.steps.iter().enumerate() {
+        let context = ValueContext::operation(operation_id).in_transaction(
+            transaction_id,
+            transaction,
+            step_index,
+        );
+
         match step {
             TransactionStep::Read(read) => {
-                validate_selector_references(index, transaction_id, &read.target, errors);
+                validate_selector_references(index, transaction_id, context, &read.target, errors);
             }
 
             TransactionStep::Write(write) => {
-                validate_selector_references(index, transaction_id, &write.target, errors);
+                validate_selector_references(index, transaction_id, context, &write.target, errors);
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &write.values,
+                    errors,
+                );
             }
 
             TransactionStep::Insert(insert) => {
@@ -1227,28 +1729,28 @@ fn validate_transaction_references(
                     ReferenceKind::DataObject,
                     errors,
                 );
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &insert.values,
+                    errors,
+                );
             }
 
             TransactionStep::Delete(delete) => {
-                validate_selector_references(index, transaction_id, &delete.target, errors);
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &delete.target,
+                    errors,
+                );
             }
 
             TransactionStep::Lock(lock) => {
-                validate_selector_references(index, transaction_id, &lock.target, errors);
-            }
-
-            TransactionStep::AcquireUniqueClaim(claim) => {
-                expect_reference(
-                    index,
-                    transaction_id,
-                    &claim.object,
-                    ReferenceKind::DataObject,
-                    errors,
-                );
-
-                for value in claim.mapping.values() {
-                    validate_value_ref_reference(index, transaction_id, value, errors);
-                }
+                validate_selector_references(index, transaction_id, context, &lock.target, errors);
             }
 
             TransactionStep::Transition(transition) => {
@@ -1278,7 +1780,13 @@ fn validate_transaction_references(
                     );
                 }
 
-                validate_selector_references(index, transaction_id, &transition.subject, errors);
+                validate_selector_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &transition.subject,
+                    errors,
+                );
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
@@ -1288,6 +1796,14 @@ fn validate_transaction_references(
                     &step.intent,
                     ReferenceKind::EffectIntent,
                     operation_id,
+                    errors,
+                );
+
+                validate_derivation_references(
+                    index,
+                    transaction_id,
+                    context,
+                    &step.values,
                     errors,
                 );
             }
@@ -1301,15 +1817,12 @@ fn validate_transaction_references(
                     operation_id,
                     errors,
                 );
-            }
 
-            TransactionStep::ReadInvocationResult(step) => {
-                expect_owned_reference(
+                validate_derivation_references(
                     index,
                     transaction_id,
-                    &step.result,
-                    ReferenceKind::InvocationResult,
-                    operation_id,
+                    context,
+                    &step.values,
                     errors,
                 );
             }
@@ -1338,16 +1851,24 @@ fn validate_flow_references(
             }
 
             FlowStep::ExecuteEffect { effect } => {
-                // May refer to an operation-owned or
-                // transition-owned effect.
-                expect_reference(index, flow_id, &effect, ReferenceKind::Effect, errors);
+                // A transition side effect is established as an intent
+                // and executed through ExecuteEffectIntent, so a direct
+                // execution must name an operation-owned effect.
+                expect_owned_reference(
+                    index,
+                    flow_id,
+                    effect,
+                    ReferenceKind::Effect,
+                    operation_id,
+                    errors,
+                );
             }
 
             FlowStep::ExecuteEffectIntent { intent } => {
                 expect_owned_reference(
                     index,
                     flow_id,
-                    &intent,
+                    intent,
                     ReferenceKind::EffectIntent,
                     operation_id,
                     errors,
@@ -1371,6 +1892,7 @@ fn validate_flow_references(
 fn validate_selector_references(
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     selector: &ObjectSelector,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1382,12 +1904,13 @@ fn validate_selector_references(
         errors,
     );
 
-    validate_predicate_references(index, subject, &selector.predicate, errors);
+    validate_predicate_references(index, subject, context, &selector.predicate, errors);
 }
 
 fn validate_predicate_references(
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     predicate: &SelectorPredicate,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1396,15 +1919,31 @@ fn validate_predicate_references(
 
         SelectorPredicate::Eq { value, .. } => {
             if let SelectorValue::Value(value) = value {
-                validate_value_ref_reference(index, subject, value, errors);
+                validate_value_ref_reference(index, subject, context, value, errors);
             }
         }
 
         SelectorPredicate::And { predicates } => {
             for predicate in predicates {
-                validate_predicate_references(index, subject, predicate, errors);
+                validate_predicate_references(index, subject, context, predicate, errors);
             }
         }
+    }
+}
+
+fn validate_derivation_references(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    context: ValueContext<'_>,
+    derivation: &Derivation,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Derivation::Deterministic { from } = derivation else {
+        return;
+    };
+
+    for value in from {
+        validate_value_ref_reference(index, subject, context, value, errors);
     }
 }
 
@@ -1412,16 +1951,17 @@ fn validate_transition_effect_references(
     model: &Model,
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &TransitionSideEffect,
     errors: &mut Vec<ValidationError>,
 ) {
     match effect {
         TransitionSideEffect::Publication(publication) => {
-            validate_publication_references(index, effect_id, publication, errors);
+            validate_publication_references(index, effect_id, context, publication, errors);
         }
 
         TransitionSideEffect::Request(request) => {
-            validate_request_effect_references(model, index, effect_id, request, errors);
+            validate_request_effect_references(model, index, effect_id, context, request, errors);
         }
     }
 }
@@ -1430,6 +1970,7 @@ fn validate_request_effect_references(
     model: &Model,
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &RequestEffect,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1472,15 +2013,16 @@ fn validate_request_effect_references(
     }
 
     for propagation in &effect.idempotency_key_propagation {
-        validate_idempotency_key_references(index, effect_id, &propagation.source, errors);
+        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
 
-        validate_idempotency_key_references(index, effect_id, &propagation.target, errors);
+        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
     }
 }
 
 fn validate_publication_references(
     index: &ReferenceIndex<'_>,
     effect_id: &Id,
+    context: ValueContext<'_>,
     effect: &PublicationEffect,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1501,50 +2043,90 @@ fn validate_publication_references(
     );
 
     for propagation in &effect.idempotency_key_propagation {
-        validate_idempotency_key_references(index, effect_id, &propagation.source, errors);
+        validate_idempotency_key_references(index, effect_id, context, &propagation.source, errors);
 
-        validate_idempotency_key_references(index, effect_id, &propagation.target, errors);
+        validate_idempotency_key_references(index, effect_id, context, &propagation.target, errors);
     }
 }
 
 fn validate_idempotency_key_references(
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     key: &IdempotencyKey,
     errors: &mut Vec<ValidationError>,
 ) {
     for component in &key.components {
-        validate_value_ref_reference(index, subject, component, errors);
+        validate_value_ref_reference(index, subject, context, component, errors);
     }
 }
 
 fn validate_value_ref_reference(
     index: &ReferenceIndex<'_>,
     subject: &Id,
+    context: ValueContext<'_>,
     value: &ValueRef,
     errors: &mut Vec<ValidationError>,
 ) {
     match &value.source {
         ValueSource::Input(input) => {
-            expect_reference(index, subject, input, ReferenceKind::Input, errors);
+            if expect_reference(index, subject, input, ReferenceKind::Input, errors) {
+                expect_in_scope(index, subject, context, input, errors);
+            }
         }
 
         ValueSource::Effect(effect) => {
-            expect_reference(index, subject, effect, ReferenceKind::Effect, errors);
+            if expect_reference(index, subject, effect, ReferenceKind::Effect, errors) {
+                expect_in_scope(index, subject, context, effect, errors);
+            }
         }
 
         ValueSource::InvocationResult(result) => {
-            expect_reference(
+            if expect_reference(
                 index,
                 subject,
                 result,
                 ReferenceKind::InvocationResult,
                 errors,
-            );
+            ) {
+                expect_in_scope(index, subject, context, result, errors);
+            }
         }
 
+        // State machines are global: any operation may address the
+        // objects they govern.
         ValueSource::StateMachineSubject(machine) => {
             expect_reference(index, subject, machine, ReferenceKind::StateMachine, errors);
+        }
+
+        ValueSource::TransactionRead(read) => {
+            if !expect_reference(index, subject, read, ReferenceKind::TransactionRead, errors) {
+                return;
+            }
+
+            let Some(scope) = context.transaction else {
+                errors.push(ValidationError::TransactionReadOutsideTransaction {
+                    subject: subject.clone(),
+                    read: read.clone(),
+                });
+
+                return;
+            };
+
+            if !expect_owned_by(index, subject, read, scope.id, errors) {
+                return;
+            }
+
+            let Some((position, _)) = scope.read(read) else {
+                return;
+            };
+
+            if position >= scope.step {
+                errors.push(ValidationError::TransactionReadOutOfOrder {
+                    transaction: scope.id.clone(),
+                    read: read.clone(),
+                });
+            }
         }
     }
 }
@@ -1658,12 +2240,24 @@ fn visit_declarations<'a>(
             visit(response_id, ReferenceKind::Response, Some(operation_id));
         }
 
-        for transaction_id in operation.transactions.keys() {
+        for (transaction_id, transaction) in &operation.transactions {
             visit(
                 transaction_id,
                 ReferenceKind::Transaction,
                 Some(operation_id),
             );
+
+            for step in &transaction.steps {
+                let TransactionStep::Read(read) = step else {
+                    continue;
+                };
+
+                visit(
+                    &read.result,
+                    ReferenceKind::TransactionRead,
+                    Some(transaction_id),
+                );
+            }
         }
 
         for flow_id in operation.flows.keys() {
@@ -1716,6 +2310,47 @@ fn expect_reference(
     }
 
     true
+}
+
+/// A value reference may only name a source that the invocations
+/// evaluating it can observe.
+///
+/// An input or invocation result belongs to exactly one operation. An
+/// effect belongs either to an operation or to a transition, and a
+/// transition-owned effect is observable by any operation that applies
+/// that transition.
+fn expect_in_scope(
+    index: &ReferenceIndex<'_>,
+    subject: &Id,
+    context: ValueContext<'_>,
+    reference: &Id,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    let Some(info) = index.get(reference) else {
+        return false;
+    };
+
+    let Some(owner) = info.owner else {
+        return true;
+    };
+
+    let owner_info = index.get(owner).expect("declaration owners exist");
+
+    let admitted = match owner_info.kind {
+        ReferenceKind::Transition => index.scope_admits_transition(context.scope, owner),
+
+        _ => index.scope_admits_operation(context.scope, owner),
+    };
+
+    if !admitted {
+        errors.push(ValidationError::ValueSourceOutOfScope {
+            subject: subject.clone(),
+            source: reference.clone(),
+            owner: owner.clone(),
+        });
+    }
+
+    admitted
 }
 
 fn expect_owned_by(
