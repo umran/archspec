@@ -2,7 +2,7 @@
 ## Transaction Replay, Deterministic Derivation, and Transaction Artifacts
 
 **Status:** Draft for discussion  
-**Date:** 2026-08-18  
+**Date:** 2026-08-19  
 **Scope:** Proposed revision to operation transaction, flow, invocation-result, effect-intent, and value-provenance semantics.
 
 This draft is intentionally narrower than a complete rewrite of the Archspec semantic contract. It records the model reached during the transaction/idempotency discussion and is intended to be reconciled into the main semantics document after implementation details are finalized.
@@ -14,8 +14,8 @@ This draft is intentionally narrower than a complete rewrite of the Archspec sem
 This revision has five goals:
 
 1. Keep **transaction idempotency** separate from **invocation-result durability**.
-2. Allow Archspec to prove **natural replay safety** from transaction semantics where sufficient provenance exists.
-3. Provide an explicit **durable keyed transaction-deduplication mechanism** when natural replay safety cannot be proven or is not desired.
+2. Allow Archspec to prove **natural replayability** from transaction semantics where sufficient provenance exists.
+3. Provide an explicit **durable keyed transaction-deduplication mechanism** when natural replayability cannot be proven or is not desired.
 4. Treat `InvocationResult` and `EffectIntent` as **logical transaction artifacts**, rather than as objects that are inherently durable in every architecture.
 5. Preserve transaction-produced artifacts across later flow steps and retries without introducing explicit `Recover*` flow steps.
 
@@ -47,25 +47,28 @@ This draft changes those semantics while preserving the small ordered-flow model
 
 Archspec SHALL distinguish the following concepts.
 
-## 3.1 Natural transaction replay safety
+## 3.1 Natural transaction replayability
 
-A transaction is naturally replay-safe when the analyzer can prove from the transaction's declared semantics that re-executing it for the same logical invocation cannot produce additional inconsistent committed state.
+A transaction is naturally replayable when the analyzer can prove from the transaction's declared semantics that re-executing it for the same logical invocation can reproduce the same logical committed outcome and any artifacts required by the remainder of the flow, without relying on recovery of a prior durable commit.
 
-Natural replay safety is **derived**. It is not asserted by a boolean such as:
+Natural replayability is **derived**. It is not asserted by a boolean such as:
 
 ```yaml
 idempotent: true
 ```
 
-Natural replay safety may follow from facts such as:
+Natural replayability may follow from facts such as:
 
 - stable mutation targets;
 - deterministic mutation contents;
 - uniqueness inherent in `DataObject.identity`;
-- guarded state transitions;
 - absence of persistent mutations.
 
-If the declared semantics are insufficient, replay safety is `Unknown`.
+For V1, a transaction containing any `Transition` is **not** eligible for natural replay. A successful transition changes the state against which that same transition was evaluated, so the transaction cannot be assumed to reproduce the same execution on a later attempt. Transition-containing transactions use the explicit durable keyed-idempotency route defined in this revision.
+
+A guard that merely prevents a second commit is not sufficient for natural replayability. If a retry cannot successfully reproduce the transaction's logical outcome and required artifacts, the transaction is not naturally replayable even when duplicate state mutation is impossible.
+
+If the declared semantics are insufficient, natural replayability is `Unknown`.
 
 ## 3.2 Explicit keyed transaction deduplication
 
@@ -145,13 +148,13 @@ For transactions:
 
 No explicit transaction-commit deduplication fact is available.
 
-The analyzer MAY still prove natural replay safety from the transaction body.
+The analyzer MAY still prove natural replayability from the transaction body.
 
 ### `NotDeduplicated`
 
 The architecture explicitly declares that the execution environment does not provide keyed transaction-commit deduplication.
 
-The analyzer MAY still prove natural replay safety.
+The analyzer MAY still prove natural replayability.
 
 ### `DeduplicatedBy { key }`
 
@@ -321,7 +324,7 @@ This makes `AcquireUniqueClaim` redundant.
 
 # 10. Transaction Read Results and Provenance
 
-The DSL SHOULD model transaction-read results now, even though the V1 idempotency solver will not use them to prove natural replay safety.
+The DSL SHOULD model transaction-read results now, even though the V1 idempotency solver will not use them to prove natural replayability.
 
 A candidate extension is:
 
@@ -375,9 +378,9 @@ Selectors MAY eventually depend on preceding transaction-read values through `Va
 
 V1 SHALL be deliberately conservative.
 
-For natural transaction replay-safety analysis:
+For natural transaction replayability analysis:
 
-> If the provenance closure of a persistent mutation's target or produced values reaches a `TransactionRead`, V1 SHALL NOT prove natural replay safety from that path.
+> If the provenance closure of a persistent mutation's target or produced values reaches a `TransactionRead`, V1 SHALL NOT prove natural replayability from that path.
 
 The result SHOULD be `Unknown`, with a reason indicating dependence on transaction-observed mutable state.
 
@@ -391,7 +394,7 @@ Write B.values = deterministic_from(r.value)
 V1:
 
 ```text
-natural replay safety = UNKNOWN
+natural replayability = UNKNOWN
 reason = mutation depends on transaction read
 ```
 
@@ -400,13 +403,37 @@ This does not mean the transaction is necessarily non-idempotent.
 A future solver may establish replay stability of the read by analyzing, for example:
 
 - all modeled writers of the observed field;
+- whether the transaction itself mutates the object or field from which the read result was derived;
 - object immutability;
 - lifecycle constraints;
 - serialization/concurrency guarantees;
 - absence of intervening writers;
 - implementation conformance regarding writers outside the model.
 
-The DSL records the provenance now so this future analysis does not require a fundamental representation change.
+### 11.1 Self-modifying read dependencies
+
+Deterministic derivation from a transaction read does **not** imply replay idempotency, even when no other process can modify the observed state. The transaction itself may change the value that a later retry will read.
+
+For example:
+
+```text
+Read A.counter -> r
+Write A.counter = deterministic_from(r.counter)
+```
+
+An implementation may deterministically compute `r.counter + 1`. Starting from `5`, the first execution writes `6`; a retry then reads `6` and writes `7`. The derivation is deterministic, but the transaction is not replay-idempotent.
+
+Accordingly, future read-stability analysis must prove more than the absence of concurrent or external writers. If `R(S)` denotes the value observed by a relevant read in state `S`, and a successful transaction execution produces state `T(S)`, replay stability requires the observed value to be invariant under the transaction's own committed transformation whenever that read participates in a replay proof. At minimum, the solver must be able to establish the relevant form of:
+
+```text
+R(S) = R(T(S))
+```
+
+and must additionally account for any other admitted state transitions between attempts.
+
+For V1, Archspec does not attempt this fixed-point/invariance analysis. **Any persistent mutation or artifact derivation whose provenance transitively reaches a `TransactionRead` prevents natural replay from being proven.**
+
+The DSL records the provenance now so a future solver can perform this stronger analysis without a fundamental representation change.
 
 ---
 
@@ -437,7 +464,7 @@ This describes how the logical result produced by that execution is derived.
 
 If:
 
-- the establishing transaction is naturally replay-safe; and
+- the establishing transaction is naturally replayable; and
 - the result derivation is replay-deterministic;
 
 then a retry MAY safely reconstruct the same logical `InvocationResult`.
@@ -456,7 +483,7 @@ If the establishing transaction uses `DeduplicatedBy(K)`:
 
 If:
 
-- the establishing transaction is not proven naturally replay-safe;
+- the establishing transaction is not proven naturally replayable;
 - there is no explicit keyed transaction deduplication;
 - and replay requires the result;
 
@@ -497,7 +524,7 @@ pub struct EstablishEffectIntent {
 
 If:
 
-- the establishing transaction is naturally replay-safe; and
+- the establishing transaction is naturally replayable; and
 - the intent derivation is replay-deterministic;
 
 then retrying the transaction MAY reconstruct the same logical effect intent.
@@ -528,6 +555,31 @@ may cause the effect execution to be attempted again.
 Safety of this case depends on the modeled effect's own idempotency/retry semantics.
 
 Artifact reconstruction and effect-execution idempotency are distinct concerns.
+
+## 13.4 Transition-produced effect intents
+
+A `Transition` may declare transition side effects. Under this revision, those side effects SHALL be interpreted as implicitly established logical `EffectIntent` artifacts, established atomically by the successful transition transaction. They follow the same artifact-retention rules as explicitly established effect intents.
+
+For V1, a transaction containing a `Transition` is not naturally replayable. Therefore transition-produced effect intents SHALL NOT be considered reconstructible merely because their payload derivation is deterministic. A retry cannot partially re-run the artifact-producing portion of a transaction while bypassing the transition that established it.
+
+This creates an important crash boundary:
+
+```text
+Transaction T
+    Transition pending -> paid
+        establishes EffectIntent E
+COMMIT
+
+<crash>
+
+ExecuteEffectIntent E
+```
+
+After `T` commits, a retry cannot naturally replay `T` to reproduce `E`, because the transition has already changed the subject state. Without durable transaction replay, the subsequent `ExecuteEffectIntent E` has no recoverable artifact to consume.
+
+Accordingly, **V1 SHALL require every transaction containing a `Transition` to declare explicit durable keyed idempotency using `DeduplicatedBy(K)`.** The successful keyed commit SHALL retain transition-produced effect intents and any other transaction artifacts. A later encounter with the same `T(K)` resolves the prior commit, restores those artifacts, and does not execute the transition body again.
+
+This rule provides crash recovery for flows that continue after a transition transaction, including flows whose next step executes an effect intent or consumes an invocation result established by the transition transaction.
 
 ---
 
@@ -648,7 +700,7 @@ ResponseReplayRequirement::ReplayConsistent
 
 the solver must prove a safe route to the same logical result, such as:
 
-1. naturally replay-safe transaction + replay-deterministic result derivation; or
+1. naturally replayable transaction + replay-deterministic result derivation; or
 2. keyed transaction deduplication + recovery of the result retained by the prior committed execution.
 
 ---
@@ -700,7 +752,7 @@ Recovery is a semantic consequence of re-encountering an explicitly keyed transa
 
 # 22. V1 Transaction Replay Analysis
 
-V1 SHOULD compute transaction replay safety using two independent proof routes.
+V1 SHOULD compute transaction replayability using two independent proof routes.
 
 ## 22.1 Natural route
 
@@ -712,12 +764,13 @@ A natural proof may use:
 - deterministic mutation derivation;
 - replay-stable provenance;
 - unique object identity;
-- state-transition guards;
 - absence of persistent mutation.
 
-If required provenance is unspecified, replay safety is `Unknown`.
+If required provenance is unspecified, natural replayability is `Unknown`.
 
-If mutation target/value provenance reaches a `TransactionRead`, V1 returns `Unknown` for the natural proof route.
+If mutation target/value or artifact provenance reaches a `TransactionRead`, V1 returns `Unknown` for the natural proof route. This includes self-modifying dependencies where a transaction reads state that it later changes; deterministic computation from the read does not make the retry deterministic because the retry may observe the state produced by the first execution.
+
+If the transaction contains any `Transition`, the V1 natural route is unavailable. Such a transaction MUST use `DeduplicatedBy(K)` so that the successful commit and its artifacts can be recovered without re-executing the transition.
 
 ## 22.2 Explicit route
 
@@ -739,7 +792,7 @@ For each artifact needed after a retry, the solver SHOULD establish one of:
 
 ```text
 A. reconstruction
-   establishing transaction naturally replay-safe
+   establishing transaction naturally replayable under the V1 natural route
    +
    artifact derivation replay-deterministic
 
@@ -752,6 +805,8 @@ B. recovery
 ```
 
 Otherwise artifact replay availability/consistency is `Unknown`.
+
+A transaction containing a `Transition` cannot use reconstruction route A in V1. Its artifacts are replay-available only through the durable keyed-commit recovery route.
 
 ---
 
@@ -768,7 +823,7 @@ The solver must compose the relevant proofs across the admitted invocation flow.
 
 At minimum it may need to reason about:
 
-- transaction replay safety;
+- transaction replayability / durable commit recovery;
 - artifact replay availability;
 - response replay consistency;
 - effect execution idempotency;
@@ -906,7 +961,7 @@ Transaction T
 V1:
 
 ```text
-natural replay safety = UNKNOWN
+natural replayability = UNKNOWN
 ```
 
 because the mutation depends on transaction-observed state.
@@ -953,7 +1008,7 @@ V1 does not need to prove replay stability of `account.tier`.
 
 ```text
 Transaction T
-  naturally replay-safe
+  naturally replayable
   EstablishEffectIntent E
     deterministic_from(input.order_id, input.payload)
 
@@ -990,6 +1045,27 @@ No `RecoverEffectIntent` flow step is necessary.
 
 ---
 
+## 26.6 Transition transaction and crash recovery
+
+```text
+Transaction T
+  idempotency: DeduplicatedBy(request_id)
+
+  Transition Order: pending -> paid
+    side effect: PaymentCaptured
+
+  EstablishInvocationResult R
+
+ExecuteEffectIntent PaymentCaptured
+Response R
+```
+
+The transition transaction is not eligible for V1 natural replay. On the first successful execution, `Commit(T, request_id)` atomically retains the transition-produced effect intent and `R`. If the invocation crashes after the transaction commits but before `ExecuteEffectIntent`, retrying the flow resolves the prior commit, restores those artifacts, and continues without attempting the state transition again.
+
+Without `DeduplicatedBy(request_id)`, V1 rejects this transaction shape as a recoverable/idempotent replay boundary because the committed transition cannot be naturally replayed to reproduce its artifacts.
+
+---
+
 # 27. Open Questions Before Finalization
 
 The semantic direction is coherent, but the following should be explicitly resolved before calling the revision final:
@@ -1006,8 +1082,8 @@ The semantic direction is coherent, but the following should be explicitly resol
 4. **Insert failure semantics**  
    Normatively define the result of attempting to insert an already-existing `DataObject.identity` and how that affects the enclosing transaction and flow applicability.
 
-5. **State-transition replay semantics**  
-   Specify when a guarded `StateTransition` can participate in a natural replay-safety proof.
+5. **Future transition replay analysis**  
+   V1 requires explicit keyed idempotency for every transition-containing transaction. A later solver may investigate whether restricted transition patterns admit safe replay without durable commit recovery, but no such inference is permitted in V1.
 
 6. **Effect execution completion state**  
    Keep intent reconstruction separate from durable tracking of effect execution/completion, and decide what minimum execution-state semantics V1 requires.
@@ -1023,16 +1099,16 @@ These questions do not require introducing recovery-specific flow steps.
 
 The intended model can be summarized as follows:
 
-> A transaction may be replay-safe either because its declared operations are naturally replay-safe or because the execution environment durably deduplicates successful commits by an explicit idempotency key.
+> A transaction may be replayable either because its declared operations can be safely and deterministically re-executed or because the execution environment durably deduplicates successful commits by an explicit idempotency key and recovers the prior committed execution.
 
 > Mutation and artifact value computations may declare deterministic provenance without exposing their implementation expressions.
 
-> Transaction-read results are first-class provenance sources, but V1 does not use read-dependent mutations to prove natural replay safety.
+> Transaction-read results are first-class provenance sources, but V1 does not use any read-dependent mutation or artifact derivation to prove natural replay. Deterministic computation from a read is insufficient because the transaction itself may change the state observed by a retry.
 
 > `InvocationResult` and `EffectIntent` are logical transaction artifacts. They are not inherently transaction-idempotency mechanisms.
 
-> Naturally replayed transactions may reconstruct replay-deterministic artifacts. Explicitly keyed transactions commit at most once and durably retain the exact artifacts of the successful logical commit for recovery on later encounters.
+> Naturally replayable transactions may reconstruct replay-deterministic artifacts. Transactions containing state transitions are not naturally replayable in V1 and must declare explicit durable keyed idempotency. Explicitly keyed transactions commit at most once and durably retain the exact artifacts of the successful logical commit for recovery on later encounters.
 
 > Invocation flows remain simple ordered sequences of transaction and effect-execution steps. Recovery is not represented as a separate flow action.
 
-> Durable result memoization must never be used to conceal a later inconsistent non-idempotent transaction execution. If neither natural replay safety nor explicit keyed commit deduplication can establish a coherent replay path, the analyzer reports the relevant requirement as unproven.
+> Durable result memoization must never be used to conceal a later inconsistent non-idempotent transaction execution. If neither natural replayability nor explicit keyed commit deduplication can establish a coherent replay path, the analyzer reports the relevant requirement as unproven.
