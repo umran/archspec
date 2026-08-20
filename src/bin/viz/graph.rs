@@ -1,0 +1,784 @@
+//! Extraction of the system-level view model from a parsed `Model`.
+//!
+//! The presentation layer renders two kinds of data: the raw model
+//! (serialized wholesale for detail panes) and this derived graph,
+//! which resolves the DSL's indirections — effect intents, transition
+//! ownership, message selectors — into plain vertices and edges so the
+//! front end never re-implements those semantics.
+//!
+//! Vertices: services (boundaries), operations, topics, external
+//! systems, and a synthetic client for request inputs nothing in the
+//! model invokes. Edges: publications (operation → topic),
+//! subscriptions (topic → operation), requests (operation →
+//! operation), and external effect executions.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Serialize;
+
+use archspec::spec::{
+    Effect, FlowStep, Id, Input, MessageSelector, Model, TransactionStep,
+    TransitionSideEffect,
+};
+
+pub const CLIENT_NODE_ID: &str = "@client";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Graph {
+    pub services: Vec<ServiceNode>,
+    pub operations: Vec<OperationNode>,
+    pub topics: Vec<TopicNode>,
+    pub externals: Vec<ExternalNode>,
+
+    /// Present only when at least one request input is externally
+    /// invokable.
+    pub client: Option<ClientNode>,
+
+    pub edges: Vec<Edge>,
+
+    /// Where each effect id is declared: on an operation or on a
+    /// state-machine transition.
+    pub effect_owners: BTreeMap<Id, EffectOwner>,
+
+    /// Transaction steps that take each transition, keyed by
+    /// `machine/transition`.
+    pub transition_refs: BTreeMap<String, Vec<TransitionRef>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceNode {
+    pub id: Id,
+    pub kind: String,
+    pub operations: Vec<Id>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperationNode {
+    pub id: Id,
+    pub service: Id,
+    pub description: Option<String>,
+
+    pub inputs: usize,
+    pub flows: usize,
+
+    /// State machines this operation touches, via transition steps or
+    /// by executing transition-owned effects.
+    pub machines: Vec<Id>,
+
+    pub requirements: RequirementBadges,
+    pub concurrency: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RequirementBadges {
+    pub serialization: usize,
+    pub ordering: usize,
+    pub idempotency: usize,
+    pub recoverability: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicNode {
+    pub id: Id,
+    pub ordering: String,
+    pub messages: Vec<Id>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalNode {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientNode {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Edge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+
+    #[serde(flatten)]
+    pub detail: EdgeDetail,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EdgeDetail {
+    /// A publication effect available to `operation`.
+    Publish {
+        operation: Id,
+        effect: Id,
+        schema: Id,
+
+        /// Set when the effect is owned by a state-machine transition
+        /// rather than declared on the operation.
+        via_transition: Option<TransitionKey>,
+
+        /// Flows of `operation` that execute the effect. Empty means
+        /// the capability is declared but no declared flow uses it.
+        executed_by: Vec<Id>,
+    },
+
+    Subscribe {
+        operation: Id,
+        input: Id,
+
+        /// Concrete message schemas, with `MessageSelector::All`
+        /// resolved against the topic.
+        schemas: Vec<Id>,
+
+        delivery: String,
+        routing: String,
+        lane_concurrency: String,
+    },
+
+    /// A request effect from `operation` to another operation's
+    /// request input.
+    Request {
+        operation: Id,
+        effect: Id,
+        input: Id,
+        schema: Id,
+        retry: String,
+        via_transition: Option<TransitionKey>,
+        executed_by: Vec<Id>,
+    },
+
+    /// An external effect execution; the modeled system ends here.
+    External {
+        operation: Id,
+        effect: Id,
+        idempotency: String,
+        executed_by: Vec<Id>,
+    },
+
+    /// A request input no modeled operation invokes.
+    Client { operation: Id, input: Id, schema: Id },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitionKey {
+    pub machine: Id,
+    pub transition: Id,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectOwner {
+    Operation { operation: Id },
+    Transition { machine: Id, transition: Id },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitionRef {
+    pub operation: Id,
+    pub transaction: Id,
+    pub step: usize,
+}
+
+pub fn extract(model: &Model) -> Graph {
+    let effect_owners = collect_effect_owners(model);
+    let transition_refs = collect_transition_refs(model);
+
+    // Request inputs targeted by some request effect anywhere in the
+    // model; the rest are externally invokable.
+    let mut targeted_inputs: BTreeSet<(Id, Id)> = BTreeSet::new();
+
+    for op in model.operations.values() {
+        for effect in op.effects.values() {
+            if let Effect::Request(request) = effect {
+                targeted_inputs.insert((
+                    request.target.operation.clone(),
+                    request.target.input.clone(),
+                ));
+            }
+        }
+    }
+
+    for machine in model.state_machines.values() {
+        for transition in machine.transitions.values() {
+            for effect in transition.side_effects.values() {
+                if let TransitionSideEffect::Request(request) = effect {
+                    targeted_inputs.insert((
+                        request.target.operation.clone(),
+                        request.target.input.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut edges = Vec::new();
+    let mut external_names: BTreeSet<String> = BTreeSet::new();
+    let mut client_used = false;
+    let mut edge_seq = 0usize;
+
+    let mut next_edge_id = move || {
+        let id = format!("e{edge_seq}");
+        edge_seq += 1;
+        id
+    };
+
+    let mut operations = Vec::new();
+
+    for (op_id, op) in &model.operations {
+        let executions = collect_effect_executions(op);
+        let mut machines: BTreeSet<Id> = BTreeSet::new();
+
+        // Inputs: subscriptions become topic → operation edges;
+        // request inputs nobody targets become client edges.
+        for (input_id, input) in &op.inputs {
+            match input {
+                Input::Subscription(sub) => {
+                    let schemas = match &sub.messages {
+                        MessageSelector::All => model
+                            .topics
+                            .get(&sub.topic)
+                            .map(|t| t.messages.iter().cloned().collect())
+                            .unwrap_or_default(),
+                        MessageSelector::Only(schemas) => {
+                            schemas.iter().cloned().collect()
+                        }
+                    };
+
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: sub.topic.to_string(),
+                        to: op_id.to_string(),
+                        detail: EdgeDetail::Subscribe {
+                            operation: op_id.clone(),
+                            input: input_id.clone(),
+                            schemas,
+                            delivery: to_tag(&sub.delivery),
+                            routing: to_tag(&sub.dispatch.routing),
+                            lane_concurrency: concurrency_label(
+                                &sub.dispatch.lane_concurrency,
+                            ),
+                        },
+                    });
+                }
+
+                Input::Request(request) => {
+                    let key = (op_id.clone(), input_id.clone());
+
+                    if !targeted_inputs.contains(&key) {
+                        client_used = true;
+
+                        edges.push(Edge {
+                            id: next_edge_id(),
+                            from: CLIENT_NODE_ID.to_string(),
+                            to: op_id.to_string(),
+                            detail: EdgeDetail::Client {
+                                operation: op_id.clone(),
+                                input: input_id.clone(),
+                                schema: request.schema.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
+        // Effects available to the operation: its own declarations
+        // plus transition-owned effects reachable through its intents.
+        let mut available: Vec<(Id, ResolvedEffect, Option<TransitionKey>)> =
+            op.effects
+                .iter()
+                .map(|(id, effect)| {
+                    (id.clone(), ResolvedEffect::from(effect), None)
+                })
+                .collect();
+
+        for intent in op.effect_intents.values() {
+            if op.effects.contains_key(&intent.effect) {
+                continue;
+            }
+
+            if let Some(EffectOwner::Transition {
+                machine,
+                transition,
+            }) = effect_owners.get(&intent.effect)
+            {
+                if let Some(effect) = transition_effect(
+                    model,
+                    machine,
+                    transition,
+                    &intent.effect,
+                ) {
+                    machines.insert(machine.clone());
+
+                    available.push((
+                        intent.effect.clone(),
+                        effect,
+                        Some(TransitionKey {
+                            machine: machine.clone(),
+                            transition: transition.clone(),
+                        }),
+                    ));
+                }
+            }
+        }
+
+        for (effect_id, effect, via_transition) in available {
+            let executed_by =
+                executions.get(&effect_id).cloned().unwrap_or_default();
+
+            match effect {
+                ResolvedEffect::Publication(publication) => {
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: op_id.to_string(),
+                        to: publication.topic.to_string(),
+                        detail: EdgeDetail::Publish {
+                            operation: op_id.clone(),
+                            effect: effect_id,
+                            schema: publication.schema.clone(),
+                            via_transition,
+                            executed_by,
+                        },
+                    });
+                }
+
+                ResolvedEffect::Request(request) => {
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: op_id.to_string(),
+                        to: request.target.operation.to_string(),
+                        detail: EdgeDetail::Request {
+                            operation: op_id.clone(),
+                            effect: effect_id,
+                            input: request.target.input.clone(),
+                            schema: request.schema.clone(),
+                            retry: to_tag(&request.retry),
+                            via_transition,
+                            executed_by,
+                        },
+                    });
+                }
+
+                ResolvedEffect::External(external) => {
+                    let node_id = format!("@external:{}", external.name);
+                    external_names.insert(external.name.clone());
+
+                    edges.push(Edge {
+                        id: next_edge_id(),
+                        from: op_id.to_string(),
+                        to: node_id,
+                        detail: EdgeDetail::External {
+                            operation: op_id.clone(),
+                            effect: effect_id,
+                            idempotency: idempotency_label(
+                                &external.idempotency,
+                            ),
+                            executed_by,
+                        },
+                    });
+                }
+            }
+        }
+
+        // Machines referenced by transition steps in transactions.
+        for transaction in op.transactions.values() {
+            for step in &transaction.steps {
+                if let TransactionStep::Transition(transition) = step {
+                    machines.insert(transition.machine.clone());
+                }
+            }
+        }
+
+        operations.push(OperationNode {
+            id: op_id.clone(),
+            service: op.service.clone(),
+            description: op.description.clone(),
+            inputs: op.inputs.len(),
+            flows: op.flows.len(),
+            machines: machines.into_iter().collect(),
+            requirements: RequirementBadges {
+                serialization: op.requirements.serialization.len(),
+                ordering: op.requirements.ordering.len(),
+                idempotency: op.requirements.idempotency.len(),
+                recoverability: op.requirements.recoverability.len(),
+            },
+            concurrency: operation_concurrency_label(
+                &op.execution.concurrency,
+            ),
+        });
+    }
+
+    let services = model
+        .services
+        .iter()
+        .map(|(id, service)| ServiceNode {
+            id: id.clone(),
+            kind: to_tag(&service.kind),
+            operations: model
+                .operations
+                .iter()
+                .filter(|(_, op)| &op.service == id)
+                .map(|(op_id, _)| op_id.clone())
+                .collect(),
+        })
+        .collect();
+
+    let topics = model
+        .topics
+        .iter()
+        .map(|(id, topic)| TopicNode {
+            id: id.clone(),
+            ordering: topic_ordering_label(&topic.ordering),
+            messages: topic.messages.iter().cloned().collect(),
+        })
+        .collect();
+
+    let externals = external_names
+        .into_iter()
+        .map(|name| ExternalNode {
+            id: format!("@external:{name}"),
+            name,
+        })
+        .collect();
+
+    Graph {
+        services,
+        operations,
+        topics,
+        externals,
+        client: client_used.then(|| ClientNode {
+            id: CLIENT_NODE_ID.to_string(),
+        }),
+        edges,
+        effect_owners,
+        transition_refs,
+    }
+}
+
+fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
+    let mut owners = BTreeMap::new();
+
+    for (op_id, op) in &model.operations {
+        for effect_id in op.effects.keys() {
+            owners.insert(
+                effect_id.clone(),
+                EffectOwner::Operation {
+                    operation: op_id.clone(),
+                },
+            );
+        }
+    }
+
+    for (machine_id, machine) in &model.state_machines {
+        for (transition_id, transition) in &machine.transitions {
+            for effect_id in transition.side_effects.keys() {
+                owners.insert(
+                    effect_id.clone(),
+                    EffectOwner::Transition {
+                        machine: machine_id.clone(),
+                        transition: transition_id.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    owners
+}
+
+fn collect_transition_refs(
+    model: &Model,
+) -> BTreeMap<String, Vec<TransitionRef>> {
+    let mut refs: BTreeMap<String, Vec<TransitionRef>> = BTreeMap::new();
+
+    for (op_id, op) in &model.operations {
+        for (tx_id, transaction) in &op.transactions {
+            for (index, step) in transaction.steps.iter().enumerate() {
+                if let TransactionStep::Transition(transition) = step {
+                    refs.entry(format!(
+                        "{}/{}",
+                        transition.machine, transition.transition
+                    ))
+                    .or_default()
+                    .push(TransitionRef {
+                        operation: op_id.clone(),
+                        transaction: tx_id.clone(),
+                        step: index,
+                    });
+                }
+            }
+        }
+    }
+
+    refs
+}
+
+/// For one operation: effect id → flows that execute it, either
+/// directly or by executing an intent that names it.
+fn collect_effect_executions(
+    op: &archspec::spec::Operation,
+) -> BTreeMap<Id, Vec<Id>> {
+    let mut executions: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+
+    for (flow_id, flow) in &op.flows {
+        for step in &flow.steps {
+            let effect_id = match step {
+                FlowStep::ExecuteEffect { effect } => Some(effect.clone()),
+
+                FlowStep::ExecuteEffectIntent { intent } => op
+                    .effect_intents
+                    .get(intent)
+                    .map(|intent| intent.effect.clone()),
+
+                FlowStep::Transaction { .. } => None,
+            };
+
+            if let Some(effect_id) = effect_id {
+                let flows = executions.entry(effect_id).or_default();
+
+                if !flows.contains(flow_id) {
+                    flows.push(flow_id.clone());
+                }
+            }
+        }
+    }
+
+    executions
+}
+
+/// Uniform view over operation-declared and transition-owned effects.
+#[derive(Debug, Clone, Copy)]
+enum ResolvedEffect<'a> {
+    Publication(&'a archspec::spec::PublicationEffect),
+    Request(&'a archspec::spec::RequestEffect),
+    External(&'a archspec::spec::ExternalEffect),
+}
+
+impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
+    fn from(effect: &'a Effect) -> Self {
+        match effect {
+            Effect::Publication(publication) => Self::Publication(publication),
+            Effect::Request(request) => Self::Request(request),
+            Effect::External(external) => Self::External(external),
+        }
+    }
+}
+
+impl<'a> From<&'a TransitionSideEffect> for ResolvedEffect<'a> {
+    fn from(effect: &'a TransitionSideEffect) -> Self {
+        match effect {
+            TransitionSideEffect::Publication(publication) => {
+                Self::Publication(publication)
+            }
+            TransitionSideEffect::Request(request) => Self::Request(request),
+        }
+    }
+}
+
+fn transition_effect<'a>(
+    model: &'a Model,
+    machine: &Id,
+    transition: &Id,
+    effect: &Id,
+) -> Option<ResolvedEffect<'a>> {
+    model
+        .state_machines
+        .get(machine)?
+        .transitions
+        .get(transition)?
+        .side_effects
+        .get(effect)
+        .map(ResolvedEffect::from)
+}
+
+fn to_tag<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(tag)) => tag,
+        Ok(serde_json::Value::Object(map)) => map
+            .get("kind")
+            .and_then(|kind| kind.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unspecified".to_string()),
+        _ => "unspecified".to_string(),
+    }
+}
+
+fn concurrency_label(value: &archspec::spec::LaneConcurrency) -> String {
+    match value {
+        archspec::spec::LaneConcurrency::Unspecified => {
+            "unspecified".to_string()
+        }
+        archspec::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
+        archspec::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
+    }
+}
+
+fn operation_concurrency_label(
+    value: &archspec::spec::OperationConcurrency,
+) -> String {
+    match value {
+        archspec::spec::OperationConcurrency::Unspecified => {
+            "unspecified".to_string()
+        }
+        archspec::spec::OperationConcurrency::Bounded(n) => {
+            format!("bounded({n})")
+        }
+        archspec::spec::OperationConcurrency::Unbounded => {
+            "unbounded".to_string()
+        }
+    }
+}
+
+fn idempotency_label(
+    value: &archspec::spec::IdempotencyGuarantee,
+) -> String {
+    match value {
+        archspec::spec::IdempotencyGuarantee::Unspecified => {
+            "unspecified".to_string()
+        }
+        archspec::spec::IdempotencyGuarantee::NotDeduplicated => {
+            "not_deduplicated".to_string()
+        }
+        archspec::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => {
+            "deduplicated_by".to_string()
+        }
+    }
+}
+
+fn topic_ordering_label(value: &archspec::spec::TopicOrdering) -> String {
+    match value {
+        archspec::spec::TopicOrdering::Unspecified => {
+            "unspecified".to_string()
+        }
+        archspec::spec::TopicOrdering::Unordered => "unordered".to_string(),
+        archspec::spec::TopicOrdering::Global => "global".to_string(),
+        archspec::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flash_checkout() -> Model {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flash_checkout.yaml");
+
+        archspec::parser::yaml::parse(
+            &std::fs::read_to_string(path).expect("fixture readable"),
+        )
+        .expect("fixture parses")
+    }
+
+    fn edges_of_kind<'a>(graph: &'a Graph, kind: &str) -> Vec<&'a Edge> {
+        graph
+            .edges
+            .iter()
+            .filter(|e| {
+                serde_json::to_value(&e.detail).unwrap()["kind"] == kind
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extracts_expected_vertices() {
+        let graph = extract(&flash_checkout());
+
+        assert_eq!(graph.services.len(), 3);
+        assert_eq!(graph.operations.len(), 6);
+        assert_eq!(graph.topics.len(), 1);
+        assert_eq!(graph.externals.len(), 1);
+        assert_eq!(graph.externals[0].name, "payment-provider.charge");
+        assert!(graph.client.is_some());
+    }
+
+    #[test]
+    fn extracts_expected_edges() {
+        let graph = extract(&flash_checkout());
+
+        // Four operation-declared publications plus one transition-owned
+        // publication surfaced through operation.apply_payment's intent.
+        assert_eq!(edges_of_kind(&graph, "publish").len(), 5);
+        assert_eq!(edges_of_kind(&graph, "subscribe").len(), 3);
+        assert_eq!(edges_of_kind(&graph, "external").len(), 1);
+
+        // No modeled operation issues requests, so all three request
+        // inputs are client entry points.
+        assert_eq!(edges_of_kind(&graph, "request").len(), 0);
+        assert_eq!(edges_of_kind(&graph, "client").len(), 3);
+    }
+
+    #[test]
+    fn transition_owned_publication_is_attributed_to_executor() {
+        let graph = extract(&flash_checkout());
+
+        let via_transition: Vec<_> = edges_of_kind(&graph, "publish")
+            .into_iter()
+            .filter_map(|e| match &e.detail {
+                EdgeDetail::Publish {
+                    operation,
+                    effect,
+                    via_transition: Some(key),
+                    executed_by,
+                    ..
+                } => Some((operation, effect, key, executed_by)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(via_transition.len(), 1);
+        let (operation, effect, key, executed_by) = &via_transition[0];
+        assert_eq!(operation.0, "operation.apply_payment");
+        assert_eq!(effect.0, "effect.order.paid");
+        assert_eq!(key.machine.0, "machine.order_lifecycle");
+        assert_eq!(key.transition.0, "transition.order.mark_paid");
+        assert_eq!(
+            executed_by.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            ["flow.apply_payment"],
+        );
+    }
+
+    #[test]
+    fn effect_owners_cover_operation_and_transition_effects() {
+        let graph = extract(&flash_checkout());
+
+        assert!(matches!(
+            graph.effect_owners.get(&Id("effect.order.paid".into())),
+            Some(EffectOwner::Transition { .. }),
+        ));
+        assert!(matches!(
+            graph
+                .effect_owners
+                .get(&Id("effect.charge_payment.card".into())),
+            Some(EffectOwner::Operation { .. }),
+        ));
+    }
+
+    #[test]
+    fn transition_refs_locate_transaction_steps() {
+        let graph = extract(&flash_checkout());
+
+        let refs = graph
+            .transition_refs
+            .get("machine.order_lifecycle/transition.order.cancel")
+            .expect("cancel transition is referenced");
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].operation.0, "operation.cancel_order");
+        assert_eq!(refs[0].transaction.0, "tx.cancel_order");
+        assert_eq!(refs[0].step, 0);
+    }
+
+    #[test]
+    fn subscriptions_resolve_message_selectors() {
+        let graph = extract(&flash_checkout());
+
+        for edge in edges_of_kind(&graph, "subscribe") {
+            let EdgeDetail::Subscribe { schemas, .. } = &edge.detail else {
+                unreachable!();
+            };
+            assert_eq!(schemas.len(), 1);
+        }
+    }
+}

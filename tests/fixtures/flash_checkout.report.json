@@ -1,0 +1,410 @@
+{
+  "format": 1,
+  "model_revision": 1,
+  "obligations": [
+    {
+      "id": "oblig.operation.create_order.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.create_order",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Repeated attempts at operation.create_order sharing idempotency_key produce the effects of a single invocation.",
+      "assumptions": [
+        "tx.create_order.new commits are deduplicated by input.create_order.request.idempotency_key",
+        "effect.create_order.publish_created propagates the invocation key into event_id"
+      ],
+      "evidence": [
+        {
+          "subject": "tx.create_order.new",
+          "message": "keyed commit deduplication makes the insert and both artifact establishments at-most-once per key"
+        },
+        {
+          "subject": "intent.create_order.publish_created",
+          "message": "the recovered intent carries the same deterministic contents on every attempt"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.create_order.response_replay.0",
+      "property": { "kind": "response_replay" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.create_order",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Every attempt at operation.create_order sharing the declared key observes an equivalent response.",
+      "assumptions": [
+        "response.create_order is sourced from result.create_order"
+      ],
+      "evidence": [
+        {
+          "subject": "result.create_order",
+          "message": "established inside the keyed-deduplicated transaction, so retries recover the original artifact instead of recomputing it"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.create_order.recoverability.0",
+      "property": { "kind": "recoverability" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.create_order",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "An interrupted invocation of operation.create_order can be resumed to reach a declared flow's terminal step.",
+      "evidence": [
+        {
+          "subject": "flow.create_order.new",
+          "message": "every failure prefix admits a continuation: an uncommitted transaction re-executes, a committed one resolves by key, and the publication intent is replay-available from the commit"
+        }
+      ]
+    },
+    {
+      "id": "oblig.flow.create_order.new.terminal_reachability",
+      "property": { "kind": "custom", "name": "terminal_reachability" },
+      "subject": {
+        "kind": "flow",
+        "operation": "operation.create_order",
+        "flow": "flow.create_order.new"
+      },
+      "status": "proven",
+      "summary": "flow.create_order.new reaches its terminal response from every admitted interruption point.",
+      "evidence": [
+        {
+          "message": "two steps, both re-drivable: keyed transaction then intent execution"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.reserve_inventory.serialization.0",
+      "property": { "kind": "serialization" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.reserve_inventory",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.reserve_inventory sharing order_id never overlap.",
+      "assumptions": [
+        "topic.order_events is keyed by order_id",
+        "input.reserve_inventory.created routes by topic key with lane concurrency 1"
+      ],
+      "evidence": [
+        {
+          "subject": "input.reserve_inventory.created",
+          "message": "deliveries sharing order_id enter one lane and at most one invocation per lane is active"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.reserve_inventory.ordering.0",
+      "property": { "kind": "ordering" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.reserve_inventory",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.reserve_inventory sharing order_id take effect in their semantic order.",
+      "evidence": [
+        {
+          "subject": "topic.order_events",
+          "message": "keyed topic order plus single-lane keyed dispatch preserves per-order delivery order into execution order"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.reserve_inventory.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.reserve_inventory",
+        "requirement": 0
+      },
+      "status": "disproven",
+      "summary": "Repeated attempts at operation.reserve_inventory sharing event_id produce the effects of a single invocation.",
+      "assumptions": [
+        "input.reserve_inventory.created delivery is at_least_once"
+      ],
+      "evidence": [
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "the commit is not deduplicated and the reserved counter is derived from a transaction read, so the body is not naturally replayable"
+        }
+      ],
+      "counterexample": {
+        "trace": [
+          {
+            "actor": "topic.order_events",
+            "description": "OrderCreated(event_id=E, quantity=2) is delivered"
+          },
+          {
+            "actor": "operation.reserve_inventory",
+            "description": "tx.reserve_inventory reads reserved=0, writes reserved=2, commits"
+          },
+          {
+            "description": "the delivery acknowledgement is lost before the broker records completion"
+          },
+          {
+            "actor": "topic.order_events",
+            "description": "the same logical message (event_id=E) is redelivered"
+          },
+          {
+            "actor": "operation.reserve_inventory",
+            "description": "tx.reserve_inventory reads reserved=2, writes reserved=4: the same event reserves stock twice"
+          }
+        ]
+      }
+    },
+    {
+      "id": "oblig.tx.reserve_inventory.natural_replayability",
+      "property": { "kind": "custom", "name": "natural_replayability" },
+      "subject": {
+        "kind": "transaction",
+        "operation": "operation.reserve_inventory",
+        "transaction": "tx.reserve_inventory"
+      },
+      "status": "disproven",
+      "summary": "Re-executing tx.reserve_inventory reproduces the original committed outcome.",
+      "evidence": [
+        {
+          "message": "the write to stock.reserved depends on read.reserve_inventory.stock, whose observed value changes across attempts, including due to the transaction's own prior commit"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.reserve_inventory.recoverability.0",
+      "property": { "kind": "recoverability" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.reserve_inventory",
+        "requirement": 0
+      },
+      "status": "unknown",
+      "summary": "An interrupted invocation of operation.reserve_inventory is re-driven until it reaches a declared flow's terminal step.",
+      "assumptions": [
+        "at_least_once delivery on input.reserve_inventory.created acts as the retry driver"
+      ],
+      "evidence": [
+        {
+          "subject": "tx.reserve_inventory",
+          "message": "resumability cannot be established: the commit is neither deduplicated nor naturally replayable (see the disproven natural-replayability obligation), so a prefix interrupted after commit has no proven route for resolving the transaction on re-encounter"
+        },
+        {
+          "message": "the at_least_once retry driver discharges only the liveness half of guaranteed completion; the resumability half remains undecided"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.charge_payment.serialization.0",
+      "property": { "kind": "serialization" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.charge_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.charge_payment sharing order_id never overlap.",
+      "evidence": [
+        {
+          "subject": "input.charge_payment.reserved",
+          "message": "keyed routing with lane concurrency 1 serializes per order"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.charge_payment.ordering.0",
+      "property": { "kind": "ordering" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.charge_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.charge_payment sharing order_id take effect in their semantic order.",
+      "evidence": [
+        {
+          "subject": "topic.order_events",
+          "message": "keyed topic order plus single-lane keyed dispatch"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.charge_payment.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.charge_payment",
+        "requirement": 0
+      },
+      "status": "disproven",
+      "summary": "Repeated attempts at operation.charge_payment sharing event_id produce the effects of a single invocation.",
+      "evidence": [
+        {
+          "subject": "effect.charge_payment.card",
+          "message": "the external charge declares not_deduplicated and no artifact records that it already executed"
+        }
+      ],
+      "counterexample": {
+        "trace": [
+          {
+            "actor": "topic.order_events",
+            "description": "InventoryReserved(event_id=E) is delivered"
+          },
+          {
+            "actor": "operation.charge_payment",
+            "description": "the card is charged at the payment provider"
+          },
+          {
+            "description": "the worker crashes before publishing PaymentCaptured; the delivery is not acknowledged"
+          },
+          {
+            "actor": "topic.order_events",
+            "description": "event E is redelivered"
+          },
+          {
+            "actor": "operation.charge_payment",
+            "description": "the card is charged a second time for the same order"
+          }
+        ]
+      }
+    },
+    {
+      "id": "oblig.operation.apply_payment.serialization.0",
+      "property": { "kind": "serialization" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.apply_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.apply_payment sharing order_id never overlap.",
+      "evidence": [
+        {
+          "subject": "input.apply_payment.captured",
+          "message": "keyed routing with lane concurrency 1 serializes per order"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.apply_payment.ordering.0",
+      "property": { "kind": "ordering" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.apply_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Invocations of operation.apply_payment sharing order_id take effect in their semantic order.",
+      "evidence": [
+        {
+          "subject": "topic.order_events",
+          "message": "keyed topic order plus single-lane keyed dispatch"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.apply_payment.idempotency.0",
+      "property": { "kind": "idempotency" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.apply_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "Repeated attempts at operation.apply_payment sharing event_id produce the effects of a single invocation.",
+      "evidence": [
+        {
+          "subject": "tx.apply_payment",
+          "message": "the transition-containing transaction is deduplicated by event_id; a redelivered event resolves the prior commit instead of transitioning again"
+        }
+      ]
+    },
+    {
+      "id": "oblig.operation.apply_payment.recoverability.0",
+      "property": { "kind": "recoverability" },
+      "subject": {
+        "kind": "operation",
+        "operation": "operation.apply_payment",
+        "requirement": 0
+      },
+      "status": "proven",
+      "summary": "An interrupted invocation of operation.apply_payment is re-driven until it reaches a declared flow's terminal step.",
+      "assumptions": [
+        "at_least_once delivery on input.apply_payment.captured acts as the retry driver"
+      ],
+      "evidence": [
+        {
+          "subject": "intent.apply_payment.order_paid",
+          "message": "the transition-established intent is recoverable from the keyed commit, so the OrderPaid publication can always be re-driven"
+        }
+      ]
+    },
+    {
+      "id": "oblig.machine.order_lifecycle.conflicting_transitions",
+      "property": { "kind": "custom", "name": "conflicting_transitions" },
+      "subject": {
+        "kind": "state_machine",
+        "machine": "machine.order_lifecycle",
+        "transition": "transition.order.cancel"
+      },
+      "status": "unknown",
+      "summary": "A concurrent cancel and mark_paid on the same pending order cannot both take effect.",
+      "evidence": [
+        {
+          "message": "both transitions guard on state.order.pending, but tx.cancel_order and tx.apply_payment run at read_committed and no serialization requirement spans the two operations; the model does not determine whether the guards are evaluated atomically with the state write"
+        }
+      ]
+    },
+    {
+      "id": "oblig.data.checkout.object.order.history.linearizable",
+      "property": { "kind": "object_history" },
+      "subject": {
+        "kind": "object",
+        "data_model": "data.checkout",
+        "object": "object.order"
+      },
+      "status": "unknown",
+      "summary": "Accesses to object.order admit a legal sequential history respecting real-time precedence.",
+      "evidence": [
+        {
+          "message": "depends on the undecided conflicting-transitions obligation on machine.order_lifecycle"
+        }
+      ]
+    },
+    {
+      "id": "oblig.data.inventory.object.stock.history.linearizable",
+      "property": { "kind": "object_history" },
+      "subject": {
+        "kind": "object",
+        "data_model": "data.inventory",
+        "object": "object.stock"
+      },
+      "status": "unknown",
+      "summary": "Accesses to object.stock admit a legal sequential history respecting real-time precedence.",
+      "evidence": [
+        {
+          "subject": "tx.transfer_stock",
+          "message": "transfer_stock locks both rows exclusively but declares no lock order and unspecified idempotency; reserve_inventory writes the same rows from a different lane domain (order_id, not warehouse)"
+        }
+      ]
+    },
+    {
+      "id": "oblig.topic.order_events.key_coherence",
+      "property": { "kind": "custom", "name": "key_coherence" },
+      "subject": { "kind": "topic", "topic": "topic.order_events" },
+      "status": "proven",
+      "summary": "Every message schema on topic.order_events maps its ordering key to the same logical order identity.",
+      "evidence": [
+        {
+          "message": "all five schemas map the topic key to their order_id field"
+        }
+      ]
+    }
+  ]
+}

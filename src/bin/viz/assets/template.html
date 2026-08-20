@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ · archspec</title>
+<style>
+/*__STYLE__*/
+</style>
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div id="brand">
+      <span class="brand-mark">archspec</span>
+      <span class="brand-title" id="page-title"></span>
+      <span class="brand-rev" id="page-rev"></span>
+    </div>
+    <nav id="crumbs"></nav>
+    <div id="topbar-tools">
+      <input id="search" type="search" placeholder="filter ids…" spellcheck="false" autocomplete="off">
+      <button id="overlay-toggle" class="tool-btn" title="Toggle prover overlay" hidden>overlay</button>
+      <button id="obligations-toggle" class="tool-btn" title="Toggle obligations panel" hidden>obligations</button>
+      <button id="fit-btn" class="tool-btn" title="Fit graph to view">fit</button>
+    </div>
+  </header>
+  <main id="stage">
+    <div id="canvas-wrap">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="legend"></div>
+      <div id="empty-note" hidden></div>
+    </div>
+    <aside id="detail" hidden>
+      <div id="detail-head">
+        <span id="detail-kind"></span>
+        <button id="detail-close" title="Close">×</button>
+      </div>
+      <div id="detail-body"></div>
+    </aside>
+    <aside id="obligations" hidden>
+      <div id="obligations-head">
+        <span>prover obligations</span>
+        <button id="obligations-close" title="Close">×</button>
+      </div>
+      <div id="obligations-filters"></div>
+      <div id="obligations-list"></div>
+    </aside>
+  </main>
+</div>
+<script>
+/*__DATA__*/
+</script>
+<script>
+/*__SCRIPT__*/
+</script>
+</body>
+</html>
