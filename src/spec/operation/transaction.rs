@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -179,6 +179,16 @@ pub struct StateTransition {
 
     /// Selects the concrete persistent machine instance.
     pub subject: ObjectSelector,
+
+    /// Provenance of each side-effect instance implicitly established
+    /// by applying the transition, keyed by side effect.
+    ///
+    /// The keys must exactly match the transition's declared side
+    /// effects; a transition without side effects uses an empty map.
+    /// The derivations are evaluated in the enclosing transaction
+    /// context at this step, so they may reference preceding
+    /// transaction reads.
+    pub effect_values: BTreeMap<Id, Derivation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -6,7 +6,7 @@ use std::{
 use archspec::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Derivation, Effect, Id, IdempotencyGuarantee, Input,
+        CompletionRequirement, Derivation, Effect, FlowStep, Id, IdempotencyGuarantee, Input,
         LaneConcurrency, Schema, SchemaCompleteness, ServiceKind, TopicOrdering, TransactionStep,
         TransitionSideEffect, ValueSource,
     },
@@ -569,4 +569,101 @@ fn flash_checkout_parses_recoverability_requirements() {
         .expect("transfer_stock should exist");
 
     assert!(transfer_stock.requirements.recoverability.is_empty());
+}
+
+#[test]
+fn flash_checkout_parses_execute_effect_values() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let flow = model
+        .operations
+        .get(&Id("operation.charge_payment".into()))
+        .expect("charge_payment should exist")
+        .flows
+        .get(&Id("flow.charge_payment".into()))
+        .expect("charge_payment flow should exist");
+
+    // Unknown provenance is declared explicitly, never omitted.
+    let FlowStep::ExecuteEffect { effect, values } = &flow.steps[0] else {
+        panic!("first step should execute the card charge");
+    };
+
+    assert_eq!(effect, &Id("effect.charge_payment.card".into()));
+
+    assert_eq!(values, &Derivation::Unspecified);
+
+    let FlowStep::ExecuteEffect { effect, values } = &flow.steps[1] else {
+        panic!("second step should execute the capture publication");
+    };
+
+    assert_eq!(effect, &Id("effect.charge_payment.publish_captured".into()));
+
+    let Derivation::Deterministic { from } = values else {
+        panic!("publication values should declare deterministic provenance");
+    };
+
+    assert_eq!(from.len(), 3);
+
+    assert_eq!(
+        from[0].source,
+        ValueSource::Input(Id("input.charge_payment.reserved".into()))
+    );
+
+    assert_eq!(from[0].path.0, vec!["event_id".to_string()]);
+}
+
+#[test]
+fn flash_checkout_parses_transition_effect_values() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let transaction = model
+        .operations
+        .get(&Id("operation.apply_payment".into()))
+        .expect("apply_payment should exist")
+        .transactions
+        .get(&Id("tx.apply_payment".into()))
+        .expect("apply_payment transaction should exist");
+
+    let TransactionStep::Transition(transition) = &transaction.steps[1] else {
+        panic!("second step should be the mark_paid transition");
+    };
+
+    assert_eq!(transition.effect_values.len(), 1);
+
+    let values = transition
+        .effect_values
+        .get(&Id("effect.order.paid".into()))
+        .expect("the mark_paid side effect should have a derivation");
+
+    let Derivation::Deterministic { from } = values else {
+        panic!("transition effect values should declare deterministic provenance");
+    };
+
+    // The derivation is evaluated in the transaction context, so it may
+    // reference the preceding read.
+    assert_eq!(
+        from[0].source,
+        ValueSource::TransactionRead(Id("read.apply_payment.order".into()))
+    );
+
+    assert_eq!(from[0].path.0, vec!["order_id".to_string()]);
+
+    // A transition without side effects declares an explicit empty map.
+    let transaction = model
+        .operations
+        .get(&Id("operation.cancel_order".into()))
+        .expect("cancel_order should exist")
+        .transactions
+        .get(&Id("tx.cancel_order".into()))
+        .expect("cancel_order transaction should exist");
+
+    let TransactionStep::Transition(transition) = &transaction.steps[0] else {
+        panic!("first step should be the cancel transition");
+    };
+
+    assert!(transition.effect_values.is_empty());
 }

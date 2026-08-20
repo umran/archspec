@@ -524,7 +524,7 @@ fn collect_effect_executions(
     for (flow_id, flow) in &op.flows {
         for step in &flow.steps {
             let effect_id = match step {
-                FlowStep::ExecuteEffect { effect } => Some(effect.clone()),
+                FlowStep::ExecuteEffect { effect, .. } => Some(effect.clone()),
 
                 FlowStep::ExecuteEffectIntent { intent } => op
                     .effect_intents

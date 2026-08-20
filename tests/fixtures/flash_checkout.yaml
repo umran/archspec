@@ -714,8 +714,28 @@ operations:
         steps:
         - kind: execute_effect
           effect: effect.charge_payment.card
+          values:
+            kind: unspecified
         - kind: execute_effect
           effect: effect.charge_payment.publish_captured
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.charge_payment.reserved
+              path:
+              - event_id
+            - source:
+                kind: input
+                id: input.charge_payment.reserved
+              path:
+              - order_id
+            - source:
+                kind: input
+                id: input.charge_payment.reserved
+              path:
+              - amount
         response: null
     requirements:
       serialization:
@@ -799,6 +819,7 @@ operations:
                     id: input.cancel_order.request
                   path:
                   - order_id
+          effect_values: {}
         - kind: establish_effect_intent
           intent: intent.cancel_order.publish_cancelled
           values:
@@ -862,6 +883,26 @@ operations:
               path:
               - event_id
         steps:
+        - kind: read
+          result: read.apply_payment.order
+          target:
+            object: object.order
+            predicate:
+              kind: eq
+              field:
+              - order_id
+              value:
+                kind: value
+                value:
+                  source:
+                    kind: input
+                    id: input.apply_payment.captured
+                  path:
+                  - order_id
+          fields:
+            kind: only
+            fields:
+            - - order_id
         - kind: transition
           machine: machine.order_lifecycle
           transition: transition.order.mark_paid
@@ -879,6 +920,20 @@ operations:
                     id: input.apply_payment.captured
                   path:
                   - order_id
+          effect_values:
+            effect.order.paid:
+              kind: deterministic
+              from:
+              - source:
+                  kind: transaction_read
+                  id: read.apply_payment.order
+                path:
+                - order_id
+              - source:
+                  kind: input
+                  id: input.apply_payment.captured
+                path:
+                - event_id
     flows:
       flow.apply_payment:
         steps:

@@ -560,6 +560,21 @@ Artifact reconstruction and effect-execution idempotency are distinct concerns.
 
 A `Transition` may declare transition side effects. Under this revision, those side effects SHALL be interpreted as implicitly established logical `EffectIntent` artifacts, established atomically by the successful transition transaction. They follow the same artifact-retention rules as explicitly established effect intents.
 
+The transition declares the effect contract; the applying `StateTransition` step declares the instance provenance:
+
+```rust
+pub struct StateTransition {
+    pub machine: Id,
+    pub transition: Id,
+    pub subject: ObjectSelector,
+    pub effect_values: BTreeMap<Id, Derivation>,
+}
+```
+
+`effect_values` supplies one `Derivation` per side effect declared by the applied transition, keyed by side effect. The keys SHALL exactly match the transition's declared side effects; a transition without side effects uses an empty map. Each derivation is evaluated in the enclosing transaction context at the transition step, so it may reference preceding transaction reads under the usual read-before-use and field-selection rules.
+
+Because every transition-containing transaction declares `DeduplicatedBy(K)`, these derivations are evaluated only during the first successful keyed execution; a later encounter recovers the exact original intents from `Commit(T,K)` without evaluating the derivations again. This permits transition effect values to depend on transaction-local reads even though those reads may not be replay-stable.
+
 For V1, a transaction containing a `Transition` is not naturally replayable. Therefore transition-produced effect intents SHALL NOT be considered reconstructible merely because their payload derivation is deterministic. A retry cannot partially re-run the artifact-producing portion of a transaction while bypassing the transition that established it.
 
 This creates an important crash boundary:
@@ -734,15 +749,19 @@ Cross-transaction availability should be governed by the artifact-availability r
 
 # 21. Flow Semantics
 
-The existing small flow vocabulary SHOULD remain:
+The existing small flow vocabulary SHOULD remain, with direct execution declaring instance provenance:
 
 ```rust
 pub enum FlowStep {
     Transaction { transaction: Id },
-    ExecuteEffect { effect: Id },
+    ExecuteEffect { effect: Id, values: Derivation },
     ExecuteEffectIntent { intent: Id },
 }
 ```
+
+`ExecuteEffect.values` declares the provenance of the complete logical effect instance constructed and executed by the step. It is evaluated in the operation-level value context and may not reference transaction reads, because no transaction is in scope at flow level. Natural replay of a direct execution requires the derivation to be replay-deterministic.
+
+`ExecuteEffectIntent` deliberately declares no derivation: it consumes an effect instance whose values were fixed when the intent was established, and must never recompute or replace them.
 
 No `RecoverInvocationResult`, `RecoverEffectIntent`, `TransactionExecution`, or other recovery wrapper is introduced.
 
@@ -876,6 +895,13 @@ pub struct EstablishEffectIntent {
     pub values: Derivation,
 }
 
+pub struct StateTransition {
+    pub machine: Id,
+    pub transition: Id,
+    pub subject: ObjectSelector,
+    pub effect_values: BTreeMap<Id, Derivation>,
+}
+
 pub enum ValueSource {
     Input(Id),
     Effect(Id),
@@ -908,12 +934,12 @@ EffectIntent.execution
 InvocationResult.key    // pending final review
 ```
 
-Unchanged flow shape:
+Flow shape, with direct execution declaring instance provenance:
 
 ```rust
 pub enum FlowStep {
     Transaction { transaction: Id },
-    ExecuteEffect { effect: Id },
+    ExecuteEffect { effect: Id, values: Derivation },
     ExecuteEffectIntent { intent: Id },
 }
 ```
@@ -1051,8 +1077,12 @@ No `RecoverEffectIntent` flow step is necessary.
 Transaction T
   idempotency: DeduplicatedBy(request_id)
 
+  Read Order -> order
+
   Transition Order: pending -> paid
     side effect: PaymentCaptured
+    effect_values:
+      PaymentCaptured = deterministic_from(order.order_id, input.amount)
 
   EstablishInvocationResult R
 
@@ -1060,7 +1090,7 @@ ExecuteEffectIntent PaymentCaptured
 Response R
 ```
 
-The transition transaction is not eligible for V1 natural replay. On the first successful execution, `Commit(T, request_id)` atomically retains the transition-produced effect intent and `R`. If the invocation crashes after the transaction commits but before `ExecuteEffectIntent`, retrying the flow resolves the prior commit, restores those artifacts, and continues without attempting the state transition again.
+The transition transaction is not eligible for V1 natural replay. On the first successful execution, the transition side-effect instance is constructed from its `effect_values` derivation — which may reference the preceding transaction read — and `Commit(T, request_id)` atomically retains the transition-produced effect intent and `R`. If the invocation crashes after the transaction commits but before `ExecuteEffectIntent`, retrying the flow resolves the prior commit, restores those artifacts, and continues without attempting the state transition again. The effect derivation is not evaluated again.
 
 Without `DeduplicatedBy(request_id)`, V1 rejects this transaction shape as a recoverable/idempotent replay boundary because the committed transition cannot be naturally replayed to reproduce its artifacts.
 

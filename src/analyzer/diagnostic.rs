@@ -68,6 +68,7 @@ pub enum ValidationCode {
 
     StateTransitionSubjectMismatch,
     TransitionTransactionNotDeduplicated,
+    TransitionEffectValuesMismatch,
     TransitionEffectIntentExplicitlyEstablished,
     AmbiguousTransitionEffectIntent,
     UnestablishableTransitionEffectIntent,

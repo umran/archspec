@@ -132,6 +132,15 @@ pub enum ValidationError {
         transition: Id,
     },
 
+    /// A `StateTransition` step's `effect_values` keys do not exactly
+    /// match the side effects declared by the applied transition.
+    TransitionEffectValuesMismatch {
+        transaction: Id,
+        transition: Id,
+        missing: Vec<Id>,
+        unexpected: Vec<Id>,
+    },
+
     /// A transition side effect is established implicitly by the
     /// transition and must not be established explicitly.
     TransitionEffectIntentExplicitlyEstablished {
@@ -715,6 +724,50 @@ impl From<ValidationError> for Diagnostic {
                                     .to_string(),
                         },
                     ],
+                }
+            }
+
+            ValidationError::TransitionEffectValuesMismatch {
+                transaction,
+                transition,
+                missing,
+                unexpected,
+            } => {
+                let mut evidence = Vec::new();
+
+                for effect in &missing {
+                    evidence.push(Evidence {
+                        subject: Some(effect.clone()),
+                        message: format!(
+                            "The transition declares side effect `{effect}`, \
+                             but the step provides no value derivation for it."
+                        ),
+                    });
+                }
+
+                for effect in &unexpected {
+                    evidence.push(Evidence {
+                        subject: Some(effect.clone()),
+                        message: format!(
+                            "The step provides a value derivation for \
+                             `{effect}`, which is not a side effect declared \
+                             by transition `{transition}`."
+                        ),
+                    });
+                }
+
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::TransitionEffectValuesMismatch,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(transaction.clone()),
+                    message: format!(
+                        "Transaction `{transaction}` applies transition \
+                         `{transition}` with `effect_values` that do not \
+                         exactly match the transition's declared side effects."
+                    ),
+                    evidence,
                 }
             }
 

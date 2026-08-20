@@ -468,6 +468,13 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                                 transition: transition.transition.clone(),
                             });
                         }
+
+                        validate_transition_effect_values(
+                            model,
+                            transaction_id,
+                            transition,
+                            &mut errors,
+                        );
                     }
 
                     TransactionStep::EstablishEffectIntent(step) => {
@@ -522,6 +529,46 @@ fn validate_established_intent(
             },
         );
     }
+}
+
+/// Applying a transition constructs one effect instance per declared
+/// side effect, so the step must supply exactly one value derivation
+/// for each of them — no more, no fewer.
+fn validate_transition_effect_values(
+    model: &Model,
+    transaction_id: &Id,
+    transition: &StateTransition,
+    errors: &mut Vec<ValidationError>,
+) {
+    let machine = model
+        .state_machines
+        .get(&transition.machine)
+        .expect("references already validated");
+
+    let declaration = machine
+        .transitions
+        .get(&transition.transition)
+        .expect("references already validated");
+
+    let declared: BTreeSet<&Id> = declaration.side_effects.keys().collect();
+    let provided: BTreeSet<&Id> = transition.effect_values.keys().collect();
+
+    if declared == provided {
+        return;
+    }
+
+    errors.push(ValidationError::TransitionEffectValuesMismatch {
+        transaction: transaction_id.clone(),
+        transition: transition.transition.clone(),
+        missing: declared
+            .difference(&provided)
+            .map(|effect| (*effect).clone())
+            .collect(),
+        unexpected: provided
+            .difference(&declared)
+            .map(|effect| (*effect).clone())
+            .collect(),
+    });
 }
 
 /// A transition establishes exactly one logical intent for each of its
@@ -731,6 +778,23 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
                 transaction,
                 &mut errors,
             );
+        }
+
+        for (flow_id, flow) in &operation.flows {
+            for step in &flow.steps {
+                let FlowStep::ExecuteEffect { values, .. } = step else {
+                    continue;
+                };
+
+                validate_derivation_paths(
+                    model,
+                    index,
+                    flow_id,
+                    ValueContext::operation(operation_id),
+                    values,
+                    &mut errors,
+                );
+            }
         }
     }
 
@@ -1152,6 +1216,17 @@ fn validate_transaction_paths(
                     &transition.subject,
                     errors,
                 );
+
+                for values in transition.effect_values.values() {
+                    validate_derivation_paths(
+                        model,
+                        index,
+                        transaction_id,
+                        context,
+                        values,
+                        errors,
+                    );
+                }
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
@@ -1787,6 +1862,13 @@ fn validate_transaction_references(
                     &transition.subject,
                     errors,
                 );
+
+                // Side-effect instances are constructed when this step
+                // applies the transition, so their derivations are
+                // evaluated in the enclosing transaction context.
+                for values in transition.effect_values.values() {
+                    validate_derivation_references(index, transaction_id, context, values, errors);
+                }
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
@@ -1850,7 +1932,7 @@ fn validate_flow_references(
                 );
             }
 
-            FlowStep::ExecuteEffect { effect } => {
+            FlowStep::ExecuteEffect { effect, values } => {
                 // A transition side effect is established as an intent
                 // and executed through ExecuteEffectIntent, so a direct
                 // execution must name an operation-owned effect.
@@ -1860,6 +1942,17 @@ fn validate_flow_references(
                     effect,
                     ReferenceKind::Effect,
                     operation_id,
+                    errors,
+                );
+
+                // The effect instance is constructed at flow level, so
+                // its derivation is evaluated in the operation value
+                // context with no transaction in scope.
+                validate_derivation_references(
+                    index,
+                    flow_id,
+                    ValueContext::operation(operation_id),
+                    values,
                     errors,
                 );
             }

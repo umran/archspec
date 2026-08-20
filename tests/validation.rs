@@ -10,8 +10,8 @@ use archspec::{
     spec::{
         CompletionRequirement, Derivation, EffectIntent, EstablishEffectIntent, FieldPath,
         FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageSelector, Model,
-        RecoverabilityRequirement, Schema, SchemaFragment, TopicOrdering, TransactionStep,
-        ValueRef, ValueSource,
+        RecoverabilityRequirement, Schema, SchemaFragment, StateTransition, TopicOrdering,
+        TransactionStep, ValueRef, ValueSource,
     },
 };
 
@@ -316,10 +316,10 @@ fn rejects_transaction_access_without_data_model() {
 
     let transaction = model
         .operations
-        .get_mut(&id("operation.apply_payment"))
+        .get_mut(&id("operation.cancel_order"))
         .unwrap()
         .transactions
-        .get_mut(&id("tx.apply_payment"))
+        .get_mut(&id("tx.cancel_order"))
         .unwrap();
 
     transaction.data_model = None;
@@ -329,7 +329,7 @@ fn rejects_transaction_access_without_data_model() {
     assert_eq!(
         errors,
         vec![ValidationError::TransactionMissingDataModel {
-            transaction: id("tx.apply_payment"),
+            transaction: id("tx.cancel_order"),
             object: id("object.order"),
         }]
     );
@@ -341,10 +341,10 @@ fn rejects_transaction_access_outside_declared_data_model() {
 
     let transaction = model
         .operations
-        .get_mut(&id("operation.apply_payment"))
+        .get_mut(&id("operation.cancel_order"))
         .unwrap()
         .transactions
-        .get_mut(&id("tx.apply_payment"))
+        .get_mut(&id("tx.cancel_order"))
         .unwrap();
 
     transaction.data_model = Some(id("data.inventory"));
@@ -354,7 +354,7 @@ fn rejects_transaction_access_outside_declared_data_model() {
     assert_eq!(
         errors,
         vec![ValidationError::TransactionObjectOutsideDataModel {
-            transaction: id("tx.apply_payment"),
+            transaction: id("tx.cancel_order"),
             data_model: id("data.inventory"),
             object: id("object.order"),
         }]
@@ -394,7 +394,7 @@ fn rejects_state_transition_with_wrong_subject_object() {
         .get_mut(&id("tx.apply_payment"))
         .unwrap();
 
-    let TransactionStep::Transition(transition) = &mut transaction.steps[0] else {
+    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
         panic!("expected transition step");
     };
 
@@ -561,6 +561,7 @@ fn rejects_direct_execution_of_transition_side_effect() {
 
     flow.steps[1] = FlowStep::ExecuteEffect {
         effect: id("effect.order.paid"),
+        values: Derivation::Unspecified,
     };
 
     let errors = validation::validate(&model);
@@ -1077,6 +1078,330 @@ fn rejects_transition_effect_intent_the_operation_cannot_establish() {
             intent: id("intent.cancel_order.order_paid"),
             effect: id("effect.order.paid"),
             transition: id("transition.order.mark_paid"),
+        }]
+    );
+}
+
+/// Retarget the card-charge flow step's derivation, which is the
+/// fixture's direct-execution provenance site.
+fn set_charge_card_values(model: &mut Model, values: Derivation) {
+    let flow = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .flows
+        .get_mut(&id("flow.charge_payment"))
+        .unwrap();
+
+    let FlowStep::ExecuteEffect {
+        values: step_values,
+        ..
+    } = &mut flow.steps[0]
+    else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    *step_values = values;
+}
+
+#[test]
+fn accepts_operation_scoped_deterministic_execute_effect_values() {
+    let mut model = load_flash_checkout();
+
+    set_charge_card_values(
+        &mut model,
+        Derivation::Deterministic {
+            from: vec![ValueRef {
+                source: ValueSource::Input(id("input.charge_payment.reserved")),
+                path: FieldPath(vec!["amount".to_owned()]),
+            }],
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn accepts_unspecified_execute_effect_values() {
+    let mut model = load_flash_checkout();
+
+    set_charge_card_values(&mut model, Derivation::Unspecified);
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_transaction_read_in_execute_effect_values() {
+    let mut model = load_flash_checkout();
+
+    // No transaction context exists at flow level, so a transaction
+    // read can never be a direct-execution provenance root.
+    set_charge_card_values(
+        &mut model,
+        Derivation::Deterministic {
+            from: vec![ValueRef {
+                source: ValueSource::TransactionRead(id("read.reserve_inventory.stock")),
+                path: FieldPath(vec!["on_hand".to_owned()]),
+            }],
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadOutsideTransaction {
+            subject: id("flow.charge_payment"),
+            read: id("read.reserve_inventory.stock"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_invalid_field_path_in_execute_effect_values() {
+    let mut model = load_flash_checkout();
+
+    set_charge_card_values(
+        &mut model,
+        Derivation::Deterministic {
+            from: vec![ValueRef {
+                source: ValueSource::Input(id("input.charge_payment.reserved")),
+                path: FieldPath(vec!["does_not_exist".to_owned()]),
+            }],
+        },
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("flow.charge_payment"),
+            schema: id("schema.InventoryReserved"),
+            path: FieldPath(vec!["does_not_exist".to_owned()]),
+        }]
+    );
+}
+
+/// The fixture's `tx.apply_payment` transition step, whose
+/// `effect_values` map is the transition provenance site.
+fn apply_payment_transition(model: &mut Model) -> &mut StateTransition {
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.apply_payment"))
+        .unwrap();
+
+    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
+        panic!("expected the mark_paid transition step");
+    };
+
+    transition
+}
+
+#[test]
+fn accepts_transition_effect_derivation_from_preceding_read() {
+    let mut model = load_flash_checkout();
+
+    let transition = apply_payment_transition(&mut model);
+
+    let Some(Derivation::Deterministic { from }) =
+        transition.effect_values.get(&id("effect.order.paid"))
+    else {
+        panic!("expected a deterministic transition effect derivation");
+    };
+
+    assert_eq!(
+        from[0].source,
+        ValueSource::TransactionRead(id("read.apply_payment.order"))
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn accepts_empty_effect_values_for_transition_without_side_effects() {
+    let model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get(&id("operation.cancel_order"))
+        .unwrap()
+        .transactions
+        .get(&id("tx.cancel_order"))
+        .unwrap();
+
+    let TransactionStep::Transition(transition) = &transaction.steps[0] else {
+        panic!("expected the cancel transition step");
+    };
+
+    assert!(transition.effect_values.is_empty());
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_missing_transition_effect_derivation() {
+    let mut model = load_flash_checkout();
+
+    apply_payment_transition(&mut model).effect_values.clear();
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransitionEffectValuesMismatch {
+            transaction: id("tx.apply_payment"),
+            transition: id("transition.order.mark_paid"),
+            missing: vec![id("effect.order.paid")],
+            unexpected: vec![],
+        }]
+    );
+}
+
+#[test]
+fn rejects_extra_transition_effect_derivation() {
+    let mut model = load_flash_checkout();
+
+    apply_payment_transition(&mut model)
+        .effect_values
+        .insert(id("effect.order.unrelated"), Derivation::Unspecified);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransitionEffectValuesMismatch {
+            transaction: id("tx.apply_payment"),
+            transition: id("transition.order.mark_paid"),
+            missing: vec![],
+            unexpected: vec![id("effect.order.unrelated")],
+        }]
+    );
+}
+
+#[test]
+fn rejects_transition_effect_derivation_owned_by_another_transition() {
+    let mut model = load_flash_checkout();
+
+    // transition.order.cancel declares no side effects, so mark_paid's
+    // side effect has no instance here for a derivation to describe.
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.cancel_order"))
+        .unwrap();
+
+    let TransactionStep::Transition(transition) = &mut transaction.steps[0] else {
+        panic!("expected the cancel transition step");
+    };
+
+    transition
+        .effect_values
+        .insert(id("effect.order.paid"), Derivation::Unspecified);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransitionEffectValuesMismatch {
+            transaction: id("tx.cancel_order"),
+            transition: id("transition.order.cancel"),
+            missing: vec![],
+            unexpected: vec![id("effect.order.paid")],
+        }]
+    );
+}
+
+#[test]
+fn rejects_transition_effect_derivation_referencing_later_read() {
+    let mut model = load_flash_checkout();
+
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.apply_payment"))
+        .unwrap();
+
+    // Move the transition ahead of the read its effect derivation
+    // depends on.
+    transaction.steps.swap(0, 1);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadOutOfOrder {
+            transaction: id("tx.apply_payment"),
+            read: id("read.apply_payment.order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_transition_effect_derivation_field_not_selected() {
+    let mut model = load_flash_checkout();
+
+    let transition = apply_payment_transition(&mut model);
+
+    let Some(Derivation::Deterministic { from }) =
+        transition.effect_values.get_mut(&id("effect.order.paid"))
+    else {
+        panic!("expected a deterministic transition effect derivation");
+    };
+
+    // `status` resolves against the order schema, but the read selects
+    // only `order_id`.
+    from[0].path = FieldPath(vec!["status".to_owned()]);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionReadFieldNotSelected {
+            transaction: id("tx.apply_payment"),
+            read: id("read.apply_payment.order"),
+            path: FieldPath(vec!["status".to_owned()]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_invalid_field_path_in_transition_effect_derivation() {
+    let mut model = load_flash_checkout();
+
+    let transition = apply_payment_transition(&mut model);
+
+    let Some(Derivation::Deterministic { from }) =
+        transition.effect_values.get_mut(&id("effect.order.paid"))
+    else {
+        panic!("expected a deterministic transition effect derivation");
+    };
+
+    from[1].path = FieldPath(vec!["does_not_exist".to_owned()]);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("tx.apply_payment"),
+            schema: id("schema.PaymentCaptured"),
+            path: FieldPath(vec!["does_not_exist".to_owned()]),
         }]
     );
 }

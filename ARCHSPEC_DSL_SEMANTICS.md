@@ -755,6 +755,18 @@ Propagation does **not** itself deduplicate anything. It allows the verifier to 
 
 Effects describe work outside the operation's immediate transaction state.
 
+### Effect contract versus effect instance
+
+An effect declaration is a contract describing what kind of logical work occurs. Depending on effect kind, this includes information such as the destination or target, the schema, retry semantics, idempotency-key propagation, and external idempotency guarantees.
+
+It does not define how the values of a particular effect instance are computed. An effect instance is constructed at an execution or establishment site, and each such site declares the provenance of the values used to construct it:
+
+- a direct `execute_effect` flow step declares `values` (§16);
+- an explicit `establish_effect_intent` transaction step declares `values` (§14);
+- a `transition` transaction step declares `effect_values`, one derivation per side effect of the applied transition (§22).
+
+`execute_effect_intent` consumes an already-established effect instance and therefore declares no derivation: the instance's values were fixed at establishment (§14).
+
 ## 13.1 Publication effect
 
 A publication effect declares publication of one schema to one topic.
@@ -837,7 +849,13 @@ The current `IntentExecutionSemantics::{Unspecified, Recoverable}` model is supe
 
 ### Intent derivation
 
-The establishment site should declare how the intent's logical contents are produced through a `Derivation` declaration.
+Establishing an intent constructs one logical instance of its effect. For `EstablishEffectIntent(I, D)`, where intent `I` refers to effect `E`:
+
+1. one logical instance of `E` is constructed;
+2. its values are obtained according to derivation `D`;
+3. `I` is established as a transaction artifact representing that exact effect instance.
+
+`EstablishEffectIntent.values` is therefore the provenance declaration for the constructed instance.
 
 If the intent is deterministically derived from replay-stable provenance and the establishing transaction is naturally replayable, a retry may reconstruct the same logical intent without requiring the intent payload itself to have been durably materialized.
 
@@ -848,6 +866,8 @@ If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exac
 A flow step executing an intent performs or attempts the work represented by the logical intent available to the current invocation.
 
 `ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
+
+The effect instance was already constructed when the intent was established, so `ExecuteEffectIntent` declares no derivation and must never recompute or replace the intent's values.
 
 Reconstructing or recovering the same intent does **not** prove that repeating the external effect is safe. A crash after an external effect succeeds but before completion is durably known may still lead to another effect attempt. Effect-level idempotency/retry semantics must handle that uncertainty.
 
@@ -924,6 +944,18 @@ For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commi
 ### `execute_effect`
 
 Executes the referenced logical effect directly.
+
+For `ExecuteEffect(E, D)`, the step:
+
+1. constructs one logical instance of effect `E`;
+2. obtains its values according to derivation `D`;
+3. executes that effect instance.
+
+`values` declares the provenance of the complete logical effect instance, for every effect kind, using the same `Derivation` vocabulary as transaction-level provenance declarations (§18). Unknown provenance must be declared explicitly as `unspecified` rather than omitted.
+
+Because the step occurs at flow level rather than inside a transaction, the derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to a transaction execution (§18).
+
+For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots establishes that a retry constructs the same logical effect instance. Effect payload stability and duplicate-execution safety remain separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
 
 A direct effect execution is not automatically durable or retry-safe. The verifier must use the effect's retry/deduplication environment and the invocation's possible failure/retry paths.
 
@@ -1382,6 +1414,32 @@ ExecuteEffectIntent E
 If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, natural replay cannot be relied on to reproduce `E`, because V1 will not replay the transition transaction naturally. `DeduplicatedBy { key }` ensures that retrying `T` resolves the prior commit and restores `E`, allowing the flow to continue.
 
 This still does not imply exactly-once external execution. Effect-level idempotency/retry analysis remains necessary.
+
+### Transition effect values
+
+The state-machine transition owns the effect contract; the applying `transition` transaction step owns the concrete instance provenance. `StateTransition.effect_values` maps each side effect declared by the applied transition to the `Derivation` used to construct that side effect's instance when the transition is applied.
+
+The mapping must be exact:
+
+```text
+transition.side_effects.keys()
+==
+state_transition.effect_values.keys()
+```
+
+Missing derivations, extra derivations, and derivations keyed by another transition's effects are all structural validation errors. A transition without side effects declares an empty map. Unknown provenance must be declared explicitly as `unspecified`; the validator does not synthesize missing entries, preserving the distinction between provenance intentionally unspecified and a provenance declaration accidentally missing.
+
+Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step. It may therefore reference valid operation-level values, available invocation results, and preceding `transaction_read` results, subject to the usual read-before-use and field-selection rules (§18). It is not evaluated in a static state-machine-transition context, because its values belong to a concrete transaction application of the transition.
+
+A successful transition transaction logically performs the following atomically:
+
+1. evaluate the state-transition guard;
+2. apply the state transition;
+3. construct each transition side-effect instance using its corresponding `effect_values` derivation;
+4. implicitly establish the corresponding effect-intent artifacts;
+5. commit the transition state and established artifacts together.
+
+Because every transition-containing transaction declares `DeduplicatedBy { key }` in V1, these derivations are evaluated only during the first successful keyed execution. A retry with the same transaction idempotency identity resolves `Commit(T,K)` and recovers the exact original artifacts without evaluating the derivations again. This is what permits transition effect values to depend on transaction-local reads even though those reads may not be replay-stable.
 
 ---
 
