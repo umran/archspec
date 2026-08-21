@@ -23,9 +23,9 @@ export interface MachineLayout {
   edges: TransitionGeometry[];
 }
 
-const XGAP = 230;
-const YGAP = 140;
-const H = 44;
+const XGAP = 270;
+const YGAP = 160;
+const H = 58;
 
 export function layoutMachine(machine: StateMachine): MachineLayout {
   // BFS layering from the initial state.
@@ -57,7 +57,7 @@ export function layoutMachine(machine: StateMachine): MachineLayout {
   layers.forEach((states, li) => {
     states.forEach((s, i) => {
       const label = shortId(s);
-      const w = Math.max(120, label.length * 7.4 + 28);
+      const w = Math.max(160, label.length * 8 + 48);
       pos.set(s, { x: (i - (states.length - 1) / 2) * XGAP - w / 2, y: li * YGAP, w, h: H, label });
     });
   });

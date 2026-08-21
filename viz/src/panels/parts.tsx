@@ -4,9 +4,9 @@ import { Text } from "@cloudflare/kumo/components/text";
 import { useState, type ReactNode } from "react";
 
 import { pathText } from "../lib/ids";
-import { STATUS_GLYPH } from "../lib/obligations";
+import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
 import { predicateText, typeText } from "../lib/text";
-import { useApp } from "../state/AppState";
+import { useApp, useObligationsAt } from "../state/AppState";
 import type {
   Derivation,
   IdempotencyKey,
@@ -113,6 +113,25 @@ export function StatusBadge({ status }: { status: Status }) {
     <Badge variant={variant} appearance="dot">
       {`${STATUS_GLYPH[status]} ${status}`}
     </Badge>
+  );
+}
+
+/** Compact per-status counts for the obligations anchored to an entity. */
+export function StatusChips({ obKey }: { obKey: string }) {
+  const { overlay } = useApp();
+  const obs = useObligationsAt(obKey);
+  if (!overlay || !obs.length) return null;
+  const counts = statusCounts(obs);
+  return (
+    <span className="inline-flex items-center gap-1">
+      {(["disproven", "unknown", "proven"] as const).map((s) =>
+        counts[s] ? (
+          <Badge key={s} variant={s === "proven" ? "success" : s === "disproven" ? "error" : "warning"} appearance="dot">
+            {`${STATUS_GLYPH[s]}${counts[s]}`}
+          </Badge>
+        ) : null,
+      )}
+    </span>
   );
 }
 

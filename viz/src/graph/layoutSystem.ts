@@ -21,6 +21,8 @@ export interface EdgeGeometry {
   d: string;
   from: Point;
   to: Point;
+  /** Where a label for the edge reads best. */
+  labelAt: Point;
 }
 
 export interface SystemLayout {
@@ -30,11 +32,13 @@ export interface SystemLayout {
 }
 
 export const SYS = {
-  OP_W: 200, OP_H: 62, OP_VGAP: 16,
-  SVC_PAD: 16, SVC_TITLE: 34, SVC_GAP: 100,
+  OP_W: 200, OP_H: 62, OP_HGAP: 18,
+  SVC_PAD: 16, SVC_TITLE: 34, SVC_GAP: 96,
   TOPIC_W: 200, TOPIC_H: 48, TOPIC_BAND: 150, TOPIC_GAP: 60,
-  EXT_W: 200, EXT_H: 46, EXT_BAND: 130,
-  CLIENT_W: 160, CLIENT_H: 58, CLIENT_GAP: 130,
+  EXT_W: 200, EXT_H: 46, EXT_BAND: 150,
+  CLIENT_W: 160, CLIENT_H: 58, CLIENT_GAP: 170,
+  /** Routing channel above the service row, below the externals. */
+  CHANNEL_Y: -60, LANE: 12, CORNER: 18, PORT_INSET: 26,
 };
 
 /**
@@ -109,7 +113,7 @@ function serviceOrder(graph: Graph): string[] {
 function assignPorts(edges: Edge[], node: Box, side: "top" | "bottom", sortBy: (e: Edge) => number) {
   const sorted = [...edges].sort((a, b) => sortBy(a) - sortBy(b));
   const n = sorted.length;
-  const inset = Math.min(26, node.w / (n + 1));
+  const inset = Math.min(SYS.PORT_INSET, node.w / (n + 1));
   const span = node.w - inset * 2;
   const ports = new Map<string, Point>();
   sorted.forEach((e, i) => {
@@ -119,6 +123,11 @@ function assignPorts(edges: Edge[], node: Box, side: "top" | "bottom", sortBy: (
   return ports;
 }
 
+/**
+ * Operations sit in one row inside their service, so every operation
+ * has a clear vertical line to the topic band below and the externals
+ * band above; nothing stacks under anything else.
+ */
 export function layoutSystem(graph: Graph): SystemLayout {
   const pos = new Map<string, Box>();
   const services: ServiceBox[] = [];
@@ -127,21 +136,21 @@ export function layoutSystem(graph: Graph): SystemLayout {
     if (!byService.has(op.service)) byService.set(op.service, []);
     byService.get(op.service)!.push(op);
   }
+  const clientFacing = new Set(graph.edges.filter((e) => e.kind === "client").map((e) => e.to));
 
   let x = 0;
   for (const svcId of serviceOrder(graph)) {
-    const ops = byService.get(svcId) ?? [];
-    const w = SYS.OP_W + SYS.SVC_PAD * 2;
-    const h =
-      SYS.SVC_TITLE + SYS.SVC_PAD + ops.length * SYS.OP_H + Math.max(0, ops.length - 1) * SYS.OP_VGAP;
-    services.push({ id: svcId, x, y: 0, w, h: Math.max(h, 70) });
+    // Client-facing operations first, so the entry edge from the left
+    // reaches the row's first card without passing the others.
+    const ops = [...(byService.get(svcId) ?? [])].sort(
+      (a, b) => Number(clientFacing.has(b.id)) - Number(clientFacing.has(a.id)) || a.id.localeCompare(b.id),
+    );
+    const n = Math.max(1, ops.length);
+    const w = SYS.SVC_PAD * 2 + n * SYS.OP_W + (n - 1) * SYS.OP_HGAP;
+    const h = SYS.SVC_TITLE + SYS.SVC_PAD + SYS.OP_H;
+    services.push({ id: svcId, x, y: 0, w, h });
     ops.forEach((op, i) => {
-      pos.set(op.id, {
-        x: x + SYS.SVC_PAD,
-        y: SYS.SVC_TITLE + i * (SYS.OP_H + SYS.OP_VGAP),
-        w: SYS.OP_W,
-        h: SYS.OP_H,
-      });
+      pos.set(op.id, { x: x + SYS.SVC_PAD + i * (SYS.OP_W + SYS.OP_HGAP), y: SYS.SVC_TITLE, w: SYS.OP_W, h: SYS.OP_H });
     });
     x += w + SYS.SVC_GAP;
   }
@@ -192,24 +201,53 @@ export function layoutSystem(graph: Graph): SystemLayout {
   );
 
   if (graph.client) {
-    const targets = graph.edges
-      .filter((e) => e.kind === "client")
-      .map((e) => pos.get(e.to))
-      .filter((p): p is Box => !!p);
-    const cy = targets.length ? targets.reduce((a, p) => a + p.y + p.h / 2, 0) / targets.length : 100;
     const minX = Math.min(0, ...services.map((b) => b.x));
     pos.set(graph.client.id, {
       x: minX - SYS.CLIENT_GAP - SYS.CLIENT_W,
-      y: cy - SYS.CLIENT_H / 2,
+      y: SYS.SVC_TITLE + SYS.OP_H / 2 - SYS.CLIENT_H / 2,
       w: SYS.CLIENT_W,
       h: SYS.CLIENT_H,
     });
   }
 
-  return { pos, services, edges: routeEdges(graph, pos) };
+  return { pos, services, edges: routeEdges(graph, pos, services) };
 }
 
-function routeEdges(graph: Graph, pos: Map<string, Box>): EdgeGeometry[] {
+/** An axis-aligned polyline with rounded corners. */
+function roundedPolyline(points: Point[], radius: number): string {
+  if (points.length < 2) return "";
+  let d = `M${points[0].x},${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const corner = points[i];
+    const next = points[i + 1];
+    const inLen = Math.hypot(corner.x - prev.x, corner.y - prev.y);
+    const outLen = Math.hypot(next.x - corner.x, next.y - corner.y);
+    const r = Math.min(radius, inLen / 2, outLen / 2);
+    const ux = inLen ? (corner.x - prev.x) / inLen : 0;
+    const uy = inLen ? (corner.y - prev.y) / inLen : 0;
+    const vx = outLen ? (next.x - corner.x) / outLen : 0;
+    const vy = outLen ? (next.y - corner.y) / outLen : 0;
+    d += ` L${corner.x - ux * r},${corner.y - uy * r}`;
+    d += ` Q${corner.x},${corner.y} ${corner.x + vx * r},${corner.y + vy * r}`;
+  }
+  const last = points[points.length - 1];
+  d += ` L${last.x},${last.y}`;
+  return d;
+}
+
+function verticalCubic(p1: Point, p2: Point): string {
+  const dir = p2.y > p1.y ? 1 : -1;
+  const dy = Math.min(120, Math.max(36, Math.abs(p2.y - p1.y) * 0.4));
+  return `M${p1.x},${p1.y} C${p1.x},${p1.y + dir * dy} ${p2.x},${p2.y - dir * dy} ${p2.x},${p2.y}`;
+}
+
+function horizontalCubic(p1: Point, p2: Point): string {
+  const dx = Math.min(140, Math.max(40, Math.abs(p2.x - p1.x) * 0.35));
+  return `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`;
+}
+
+function routeEdges(graph: Graph, pos: Map<string, Box>, services: ServiceBox[]): EdgeGeometry[] {
   const portOf = new Map<string, { from?: Point; to?: Point }>();
   const vertical = graph.edges.filter(
     (e) => e.kind === "publish" || e.kind === "subscribe" || e.kind === "external",
@@ -261,41 +299,67 @@ function routeEdges(graph: Graph, pos: Map<string, Box>): EdgeGeometry[] {
     for (const [id, pt] of ports) record(id, "to", { x: pt.x, y: p.y + p.h });
   }
 
+  const serviceIndex = new Map(services.map((s, i) => [s.id, i]));
+  const opService = new Map(graph.operations.map((o) => [o.id, o.service]));
+  const rowOf = (svc: string) => graph.operations.filter((o) => o.service === svc).map((o) => pos.get(o.id)!).filter(Boolean);
+  const isLeftmost = (box: Box, svc: string) => rowOf(svc).every((p) => p.x >= box.x);
+  const isRightmost = (box: Box, svc: string) => rowOf(svc).every((p) => p.x <= box.x);
+
   const out: EdgeGeometry[] = [];
+  let channelLane = 0;
+
   for (const e of graph.edges) {
     const rec = portOf.get(e.id) ?? {};
     const a = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a || !b) continue;
 
-    let p1 = rec.from;
-    let p2 = rec.to;
-    let d: string;
     if (e.kind === "request") {
-      const forward = b.x >= a.x + a.w + 20;
-      if (forward) {
-        p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
-        p2 = { x: b.x, y: b.y + b.h / 2 };
-        const dx = Math.min(140, Math.max(40, (p2.x - p1.x) * 0.35));
-        d = `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`;
+      const sa = opService.get(e.operation);
+      const sb = opService.get(e.to);
+      const ia = sa !== undefined ? serviceIndex.get(sa) : undefined;
+      const ib = sb !== undefined ? serviceIndex.get(sb) : undefined;
+      const adjacentForward =
+        sa !== undefined && sb !== undefined && ia !== undefined && ib !== undefined &&
+        ib === ia + 1 && isRightmost(a, sa) && isLeftmost(b, sb);
+      if (adjacentForward) {
+        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
+        const p2 = { x: b.x, y: b.y + b.h / 2 };
+        out.push({ edge: e, d: horizontalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 } });
       } else {
-        p1 = { x: a.x + a.w / 2, y: a.y };
-        p2 = { x: b.x + b.w / 2, y: b.y };
-        const top = Math.min(p1.y, p2.y) - 70;
-        d = `M${p1.x},${p1.y} C${p1.x},${top} ${p2.x},${top} ${p2.x},${p2.y}`;
+        // Over the top: up from the source, along the channel, down
+        // into the target. Every lane gets its own height so parallel
+        // routes stay distinguishable.
+        const lane = channelLane++;
+        const yc = SYS.CHANNEL_Y - lane * SYS.LANE;
+        const p1 = { x: a.x + a.w - SYS.PORT_INSET - 8, y: a.y };
+        const p2 = { x: b.x + SYS.PORT_INSET + 8, y: b.y };
+        const points = [p1, { x: p1.x, y: yc }, { x: p2.x, y: yc }, p2];
+        out.push({ edge: e, d: roundedPolyline(points, SYS.CORNER), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: yc - 8 } });
       }
     } else if (e.kind === "client") {
-      p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
-      p2 = { x: b.x, y: b.y + b.h / 2 };
-      const dx = Math.min(120, Math.max(40, Math.abs(p2.x - p1.x) * 0.4));
-      d = `M${p1.x},${p1.y} C${p1.x + dx},${p1.y} ${p2.x - dx},${p2.y} ${p2.x},${p2.y}`;
+      const sb = opService.get(e.operation);
+      const first = services[0];
+      const direct = !!sb && first !== undefined && serviceIndex.get(sb) === 0 && isLeftmost(b, sb);
+      if (direct) {
+        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
+        const p2 = { x: b.x, y: b.y + b.h / 2 };
+        out.push({ edge: e, d: horizontalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 - 8 } });
+      } else {
+        const lane = channelLane++;
+        const yc = SYS.CHANNEL_Y - lane * SYS.LANE;
+        const riser = a.x + a.w + 40 + lane * SYS.LANE;
+        const p1 = { x: a.x + a.w, y: a.y + a.h / 2 };
+        const p2 = { x: b.x + SYS.PORT_INSET + 8, y: b.y };
+        const points = [p1, { x: riser, y: p1.y }, { x: riser, y: yc }, { x: p2.x, y: yc }, p2];
+        out.push({ edge: e, d: roundedPolyline(points, SYS.CORNER), from: p1, to: p2, labelAt: { x: (riser + p2.x) / 2, y: yc - 8 } });
+      }
     } else {
+      const p1 = rec.from;
+      const p2 = rec.to;
       if (!p1 || !p2) continue;
-      const dir = p2.y > p1.y ? 1 : -1;
-      const dy = Math.min(120, Math.max(36, Math.abs(p2.y - p1.y) * 0.4));
-      d = `M${p1.x},${p1.y} C${p1.x},${p1.y + dir * dy} ${p2.x},${p2.y - dir * dy} ${p2.x},${p2.y}`;
+      out.push({ edge: e, d: verticalCubic(p1, p2), from: p1, to: p2, labelAt: { x: (p1.x + p2.x) / 2 + 8, y: (p1.y + p2.y) / 2 - 6 } });
     }
-    out.push({ edge: e, d, from: p1!, to: p2! });
   }
   return out;
 }

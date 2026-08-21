@@ -86,7 +86,7 @@ export function SystemView() {
         );
       })}
 
-      {layout.edges.map(({ edge: e, d, from, to }) => {
+      {layout.edges.map(({ edge: e, d, labelAt }) => {
         const unexecuted = "executed_by" in e && e.executed_by.length === 0;
         const dimmed = selection ? !related.has(e.id) : q ? !(matches(e.from) || matches(e.to)) : false;
         const classes = ["arch-edge", e.kind];
@@ -98,7 +98,7 @@ export function SystemView() {
             <path className={classes.join(" ")} d={d} markerEnd={`url(#arr-${e.kind})`} />
             <path className="arch-edge-hit" d={d} />
             {selection === e.id && (
-              <text className="arch-edge-label" x={(from.x + to.x) / 2 + 8} y={(from.y + to.y) / 2 - 6}>
+              <text className="arch-edge-label" x={labelAt.x} y={labelAt.y}>
                 {edgeShortLabel(e)}
               </text>
             )}

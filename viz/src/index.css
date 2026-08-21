@@ -70,27 +70,6 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-status-ring.unknown { stroke: var(--arch-unknown); }
 .arch-status-chip text { font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
-.arch-card { cursor: pointer; }
-.arch-card .body { fill: var(--arch-node-fill); stroke: var(--arch-node-line); stroke-width: 1.2; }
-.arch-card:hover .body, .arch-card.selected .body { stroke: var(--arch-accent); }
-.arch-card.selected .body { stroke-width: 2; }
-.arch-card.tx .body { stroke: var(--arch-edge-request); }
-.arch-card.effect .body { stroke: var(--arch-edge-publish); }
-.arch-card.intent .body { stroke: var(--arch-edge-publish); stroke-dasharray: 5 4; }
-.arch-card.response .body { stroke: var(--arch-edge-client); }
-.arch-card.txstep .body { fill: color-mix(in srgb, var(--arch-node-fill) 60%, transparent); stroke: var(--color-kumo-hairline); }
-.arch-card.transition .body { stroke: var(--arch-accent); }
-.arch-card .kind { fill: var(--arch-text-faint); font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; }
-.arch-card .title { font-weight: 600; font-size: 12.5px; }
-.arch-card .note { fill: var(--arch-text-subtle); font-size: 10.5px; }
-.arch-card .hint { fill: var(--arch-accent); font-size: 10px; pointer-events: all; cursor: pointer; }
-.arch-chip { cursor: pointer; }
-.arch-chip text { font-size: 11px; }
-.arch-flow-arrow { stroke: var(--arch-text-faint); stroke-width: 1.2; fill: none; }
-.arch-flow-title { fill: var(--arch-text-subtle); font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
-.arch-heading { font-size: 17px; font-weight: 700; }
-.arch-subheading { font-size: 11px; fill: var(--arch-text-subtle); }
-.arch-desc { font-size: 12px; fill: var(--arch-text-subtle); }
 
 .arch-sm-edge { fill: none; stroke: var(--arch-text-subtle); stroke-width: 1.5; }
 .arch-sm-edge.selected { stroke-width: 2.4; }

@@ -1,6 +1,7 @@
+import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Text } from "@cloudflare/kumo/components/text";
-import { XIcon } from "@phosphor-icons/react";
+import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
@@ -14,7 +15,7 @@ import type { Id, IdempotencyKeyPropagation, RequirementKind } from "../types/mo
 import { ObligationCard } from "./ObligationCard";
 import {
   DerivationView, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink, PredicateView,
-  RefText, Section, Tag, TypeView,
+  RefText, Section, StatusChips, Tag, TypeView,
 } from "./parts";
 
 /** Chrome shared by every detail: kind label, close button, title block. */
@@ -128,12 +129,71 @@ function ServiceDetail({ id }: { id: Id }) {
   );
 }
 
+function FlowSummary({ opId, flowId }: { opId: Id; flowId: Id }) {
+  const { model, index, navigateTo } = useApp();
+  const op = model.operations[opId];
+  const flow = op.flows[flowId];
+  const effectKind = (effectId: Id) => effectDef(model, index, effectId)?.effect.kind ?? null;
+  const kindBadge = (kind: string | null) =>
+    kind ? <Badge variant={kind === "publication" ? "purple" : kind === "request" ? "orange" : "warning"}>{kind}</Badge> : null;
+  return (
+    <div className="space-y-1.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <IdLink id={flowId}>{shortId(flowId)}</IdLink>
+        <span className="flex items-center gap-1">
+          <StatusChips obKey={`${opId}/${flowId}`} />
+          <Button
+            variant="ghost"
+            size="xs"
+            shape="square"
+            icon={ArrowSquareOutIcon}
+            aria-label="Open in flow view"
+            onClick={() => navigateTo(hashes.op(opId), `flow:${flowId}`)}
+          />
+        </span>
+      </div>
+      <ol className="space-y-1">
+        {flow.steps.map((s, i) => (
+          <li key={i} className="flex flex-wrap items-center gap-1.5 text-xs">
+            <Tag>{i + 1}</Tag>
+            {s.kind === "transaction" && (
+              <>
+                <span className="text-kumo-subtle">transaction</span>
+                <IdLink id={s.transaction}>{shortId(s.transaction)}</IdLink>
+                <span className="text-kumo-inactive">{op.transactions[s.transaction]?.steps.length ?? "?"} steps</span>
+              </>
+            )}
+            {s.kind === "execute_effect" && (
+              <>
+                <span className="text-kumo-subtle">execute</span>
+                {kindBadge(effectKind(s.effect))}
+                <IdLink id={s.effect}>{shortId(s.effect)}</IdLink>
+              </>
+            )}
+            {s.kind === "execute_effect_intent" && (
+              <>
+                <span className="text-kumo-subtle">execute intent</span>
+                {kindBadge(op.effect_intents[s.intent] ? effectKind(op.effect_intents[s.intent].effect) : null)}
+                <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
+              </>
+            )}
+          </li>
+        ))}
+      </ol>
+      <div className="text-xs text-kumo-subtle">
+        terminal response: {flow.response ? <IdLink id={flow.response}>{shortId(flow.response)}</IdLink> : "none"}
+      </div>
+    </div>
+  );
+}
+
 function OperationDetail({ id }: { id: Id }) {
-  const { model, graph, index } = useApp();
+  const { model, graph, index, navigateTo } = useApp();
   const op = model.operations[id];
   const node = graph.operations.find((o) => o.id === id);
   const inputs = Object.entries(op.inputs);
   const effects = Object.keys(op.effects);
+  const flows = Object.keys(op.flows);
   const reqs = op.requirements;
   const reqRows: ReactNode[] = [];
   reqs.serialization.forEach((r, i) => reqRows.push(
@@ -152,10 +212,19 @@ function OperationDetail({ id }: { id: Id }) {
 
   return (
     <Frame kind="operation" title={id} subtitle={<span>operation on <IdLink id={op.service} /></span>} description={op.description}>
-      <NavLink hash={hashes.op(id)}>open flows →</NavLink>
+      <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.op(id))}>
+        open flow view
+      </Button>
       <Section title="execution">
         <KeyValue rows={[["concurrency", concurrencyText(op.execution.concurrency)]]} />
       </Section>
+      {flows.length > 0 && (
+        <Section title="flows" count={flows.length}>
+          {flows.map((flowId) => (
+            <FlowSummary key={flowId} opId={id} flowId={flowId} />
+          ))}
+        </Section>
+      )}
       {inputs.length > 0 && (
         <Section title="inputs" count={inputs.length}>
           <List items={inputs.map(([iid, input]) => (
