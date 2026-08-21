@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "viz",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8765", "--directory", "target/viz"],
+      "port": 8765
+    },
+    {
+      "name": "viz-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "viz", "run", "dev", "--", "--port", "5173", "--strictPort"],
+      "port": 5173
+    }
+  ]
+}
