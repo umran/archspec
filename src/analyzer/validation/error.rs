@@ -85,6 +85,33 @@ pub enum ValidationError {
         schema: Id,
     },
 
+    /// A message-identity mapping names a schema the topic does not
+    /// carry.
+    MessageIdentitySchemaNotOnTopic {
+        topic: Id,
+        schema: Id,
+    },
+
+    /// A message-identity mapping declares an empty identity tuple.
+    EmptyMessageIdentity {
+        topic: Id,
+        schema: Id,
+    },
+
+    /// Message-identity tuple positions correspond across schemas, so
+    /// every mapped tuple must have the same arity.
+    MessageIdentityArityMismatch {
+        topic: Id,
+        schema: Id,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// A request input declares a keyed identity with no fields.
+    EmptyRequestIdentity {
+        input: Id,
+    },
+
     TransactionObjectOutsideDataModel {
         transaction: Id,
         data_model: Id,
@@ -533,6 +560,100 @@ impl From<ValidationError> for Diagnostic {
                         subject: Some(schema),
                         message:
                             "Every message schema carried by a keyed topic must define how its ordering key is obtained."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::MessageIdentitySchemaNotOnTopic {
+                topic,
+                schema,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::MessageIdentitySchemaNotOnTopic,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(topic.clone()),
+                    message: format!(
+                        "Topic `{topic}` declares a message identity for schema \
+                         `{schema}`, but does not carry that schema."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(schema),
+                        message:
+                            "Message-identity mappings may only reference message schemas carried by the topic."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::EmptyMessageIdentity {
+                topic,
+                schema,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::EmptyMessageIdentity,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(topic.clone()),
+                    message: format!(
+                        "Topic `{topic}` declares an empty message identity \
+                         for schema `{schema}`."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(schema),
+                        message:
+                            "A mapped schema must declare the complete, non-empty identity of one logical message."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::MessageIdentityArityMismatch {
+                topic,
+                schema,
+                expected,
+                actual,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::MessageIdentityArityMismatch,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(topic.clone()),
+                    message: format!(
+                        "Topic `{topic}` maps the message identity of \
+                         `{schema}` with {actual} field(s), but other mapped \
+                         schemas use {expected}."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(schema),
+                        message:
+                            "Identity tuple positions correspond across schemas, so every mapped tuple must have the same arity."
+                                .to_string(),
+                    }],
+                }
+            }
+
+            ValidationError::EmptyRequestIdentity {
+                input,
+            } => {
+                Diagnostic {
+                    code: DiagnosticCode::Validation(
+                        ValidationCode::EmptyRequestIdentity,
+                    ),
+                    severity: Severity::Error,
+                    subject: Some(input.clone()),
+                    message: format!(
+                        "Request input `{input}` declares a keyed identity \
+                         with no fields."
+                    ),
+                    evidence: vec![Evidence {
+                        subject: Some(input),
+                        message:
+                            "A keyed request identity must declare the complete, non-empty identity of one logical request."
                                 .to_string(),
                     }],
                 }

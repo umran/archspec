@@ -17,7 +17,7 @@ A declaration belongs to one of three semantic categories:
 | Category | Meaning | Examples |
 |---|---|---|
 | **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, flows, effects, transactions, schemas |
-| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic ordering, delivery semantics, dispatch routing, transaction isolation, locks, effect idempotency, concurrency bounds |
+| **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic ordering, delivery semantics, dispatch routing, transaction isolation, locks, effect idempotency, concurrency bounds, request/message identity |
 | **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | operation serialization, operation ordering, operation idempotency, object linearizability |
 
 A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
@@ -299,6 +299,34 @@ may both represent the same logical `order` key domain if the topic mapping says
 
 The mapping establishes key-domain equivalence; it does not itself establish causal precedence between independently produced messages.
 
+### `Topic.message_identity`
+
+Message identity is a **guarantee provided by the topic's producers**, declaring where the identity of one logical message lives in the payload.
+
+#### `unspecified`
+
+No fact relates two carried messages sharing any field values.
+
+#### `keyed`
+
+For each mapped message schema, the mapping gives the ordered tuple of fields holding that schema's message identity. As with the ordering key, different schemas may map differently named fields into the same identity domain; tuple positions correspond across schemas, so all mapped tuples must have the same arity.
+
+The guarantee is one statement over the mapped population:
+
+> Any two messages carried by the topic, each of a mapped schema, whose identity tuples are equal are the **same logical message** — hence of the same schema, with equal payloads.
+
+Three consequences are deliberate:
+
+1. Two publications sharing an identity are attempts at publishing one logical message. The declaration says nothing about how often that message is delivered; delivery semantics remain those of §8.2 — which already speak of "the same logical message" being redelivered, and here gain their payload-level anchor.
+2. Because equal identity implies same schema, cross-schema identity collisions are excluded. An architect must not place two schemas in one identity domain if distinct logical messages of those schemas can share the identity value.
+3. The mapping may cover a subset of the carried schemas. This is a deliberate asymmetry with the ordering key: keyed ordering must route every carried message, while identity is meaningful knowledge per schema.
+
+The message identity is not the ordering key, and it is not object identity. On an order-events topic, `order_id` correctly orders the messages of one order and identifies the *order*; it does not identify the *message*, because `OrderCreated` and `OrderPaid` for one order share it while being different logical messages. The message identity of such a topic is an `event_id`.
+
+Where the publishing operations are modeled, a declared message identity is a checkable claim: a publisher whose publication payload is replay-deterministic under a key propagated into the identity fields (§12, §13) conforms to it. V1 does not perform that check; the declaration is relied on exactly as external-effect idempotency is, subject to §1.3.
+
+Declaring an identity is subject to the §26 authoring rule: declare it only if you are willing for a correctness proof to rely on "same identity value implies same payload". A producer that stamps a fresh timestamp into each publication attempt does not provide the guarantee.
+
 ### Topic order is not execution serialization
 
 A topic ordering guarantee describes the order in which messages are logically observed by the subscription abstraction.
@@ -385,6 +413,20 @@ The current request declaration does **not** itself encode:
 - or whether the request originated from a user versus another service.
 
 Outbound operation-to-operation calls are modeled separately through `RequestEffect`.
+
+### `RequestInput.identity`
+
+Request identity is a **guarantee provided by the request boundary**, declaring where the identity of one logical request lives in the payload.
+
+`unspecified` provides no fact: distinct attempts may present arbitrarily different payloads under equal field values.
+
+`keyed` declares an ordered tuple of payload fields and guarantees:
+
+> Any two requests arriving at this input whose values at the declared identity fields are equal present equal payloads, at the granularity of the modeled schema.
+
+Equivalently, the payload is a function of its identity fields. The canonical conforming implementations are a boundary that rejects a retry whose payload disagrees with the original request under the same identity, and a caller contract strong enough to stand in a proof. A rejected conflicting request is not an admitted invocation of the operation, so rejection preserves the guarantee.
+
+The declaration is an implementation guarantee, not a mechanism: it fixes what the payload of a logical request is, deduplicates nothing, and does not by itself discharge any idempotency requirement.
 
 ## 8.2 Subscription input
 
@@ -553,6 +595,8 @@ These mechanisms are not interchangeable. A transaction that merely prevents a s
 
 The requirement is not discharged merely because the operation has a field named `idempotency_key`, because an `InvocationResult` exists, or because an `EffectIntent` exists.
 
+V1 discharges the requirement over each admitted flow — one with no response, or one with the triggering input's response — under the governing key's population (§12). Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole flow even after terminal completion. Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14). Response consistency is the separate response-replay obligation below. Vacuously discharged: an empty population; no admitted flow, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
+
 ### `ResponseReplayRequirement::replay_consistent`
 
 When replay consistency is required, retries for the same logical invocation must resolve the same logical response.
@@ -609,6 +653,8 @@ For every prefix at which the invocation may fail, the solver must establish tha
 - every artifact a later step consumes is replay-available by route A or route B of §17;
 - no step is left in a state from which the flow cannot proceed.
 
+V1 discharges this by **same-flow continuation**: for every admitted flow — one with no response, or one whose response belongs to the triggering input — re-driving that same flow from its first step must reach its terminal completion. Every transaction step needs re-encounter resolution except one that is the final step of a response-less flow, after which no failing prefix exists. Consumed artifacts are judged by the replay rules of §17 and §18, with references inside the establishing transaction exempt by atomicity, and a commit key judged by the re-encounter analysis rather than double-counted as consumption. This is a sufficient route and deliberately does not prejudge which other flows a resumed attempt may take (`ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`).
+
 `resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Archspec does not model.
 
 ### `completion: guaranteed`
@@ -619,6 +665,8 @@ This is a liveness obligation and additionally requires a modeled retry driver, 
 
 - `delivery: at_least_once` on the triggering subscription, or
 - an inbound `RequestEffect` whose `retry` is `may_repeat`.
+
+An inbound repeatable request may be declared among a modeled caller's effects or as a state-machine transition side effect, which is a `RequestEffect` under §22. Both driver facts re-drive the *same logical invocation*: a redelivery is another delivery of one logical message, and `may_repeat` repeats one logical request, so the re-driven attempt carries the same payload and hence the same key.
 
 Two cautions apply.
 
@@ -695,7 +743,7 @@ This is a structural coherence rule, not a replay-stability claim. A reference b
 
 References a field in the current invocation's input payload.
 
-An input reference is not automatically replay-stable merely because two attempts share an idempotency key. Replay stability must follow from the operation's declared idempotency equivalence or other established provenance facts.
+An input reference is not automatically replay-stable merely because two attempts share an idempotency key. Replay stability must follow from the V1 rules of §18: the governing key's own components, a declared request or message identity pinned by that key, artifact recovery or reconstruction, or deterministic derivation over such roots.
 
 ### `ValueSource::effect`
 
@@ -738,6 +786,16 @@ Two attempts have the same declared idempotency identity when all components are
 A composite key is one logical key, not a set of independent alternative keys.
 
 The current DSL assigns no special semantic meaning to an empty component list; authors should not rely on one unless a future contract explicitly defines it.
+
+### Governing keys and the attempt population
+
+When an idempotency, recoverability, or response-replay obligation is verified, its key is the **governing key** of the analysis. V1 analysis proceeds only when every component of a governing key is sourced from **one** input of the operation — the *triggering input* of the analysis. A component sourced from mutable persistent state, or from an artifact the invocation itself produces, cannot define a pre-execution equivalence class, and the obligation is `Unknown`.
+
+The attempt population of such an obligation is the set of invocations triggered by that input. An invocation triggered by a different input has no value for the key, belongs to no equivalence class, and is not constrained by the obligation — the same population reading that applies to serialization and ordering keys, for the §7 reason that a concrete invocation is associated with the input that triggered it.
+
+An empty governing key places every attempt in one class; no component roots exist and no identity can be pinned by it (§18), so essentially nothing is replay-stable relative to it.
+
+`DeduplicatedBy` keys on transactions are not governing keys and are exempt from the single-input restriction; their fitness for artifact recovery is judged by the §18 rules.
 
 ### `IdempotencyKeyPropagation`
 
@@ -785,6 +843,12 @@ A publication declaration does **not** by itself imply:
 
 Those properties require additional structure/facts.
 
+### Duplicate publication
+
+For an upstream idempotency requirement, a duplicate execution of a publication effect is safe exactly when the topic declares a keyed message identity mapping the published schema (§6) and the published instance is class-fixed — replay-deterministic for a direct execution, or an intent replay-available by route A or B of §17. Every attempt then publishes the **same logical message**, so the duplicate creates no new logical work: at most it raises delivery multiplicity, which the topic's delivery semantics already admit and every consumer's own obligations must handle regardless.
+
+`idempotency_key_propagation` plays no role in this discharge: propagation is lineage for the consumer's analysis (§12) and deduplicates nothing on the publishing side.
+
 ## 13.2 Request effect
 
 A request effect invokes a specific request input of another operation with the declared schema.
@@ -811,6 +875,10 @@ No retry fact is available.
 
 `idempotency_key_propagation` links the outbound request's key fields to upstream logical identity.
 
+### Duplicate request
+
+A duplicate execution of a request effect invokes the target again, and nothing admits invocation multiplicity by default — the asymmetry with duplicate publication is deliberate: a request identity on the target input fixes payload consistency, but only a mechanism collapses invocations. The duplicate is safe exactly when the instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement, keyed from the targeted input, that is itself proven: payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation. V1 computes these mutually dependent verdicts as a least fixpoint; cyclic request dependencies settle unproven.
+
 ## 13.3 External effect
 
 An external effect marks a boundary beyond which Archspec does not inspect implementation structure.
@@ -834,6 +902,8 @@ A retry/duplicate path reaching such an effect is therefore potentially observab
 The external boundary guarantees deduplication for executions sharing the declared idempotency key.
 
 The guarantee is scoped to equality of that logical key. It does not imply ordering, transactionality, or deduplication across different keys.
+
+For an upstream idempotency requirement, a duplicate execution is safe when every component of the declared key is replay-stable relative to the governing key (§18): all attempts then execute under one key, and the boundary collapses them. No instance condition is needed, since the guarantee is scoped to key equality alone.
 
 ---
 
@@ -955,7 +1025,7 @@ For `ExecuteEffect(E, D)`, the step:
 
 Because the step occurs at flow level rather than inside a transaction, the derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to a transaction execution (§18).
 
-For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots establishes that a retry constructs the same logical effect instance. Effect payload stability and duplicate-execution safety remain separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
+For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots (§18) establishes that a retry constructs the same logical effect instance. Effect payload stability and duplicate-execution safety remain separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
 
 A direct effect execution is not automatically durable or retry-safe. The verifier must use the effect's retry/deduplication environment and the invocation's possible failure/retry paths.
 
@@ -1089,6 +1159,8 @@ B. recovery
 
 Otherwise the artifact's retry availability/consistency is not proven.
 
+Route A's derivation roots and route B's commit-key components are judged by the replay-stability rules of §18. In particular, a commit key over roots that are not replay-stable earns no recovery route: attempts may evaluate different keys, address different commits, and each commit the body once.
+
 ### Isolation
 
 The solver should use the following abstract semantics.
@@ -1157,6 +1229,84 @@ replay-stable provenance
         ↓
 replay-deterministic produced value
 ```
+
+### Replay-stable provenance roots (V1)
+
+Replay stability is judged relative to an operation and a governing key
+`K` (§12):
+
+> A `ValueRef` is **replay-stable** iff in every admitted execution,
+> any two attempts in the same `K`-class that evaluate it obtain equal
+> logical values.
+
+The quantification is over evaluations: an attempt that crashes before
+evaluating a reference imposes nothing, and evaluating an artifact
+reference presupposes the artifact is available in the attempt's
+context (§16).
+
+A path `p` is *pinned by `K` in schema `S`* when some component of `K`
+has a path canonically equal to `p` within `S` — equality of canonical
+value paths after fragment expansion, since a fragment mapping asserts
+semantic identity of the referenced value (§4).
+
+The V1 rules. Stability is definitional, declared, or derived — never
+assumed:
+
+1. **Key components.** Every component of `K` is replay-stable: class
+   membership requires their equality (§12).
+2. **Literals.** A literal is replay-stable; this matters for selector
+   provenance (§19).
+3. **Identified triggering payload.** Let `i` be the triggering input.
+   - `i` is a request declaring a keyed identity (§8.1) whose every
+     field is pinned by `K`: every field of `i`'s payload is
+     replay-stable.
+   - `i` is a subscription whose topic declares a keyed message
+     identity (§6), every admitted schema is mapped, and for each
+     identity position a **single** component of `K` pins that
+     position's field in **every** admitted schema: every field of
+     `i`'s payload is replay-stable.
+
+   Same-class attempts are then presentations of one logical stimulus.
+   The per-position single-component clause is what carries key
+   equality across schemas: with different components pinning a
+   position in different schemas, class equality would relate each
+   component to itself across attempts but never relate one message's
+   identity to the other's.
+4. **Recovered artifacts.** For a transaction `T` declared
+   `DeduplicatedBy { key }` whose key components are all replay-stable,
+   the contents of every artifact established by `T` are replay-stable:
+   all attempts in a class address the same `Commit(T,K)`, which
+   durably retains the exact artifacts of the single successful
+   execution (§17 route B).
+5. **Reconstructed artifacts.** For a naturally replayable transaction,
+   an artifact whose establishment derivation is replay-deterministic
+   is replay-stable (§17 route A).
+6. **Congruence.** A value produced by `Deterministic { from }` with
+   every root replay-stable is replay-deterministic, and its uses
+   inherit stability.
+7. **Everything else is `Unknown`**: unidentified non-key input fields,
+   fields of a non-triggering input, `state_machine_subject` state
+   (always, in V1), `effect` payload roots, and `transaction_read`
+   results, which additionally poison any natural-replay provenance
+   closure that reaches them.
+
+The `Unknown` cases are epistemic (§1.1): no rule establishes
+stability; instability is not proven.
+
+Why rule 3 requires a declaration rather than following from the key:
+with `K = [input.idempotency_key]` and no declared identity, attempts
+`{idempotency_key: k, amount: 100}` and `{idempotency_key: k, amount:
+200}` are both admitted and share a class. A write derived
+`deterministic_from(input.amount)` is deterministic yet produces
+different values across the class. Only a boundary fact excludes the
+conflicting attempt.
+
+These judgments — stability, replay determinism, natural
+replayability, artifact replay availability — form one simultaneous
+induction, computable in a single forward pass in flow order and,
+within a transaction, step order: every rule consumes only roots or
+facts established at earlier steps, and transaction-read dependence,
+the only backward-looking observation, is excluded outright.
 
 ### Transaction read results
 
@@ -1265,7 +1415,7 @@ Mutates the listed fields of the selected object instances.
 
 The revised model should declare the provenance of the values written through `Derivation`.
 
-A deterministic derivation describes value computation, not replayability by itself. Natural replay analysis must additionally establish replay stability of the selected target and all derivation roots.
+A deterministic derivation describes value computation, not replayability by itself. Natural replay analysis must additionally establish replay stability of the selected target and all derivation roots (§18).
 
 A write whose derivation is `Unspecified` normally leaves natural replayability `Unknown` when that mutation matters to the proof.
 
@@ -1489,6 +1639,10 @@ The solver must preserve these distinctions:
 | **Idempotency vs recoverability** | Idempotency bounds what retries may do and is satisfied by never retrying; recoverability obliges the flow to actually reach its terminal step. |
 | **Resumable vs guaranteed completion** | Being able to resume is a property of the flow's artifacts; being re-driven requires a modeled retry driver. |
 | **Duplicate-delivery fact vs liveness** | `at_least_once` and `may_repeat` say a retry may happen, not that retries continue until success. |
+| **Ordering key vs message identity** | The ordering key sequences messages; the message identity identifies one logical message. They may coincide; neither implies the other. |
+| **Object identity vs message identity** | `order_id` identifies the order, not the message about the order. |
+| **Key equality vs payload equality** | Class membership equates the governing key's components only; payload equality needs a declared stimulus identity pinned by that key. |
+| **Stimulus identity vs deduplication** | An identity fixes what the payload of a logical request or message is; only a mechanism limits how often work happens. |
 
 ---
 

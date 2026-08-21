@@ -7,8 +7,8 @@ use archspec::{
     parser::yaml,
     spec::{
         CompletionRequirement, Derivation, Effect, FlowStep, Id, IdempotencyGuarantee, Input,
-        LaneConcurrency, Schema, SchemaCompleteness, ServiceKind, TopicOrdering, TransactionStep,
-        TransitionSideEffect, ValueSource,
+        LaneConcurrency, MessageIdentity, RequestIdentity, Schema, SchemaCompleteness,
+        ServiceKind, TopicOrdering, TransactionStep, TransitionSideEffect, ValueSource,
     },
 };
 
@@ -152,6 +152,63 @@ fn parses_keyed_topic_model() {
         .expect("OrderEvent should define its topic ordering key");
 
     assert_eq!(order_event_key.0, vec!["order_id".to_string()]);
+
+    // The ordering key and the message identity are separate
+    // declarations: order_id sequences events for an order, event_id
+    // identifies one logical message.
+    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        panic!("order_events should declare a keyed message identity");
+    };
+
+    let order_event_identity = mapping
+        .get(&Id("OrderEvent".into()))
+        .expect("OrderEvent should define its message identity");
+
+    assert_eq!(order_event_identity.len(), 1);
+    assert_eq!(order_event_identity[0].0, vec!["event_id".to_string()]);
+}
+
+#[test]
+fn flash_checkout_parses_stimulus_identities() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let input = model
+        .operations
+        .get(&Id("operation.create_order".into()))
+        .expect("create_order should exist")
+        .inputs
+        .get(&Id("input.create_order.request".into()))
+        .expect("create_order request should exist");
+
+    let Input::Request(request) = input else {
+        panic!("create_order input should be a request");
+    };
+
+    let RequestIdentity::Keyed { fields } = &request.identity else {
+        panic!("create_order request should declare a keyed identity");
+    };
+
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].0, vec!["idempotency_key".to_string()]);
+
+    let topic = model
+        .topics
+        .get(&Id("topic.order_events".into()))
+        .expect("order_events topic should exist");
+
+    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        panic!("order_events should declare a keyed message identity");
+    };
+
+    // Every carried schema is identified by its event_id.
+    assert_eq!(mapping.len(), 5);
+
+    for identity in mapping.values() {
+        assert_eq!(identity.len(), 1);
+        assert_eq!(identity[0].0, vec!["event_id".to_string()]);
+    }
 }
 
 #[test]

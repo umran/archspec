@@ -51,6 +51,12 @@ topics:
                 OrderEvent:
                     - order_id
 
+        message_identity:
+            kind: keyed
+            mapping:
+                OrderEvent:
+                    - - event_id
+
 state_machines: {}
 
 operations: {}

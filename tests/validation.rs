@@ -9,9 +9,9 @@ use archspec::{
     parser::yaml,
     spec::{
         CompletionRequirement, Derivation, EffectIntent, EstablishEffectIntent, FieldPath,
-        FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageSelector, Model,
-        RecoverabilityRequirement, Schema, SchemaFragment, StateTransition, TopicOrdering,
-        TransactionStep, ValueRef, ValueSource,
+        FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
+        MessageSelector, Model, RecoverabilityRequirement, RequestIdentity, Schema,
+        SchemaFragment, StateTransition, TopicOrdering, TransactionStep, ValueRef, ValueSource,
     },
 };
 
@@ -1401,6 +1401,179 @@ fn rejects_invalid_field_path_in_transition_effect_derivation() {
         vec![ValidationError::InvalidFieldPath {
             subject: id("tx.apply_payment"),
             schema: id("schema.PaymentCaptured"),
+            path: FieldPath(vec!["does_not_exist".to_owned()]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_empty_request_identity() {
+    let mut model = load_flash_checkout();
+
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.create_order.request"))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    request.identity = RequestIdentity::Keyed { fields: Vec::new() };
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EmptyRequestIdentity {
+            input: id("input.create_order.request"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_unresolvable_request_identity_field() {
+    let mut model = load_flash_checkout();
+
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.create_order.request"))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    request.identity = RequestIdentity::Keyed {
+        fields: vec![FieldPath(vec!["does_not_exist".to_owned()])],
+    };
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("input.create_order.request"),
+            schema: id("schema.CreateOrderRequest"),
+            path: FieldPath(vec!["does_not_exist".to_owned()]),
+        }]
+    );
+}
+
+fn order_events_message_identity(
+    model: &mut Model,
+) -> &mut std::collections::BTreeMap<Id, Vec<FieldPath>> {
+    let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
+
+    let MessageIdentity::Keyed { mapping } = &mut topic.message_identity else {
+        panic!("order_events should declare a keyed message identity");
+    };
+
+    mapping
+}
+
+#[test]
+fn rejects_message_identity_for_uncarried_schema() {
+    let mut model = load_flash_checkout();
+
+    // A declared schema, but not one carried by the topic.
+    order_events_message_identity(&mut model).insert(
+        id("schema.CreateOrderRequest"),
+        vec![FieldPath(vec!["idempotency_key".to_owned()])],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::MessageIdentitySchemaNotOnTopic {
+            topic: id("topic.order_events"),
+            schema: id("schema.CreateOrderRequest"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_unknown_schema_in_message_identity() {
+    let mut model = load_flash_checkout();
+
+    order_events_message_identity(&mut model).insert(
+        id("schema.missing"),
+        vec![FieldPath(vec!["event_id".to_owned()])],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnknownReference {
+            subject: id("topic.order_events"),
+            reference: id("schema.missing"),
+            expected: ReferenceKind::Schema,
+        }]
+    );
+}
+
+#[test]
+fn rejects_empty_message_identity() {
+    let mut model = load_flash_checkout();
+
+    order_events_message_identity(&mut model).insert(id("schema.OrderCreated"), Vec::new());
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EmptyMessageIdentity {
+            topic: id("topic.order_events"),
+            schema: id("schema.OrderCreated"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_message_identity_arity_mismatch() {
+    let mut model = load_flash_checkout();
+
+    order_events_message_identity(&mut model).insert(
+        id("schema.OrderCreated"),
+        vec![
+            FieldPath(vec!["event_id".to_owned()]),
+            FieldPath(vec!["order_id".to_owned()]),
+        ],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::MessageIdentityArityMismatch {
+            topic: id("topic.order_events"),
+            schema: id("schema.OrderCreated"),
+            expected: 1,
+            actual: 2,
+        }]
+    );
+}
+
+#[test]
+fn rejects_unresolvable_message_identity_field() {
+    let mut model = load_flash_checkout();
+
+    order_events_message_identity(&mut model).insert(
+        id("schema.OrderCreated"),
+        vec![FieldPath(vec!["does_not_exist".to_owned()])],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("topic.order_events"),
+            schema: id("schema.OrderCreated"),
             path: FieldPath(vec!["does_not_exist".to_owned()]),
         }]
     );

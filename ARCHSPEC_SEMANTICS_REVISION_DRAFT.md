@@ -951,6 +951,11 @@ pub enum FlowStep {
 ## 26.1 Naturally replayable write and result
 
 ```text
+input.request : request
+  identity: keyed [request_id]
+
+operation idempotency key: [input.request_id]
+
 Transaction T
   idempotency: unspecified
 
@@ -962,7 +967,10 @@ Transaction T
     values: deterministic_from(input.file_id)
 ```
 
-If the solver proves `input.file_id` and `input.contents` replay-stable for the relevant logical invocation:
+The declared request identity, pinned by the operation's idempotency
+key, makes `input.file_id` and `input.contents` replay-stable for the
+relevant logical invocation (`ARCHSPEC_REPLAY_STABILITY_DRAFT.md`;
+main document §18). Then:
 
 ```text
 retry T
@@ -1106,8 +1114,8 @@ The semantic direction is coherent, but the following should be explicitly resol
 2. **Artifact derivation granularity**  
    Confirm whether `Derivation` on `EstablishEffectIntent` describes the entire intended effect payload, and whether additional effect-payload lineage is needed.
 
-3. **Replay-stable provenance roots**  
-   Define the exact V1 rules for when an input or other `ValueRef` is considered invariant across retries in the operation's idempotency equivalence class.
+3. **Replay-stable provenance roots** — *Resolved, 2026-08-20.*  
+   The exact V1 rules are defined in `ARCHSPEC_REPLAY_STABILITY_DRAFT.md` and reconciled into the main document (§6 `message_identity`, §8.1 `RequestInput.identity`, §12 governing keys, §18 rules). Stability is definitional (governing-key components), declared (a request or message identity pinned by the governing key), or derived (keyed-commit recovery, natural-replay reconstruction, congruence); everything else is `Unknown`.
 
 4. **Insert failure semantics**  
    Normatively define the result of attempting to insert an already-existing `DataObject.identity` and how that affects the enclosing transaction and flow applicability.
@@ -1118,8 +1126,8 @@ The semantic direction is coherent, but the following should be explicitly resol
 6. **Effect execution completion state**  
    Keep intent reconstruction separate from durable tracking of effect execution/completion, and decide what minimum execution-state semantics V1 requires.
 
-7. **Alternative flow applicability**  
-   Formalize how candidate flows whose required transaction/artifact preconditions cannot be satisfied are treated by the analyzer.
+7. **Alternative flow applicability** — *Open; V1 stance adopted 2026-08-21.*  
+   Formalize how candidate flows whose required transaction/artifact preconditions cannot be satisfied are treated by the analyzer. This remains unresolved: `ARCHSPEC_FLOW_RESUMPTION_DRAFT.md` adopts same-flow continuation as a sufficient recoverability route that neither uses nor forbids alternative-flow continuations, so a future resolution may add routes but cannot invalidate V1 proofs.
 
 These questions do not require introducing recovery-specific flow steps.
 

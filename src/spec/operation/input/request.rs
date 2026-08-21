@@ -1,9 +1,40 @@
 use serde::{Deserialize, Serialize};
 
-use crate::spec::Id;
+use crate::spec::{FieldPath, Id};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestInput {
     pub schema: Id,
+
+    /// Identity of one logical request at this boundary.
+    pub identity: RequestIdentity,
+}
+
+/// Where the identity of one logical request lives in the payload.
+///
+/// This is an implementation guarantee about the request boundary, not
+/// a requirement and not a mechanism: it fixes what the payload of a
+/// logical request is, deduplicates nothing, and does not by itself
+/// discharge any idempotency obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestIdentity {
+    /// No fact relates two requests sharing any field values. Distinct
+    /// attempts may present arbitrarily different payloads under equal
+    /// keys.
+    Unspecified,
+
+    /// Any two requests arriving at this input whose values at the
+    /// declared identity fields are equal present equal payloads, at
+    /// the granularity of the modeled schema: the payload is a
+    /// function of its identity fields.
+    ///
+    /// The canonical conforming implementations are a boundary that
+    /// rejects a retry whose payload disagrees with the original
+    /// request under the same identity, and a caller contract strong
+    /// enough to stand in a proof. A rejected conflicting request is
+    /// not an admitted invocation, so rejection preserves the
+    /// guarantee.
+    Keyed { fields: Vec<FieldPath> },
 }

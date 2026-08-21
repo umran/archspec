@@ -36,6 +36,26 @@ pub struct Evidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticCode {
     Validation(ValidationCode),
+    Verification(VerificationCode),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationCode {
+    /// A declared serialization requirement is not established by the
+    /// declared facts. Epistemic, not a violation (§1.2).
+    SerializationUnproven,
+
+    /// A declared response-replay obligation is not established by the
+    /// declared facts. Epistemic, not a violation (§1.2).
+    ResponseReplayUnproven,
+
+    /// A declared recoverability requirement is not established by the
+    /// declared facts. Epistemic, not a violation (§1.2).
+    RecoverabilityUnproven,
+
+    /// A declared idempotency requirement is not established by the
+    /// declared facts. Epistemic, not a violation (§1.2).
+    IdempotencyUnproven,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +78,11 @@ pub enum ValidationCode {
 
     TopicKeySchemaNotOnTopic,
     TopicKeyMissingSchema,
+
+    MessageIdentitySchemaNotOnTopic,
+    EmptyMessageIdentity,
+    MessageIdentityArityMismatch,
+    EmptyRequestIdentity,
 
     TransactionObjectOutsideDataModel,
     TransactionMissingDataModel,
