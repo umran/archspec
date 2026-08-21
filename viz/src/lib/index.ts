@@ -1,4 +1,4 @@
-import type { Effect, Id, Model, TransitionSideEffect } from "../types/model";
+import type { Effect, Id, Model, Operation, TransitionSideEffect } from "../types/model";
 import { shortId } from "./ids";
 
 /** Where an id is declared, resolved once for the whole model. */
@@ -97,6 +97,14 @@ export function effectSummary(model: Model, index: ModelIndex, effectId: Id): st
     case "external":
       return `external ${e.name} · ${e.idempotency.kind}`;
   }
+}
+
+/** The first declared flow whose steps run the transaction, if any. */
+export function flowContaining(operation: Operation, transaction: Id): Id | null {
+  for (const [flowId, flow] of Object.entries(operation.flows)) {
+    if (flow.steps.some((s) => s.kind === "transaction" && s.transaction === transaction)) return flowId;
+  }
+  return null;
 }
 
 /** Operations that execute an effect through a declared intent. */

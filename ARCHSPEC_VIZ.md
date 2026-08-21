@@ -43,13 +43,20 @@ execute them through intents and marked "via transition". Click
 anything for a structured detail panel; double-click an operation to
 drill in. The filter box dims non-matching vertices.
 
-**Operation view** (`#/op/<id>`). One column per declared invocation
-flow, steps in order. Transaction steps expand in place into their
-transaction's steps (reads, writes, inserts, deletes, locks,
-transitions, artifact establishments), each with its selector,
-provenance, and a full detail panel. Transition steps link into the
-owning state machine. Requirement chips across the top carry
-per-requirement verdicts when a report is loaded.
+**Operation view** (`#/op/<id>`). Inputs and requirements across the
+top, then the operation's invocation flows as tabs, one flow at a
+time — flows are alternative execution paths (an invocation takes
+exactly one), so they are never shown side by side. The active tab is
+part of the route (`#/op/<id>?flow=<flow id>`), so a flow can be
+deep-linked, and clicking a flow in the operation's detail panel or an
+obligation's subject lands directly on it. Within a flow, steps run in
+order: transaction steps expand in place into their transaction's
+steps (reads, writes, inserts, deletes, locks, transitions, artifact
+establishments), each with its selector, provenance, and a full detail
+panel; execute-effect steps are badged with the effect's kind
+(publication, request, external). Transition steps link into the
+owning state machine. Requirement chips carry per-requirement verdicts
+when a report is loaded.
 
 **State machine view** (`#/machine/<id>`). The state graph: legal
 states, initial state, transitions (with ⚡ badges for transition-owned

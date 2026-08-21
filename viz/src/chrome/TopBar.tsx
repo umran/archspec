@@ -37,7 +37,15 @@ export function TopBar() {
               <Breadcrumbs.Separator />
               <Breadcrumbs.Current>{route.view === "op" ? "operation" : "machine"}</Breadcrumbs.Current>
               <Breadcrumbs.Separator />
-              <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
+              {route.view === "op" && route.flow ? (
+                <>
+                  <Breadcrumbs.Link href={hashes.op(route.id)}>{route.id}</Breadcrumbs.Link>
+                  <Breadcrumbs.Separator />
+                  <Breadcrumbs.Current>{shortId(route.flow)}</Breadcrumbs.Current>
+                </>
+              ) : (
+                <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
+              )}
             </>
           )}
         </Breadcrumbs>

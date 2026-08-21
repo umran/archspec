@@ -5,7 +5,7 @@ import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
-import { effectDef, effectSummary, intentExecutors } from "../lib/index";
+import { effectDef, effectSummary, flowContaining, intentExecutors } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { concurrencyText } from "../lib/text";
@@ -139,18 +139,16 @@ function FlowSummary({ opId, flowId }: { opId: Id; flowId: Id }) {
   return (
     <div className="space-y-1.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
       <div className="flex items-center justify-between gap-2">
-        <IdLink id={flowId}>{shortId(flowId)}</IdLink>
-        <span className="flex items-center gap-1">
-          <StatusChips obKey={`${opId}/${flowId}`} />
-          <Button
-            variant="ghost"
-            size="xs"
-            shape="square"
-            icon={ArrowSquareOutIcon}
-            aria-label="Open in flow view"
-            onClick={() => navigateTo(hashes.op(opId), `flow:${flowId}`)}
-          />
-        </span>
+        <button
+          type="button"
+          className="flex cursor-pointer items-center gap-1.5 font-mono text-[12px] text-kumo-link hover:underline"
+          title="Open this flow in the operation view"
+          onClick={() => navigateTo(hashes.op(opId, flowId), `flow:${flowId}`)}
+        >
+          {shortId(flowId)}
+          <ArrowSquareOutIcon size={12} />
+        </button>
+        <StatusChips obKey={`${opId}/${flowId}`} />
       </div>
       <ol className="space-y-1">
         {flow.steps.map((s, i) => (
@@ -407,9 +405,13 @@ function TransitionDetail({ mId, id }: { mId: Id; id: Id }) {
       )}
       {refs.length > 0 && (
         <Section title="taken by transactions" count={refs.length}>
-          <List items={refs.map((r, i) => (
-            <span key={i}><IdLink id={r.transaction} /> step {r.step + 1} in <NavLink hash={hashes.op(r.operation)}>{shortId(r.operation)}</NavLink></span>
-          ))} />
+          <List items={refs.map((r, i) => {
+            const owner = model.operations[r.operation];
+            const flow = owner ? flowContaining(owner, r.transaction) : null;
+            return (
+              <span key={i}><IdLink id={r.transaction} /> step {r.step + 1} in <NavLink hash={hashes.op(r.operation, flow)} selection={`tx:${r.transaction}`}>{shortId(r.operation)}</NavLink></span>
+            );
+          })} />
         </Section>
       )}
       <Obligations obKey={`${mId}/${id}`} />
@@ -559,7 +561,7 @@ function FlowDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
   const flow = model.operations[opId].flows[id];
   return (
-    <Frame kind="invocation flow" title={id} subtitle={<span>flow of <NavLink hash={hashes.op(opId)}>{shortId(opId)}</NavLink></span>}>
+    <Frame kind="invocation flow" title={id} subtitle={<span>flow of <NavLink hash={hashes.op(opId, id)} selection={`flow:${id}`}>{shortId(opId)}</NavLink></span>}>
       <Section title="steps" count={flow.steps.length}>
         <List items={flow.steps.map((s, i) => (
           <span key={i} className="flex items-center gap-2"><Tag>{i + 1}</Tag><span className="text-sm">{s.kind}</span>

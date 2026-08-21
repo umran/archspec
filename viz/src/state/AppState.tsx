@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 
-import { buildIndex, type ModelIndex } from "../lib/index";
+import { buildIndex, flowContaining, type ModelIndex } from "../lib/index";
 import { buildObligationIndex, type ObligationIndex } from "../lib/obligations";
 import { hashes, navigate, routeKey, useRoute, type Route } from "../lib/route";
 import type { Graph } from "../types/graph";
@@ -151,11 +151,14 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
           break;
         }
         case "flow":
-          navigateTo(hashes.op(s.operation), `flow:${s.flow}`);
+          navigateTo(hashes.op(s.operation, s.flow), `flow:${s.flow}`);
           break;
-        case "transaction":
-          navigateTo(hashes.op(s.operation), `tx:${s.transaction}`);
+        case "transaction": {
+          const operation = data.model.operations[s.operation];
+          const flow = operation ? flowContaining(operation, s.transaction) : null;
+          navigateTo(hashes.op(s.operation, flow), `tx:${s.transaction}`);
           break;
+        }
         case "state_machine":
           navigateTo(hashes.machine(s.machine, s.transition));
           break;
@@ -167,7 +170,7 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
           break;
       }
     },
-    [navigateTo, openDetail],
+    [navigateTo, openDetail, data.model],
   );
 
   const value = useMemo<AppState>(

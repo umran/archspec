@@ -2,13 +2,14 @@ import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Empty } from "@cloudflare/kumo/components/empty";
+import { Tabs } from "@cloudflare/kumo/components/tabs";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowDownIcon, ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
 import { effectDef, effectSummary } from "../lib/index";
-import { STATUS_GLYPH, propertyMatchesRequirement, worstStatus } from "../lib/obligations";
+import { STATUS_GLYPH, propertyMatchesRequirement, statusChipText, statusCounts, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { concurrencyText, predicateText } from "../lib/text";
 import { useApp, type DetailContext } from "../state/AppState";
@@ -250,7 +251,7 @@ function FlowColumn({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowI
 
   const flowKey = `flow:${flowId}`;
   return (
-    <div className="w-[340px] shrink-0">
+    <div className="w-full max-w-[640px]">
       <div
         role="button"
         tabIndex={0}
@@ -281,7 +282,7 @@ function FlowColumn({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowI
 }
 
 export function OperationView({ id }: { id: string }) {
-  const { model, obligations, overlay, selection, select, navigateTo } = useApp();
+  const { model, obligations, overlay, selection, select, navigateTo, route } = useApp();
   const op = model.operations[id];
 
   if (!op) {
@@ -301,7 +302,14 @@ export function OperationView({ id }: { id: string }) {
   reqs.recoverability.forEach((r, i) => chips.push({ prop: "recoverability", i, label: `recoverability #${i} · ${r.completion}` }));
 
   const inputs = Object.entries(op.inputs);
-  const flows = Object.entries(op.flows);
+  const flowIds = Object.keys(op.flows);
+  const requested = route.view === "op" ? route.flow : null;
+  const activeFlow = requested && op.flows[requested] ? requested : (flowIds[0] ?? null);
+  const tabLabel = (flowId: Id) => {
+    const counts = overlay ? statusCounts(obligations.get(`${id}/${flowId}`) ?? []) : {};
+    const chip = statusChipText(counts);
+    return chip ? `${shortId(flowId)}  ${chip}` : shortId(flowId);
+  };
   const node = { machines: Object.values(op.transactions).flatMap((tx) => tx.steps.flatMap((s) => (s.kind === "transition" ? [s.machine] : []))) };
 
   return (
@@ -383,17 +391,27 @@ export function OperationView({ id }: { id: string }) {
           </section>
         )}
 
-        <section className="space-y-2">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">flows</div>
-          {flows.length ? (
-            // Selection rings draw outside their card; the scroll
-            // container clips both axes, so it carries a ring's worth of
-            // padding pulled back out by a negative margin.
-            <div className="-mx-1.5 -mt-1.5 flex gap-8 overflow-x-auto px-1.5 pt-1.5 pb-4">
-              {flows.map(([flowId, flow]) => (
-                <FlowColumn key={flowId} opId={id} op={op} flowId={flowId} flow={flow} />
-              ))}
-            </div>
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-baseline gap-3">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">flows</div>
+            <span className="text-xs text-kumo-inactive">
+              alternative invocation paths — an invocation takes exactly one
+            </span>
+          </div>
+          {activeFlow ? (
+            <>
+              <Tabs
+                variant="underline"
+                tabs={flowIds.map((flowId) => ({ value: flowId, label: tabLabel(flowId) }))}
+                value={activeFlow}
+                onValueChange={(value) => navigateTo(hashes.op(id, value))}
+              />
+              {/* Selection rings draw outside their card; the padding
+                  keeps them clear of the section edge. */}
+              <div className="pt-1.5 pl-1.5">
+                <FlowColumn key={activeFlow} opId={id} op={op} flowId={activeFlow} flow={op.flows[activeFlow]} />
+              </div>
+            </>
           ) : (
             <Empty size="sm" title="operation declares no flows" />
           )}

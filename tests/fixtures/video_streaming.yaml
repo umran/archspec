@@ -475,7 +475,7 @@ operations:
         kind: unbounded
   operation.transcode_video:
     service: service.transcoder
-    description: Claim the transcode job for an uploaded video, render its renditions through the transcoding engine, and announce completion.
+    description: Claim the transcode job for an uploaded video and render its renditions through the transcoding engine; one flow announces completion, the alternative marks the job failed when the engine rejects the source.
     inputs:
       input.transcode_video.uploaded:
         kind: subscription
@@ -624,8 +624,39 @@ operations:
                   id: input.transcode_video.uploaded
                 path:
                 - video_id
+      tx.transcode_video.fail:
+        data_model: data.transcoder
+        isolation: read_committed
+        idempotency:
+          kind: deduplicated_by
+          key:
+            components:
+            - source:
+                kind: input
+                id: input.transcode_video.uploaded
+              path:
+              - event_id
+        steps:
+        - kind: transition
+          machine: machine.job_lifecycle
+          transition: transition.job.fail
+          subject:
+            object: object.job
+            predicate:
+              kind: eq
+              field:
+              - video_id
+              value:
+                kind: value
+                value:
+                  source:
+                    kind: input
+                    id: input.transcode_video.uploaded
+                  path:
+                  - video_id
+          effect_values: {}
     flows:
-      flow.transcode_video:
+      flow.transcode_video.completed:
         steps:
         - kind: transaction
           transaction: tx.transcode_video.claim
@@ -648,6 +679,28 @@ operations:
           transaction: tx.transcode_video.complete
         - kind: execute_effect_intent
           intent: intent.transcode_video.completed
+        response: null
+      flow.transcode_video.failed:
+        steps:
+        - kind: transaction
+          transaction: tx.transcode_video.claim
+        - kind: execute_effect
+          effect: effect.transcode_video.engine
+          values:
+            kind: deterministic
+            from:
+            - source:
+                kind: input
+                id: input.transcode_video.uploaded
+              path:
+              - video_id
+            - source:
+                kind: input
+                id: input.transcode_video.uploaded
+              path:
+              - source_uri
+        - kind: transaction
+          transaction: tx.transcode_video.fail
         response: null
     requirements:
       serialization:

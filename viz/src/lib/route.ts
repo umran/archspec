@@ -2,13 +2,15 @@ import { useSyncExternalStore } from "react";
 
 export type Route =
   | { view: "system" }
-  | { view: "op"; id: string }
+  | { view: "op"; id: string; flow: string | null }
   | { view: "machine"; id: string; highlight: string | null };
 
 export function parseHash(hash: string): Route {
   const h = decodeURIComponent(hash || "");
   let m: RegExpMatchArray | null;
-  if ((m = h.match(/^#\/op\/(.+)$/))) return { view: "op", id: m[1] };
+  if ((m = h.match(/^#\/op\/([^?]+)(?:\?flow=(.+))?$/))) {
+    return { view: "op", id: m[1], flow: m[2] ?? null };
+  }
   if ((m = h.match(/^#\/machine\/([^?]+)(?:\?t=(.+))?$/))) {
     return { view: "machine", id: m[1], highlight: m[2] ?? null };
   }
@@ -16,12 +18,15 @@ export function parseHash(hash: string): Route {
 }
 
 export function routeKey(route: Route): string {
-  return route.view === "system" ? "system" : `${route.view}:${route.id}`;
+  if (route.view === "system") return "system";
+  if (route.view === "op") return `op:${route.id}` + (route.flow ? `?${route.flow}` : "");
+  return `machine:${route.id}`;
 }
 
 export const hashes = {
   system: () => "#/system",
-  op: (id: string) => `#/op/${encodeURIComponent(id)}`,
+  op: (id: string, flow?: string | null) =>
+    `#/op/${encodeURIComponent(id)}` + (flow ? `?flow=${encodeURIComponent(flow)}` : ""),
   machine: (id: string, transition?: string) =>
     `#/machine/${encodeURIComponent(id)}` +
     (transition ? `?t=${encodeURIComponent(transition)}` : ""),
