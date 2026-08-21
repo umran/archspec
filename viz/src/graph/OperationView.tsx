@@ -358,7 +358,7 @@ export function OperationView({ id }: { id: string }) {
         {inputs.length > 0 && (
           <section className="space-y-2">
             <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">inputs</div>
-            <div className="flex flex-wrap gap-3">
+            <div className="-m-1.5 flex flex-wrap gap-3 p-1.5">
               {inputs.map(([inputId, input]) => (
                 <div key={inputId} className="w-[340px]">
                   <StepCard selKey={`in:${inputId}`} detailId={inputId} stripe={input.kind === "request" ? STEP_STRIPE.response : "var(--arch-edge-subscribe)"}>
@@ -386,7 +386,10 @@ export function OperationView({ id }: { id: string }) {
         <section className="space-y-2">
           <div className="text-[11px] font-semibold uppercase tracking-wider text-kumo-subtle">flows</div>
           {flows.length ? (
-            <div className="flex gap-8 overflow-x-auto pb-4">
+            // Selection rings draw outside their card; the scroll
+            // container clips both axes, so it carries a ring's worth of
+            // padding pulled back out by a negative margin.
+            <div className="-mx-1.5 -mt-1.5 flex gap-8 overflow-x-auto px-1.5 pt-1.5 pb-4">
               {flows.map(([flowId, flow]) => (
                 <FlowColumn key={flowId} opId={id} op={op} flowId={flowId} flow={flow} />
               ))}
