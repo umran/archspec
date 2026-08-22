@@ -1486,7 +1486,7 @@ Program order between separate `Lock` steps is itself relevant to the lock-order
 
 A `by` order within one selector does not automatically reconcile contradictory order between two separately declared lock steps.
 
-The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. This is open question 8 of `ARCHSPEC_SEMANTICS_REVISION_DRAFT.md` §27.
+The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 of `ARCHSPEC_SEMANTICS_REVISION_DRAFT.md` §27, and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about locks.
 
 ---
 

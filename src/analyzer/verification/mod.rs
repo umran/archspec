@@ -17,7 +17,10 @@
 //! artifact replay availability. Verifiers that follow effects into
 //! other operations share the trigger graph (`trigger`). Of the §9
 //! requirement families only ordering remains, pending its
-//! precedence-source semantics.
+//! precedence-source semantics. Beyond §9, a model-wide deadlock
+//! checker is earmarked (revision draft §27, question 9), gated on
+//! the locking facts the DSL cannot yet state (question 8); no
+//! verifier here reasons about locks.
 //!
 //! Two rules govern every verdict:
 //!
