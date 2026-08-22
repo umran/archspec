@@ -1022,6 +1022,11 @@ operations:
         idempotency:
           kind: unspecified
         steps:
+        # The two exclusive locks below take the source and destination
+        # rows as separate steps in program order with no acquisition
+        # order between them, so a concurrent transfer in the opposite
+        # direction may deadlock — and the DSL cannot yet say otherwise
+        # (ARCHSPEC_SEMANTICS_REVISION_DRAFT.md §27, question 8).
         - kind: lock
           target:
             object: object.stock
