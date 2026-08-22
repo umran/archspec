@@ -41,7 +41,8 @@ exists on the operation but no declared flow executes it. Effects owned
 by state-machine transitions are attributed to the operations that
 execute them through intents and marked "via transition". Click
 anything for a structured detail panel; double-click an operation to
-drill in. The filter box dims non-matching vertices.
+drill in. The top bar's filter box dims non-matching vertices, and a
+fit control in the canvas corner re-centres the graph.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, concurrency, transaction and
@@ -89,6 +90,13 @@ requirement, or graph edge — opens a detail panel organized into
 collapsible, counted sections (execution, inputs, declared effects,
 requirements, obligations, …) with key/value grids, typed badges, and
 clickable ids that open the referenced entity in place.
+
+**Top bar.** Model name and revision, breadcrumbs for the current
+page, and — when a report is loaded — a "Verdicts" switch that turns
+the proof-status colouring on or off across every view, and an
+"Obligations" button carrying the report's tally that opens the
+obligations panel. The bar shares the pages' content column, so its
+edges line up with the page headers beneath it.
 
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a

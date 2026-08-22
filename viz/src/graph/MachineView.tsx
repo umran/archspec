@@ -131,7 +131,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
           </dl>
         </header>
 
-        <SectionCard title="State graph" hint="legal states and the transitions between them; ⚡ counts a transition's side effects">
+        <SectionCard title="State graph" hint="legal states and the transitions between them; ⚡ counts a transition's side effects" bodyClassName="p-4">
           <div className="overflow-x-auto">
             <div className="relative rounded-lg border border-kumo-hairline bg-kumo-elevated/30" style={{ width, height }}>
               <svg className="absolute inset-0" width={width} height={height} style={{ pointerEvents: "none" }}>
@@ -220,7 +220,6 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
           title="Transitions"
           count={transitions.length}
           hint="each with its side effects and the transaction steps that take it"
-          bodyClassName="p-0"
         >
           <div className="overflow-x-auto">
             <Table>

@@ -1,3 +1,6 @@
+import { Button } from "@cloudflare/kumo/components/button";
+import { Tooltip } from "@cloudflare/kumo/components/tooltip";
+import { ArrowsOutIcon } from "@phosphor-icons/react";
 import { Empty } from "@cloudflare/kumo/components/empty";
 import { GraphIcon } from "@phosphor-icons/react";
 import { useEffect, useLayoutEffect, useRef, type MouseEvent, type ReactNode } from "react";
@@ -111,6 +114,13 @@ export function SvgCanvas({ children, legend, empty }: Props) {
           {children}
         </g>
       </svg>
+      {/* The fit control belongs to the canvas it acts on. */}
+      <div className="absolute bottom-4 right-4">
+        <Tooltip
+          content="Fit graph to view"
+          render={<Button variant="secondary" size="sm" shape="square" icon={ArrowsOutIcon} aria-label="Fit graph to view" onClick={app.requestFit} />}
+        />
+      </div>
       <div className="pointer-events-none absolute bottom-4 left-4 flex flex-col gap-1 rounded-lg border border-kumo-hairline bg-kumo-base/90 px-3 py-2 text-xs text-kumo-subtle backdrop-blur">
         {legend}
       </div>

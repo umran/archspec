@@ -24,14 +24,17 @@ function Shell() {
   const showObligations = obligationsOpen && !!report;
 
   return (
-    <div className="flex h-full flex-col bg-kumo-canvas text-kumo-default">
-      <TopBar />
-      <div className="relative flex min-h-0 flex-1">
-        <main className="relative min-w-0 flex-1">
+    <div className="relative flex h-full bg-kumo-canvas text-kumo-default">
+      <main className="flex min-w-0 flex-1 flex-col">
+        <TopBar />
+        <div className="relative min-h-0 flex-1">
           {route.view === "system" && <SystemView />}
           {route.view === "op" && <OperationView id={route.id} />}
           {route.view === "machine" && <MachineView id={route.id} highlight={route.highlight} />}
-        </main>
+        </div>
+      </main>
+      {(detail || showObligations) && (
+        <>
         {detail && (
           <aside
             className={`absolute inset-y-0 z-10 w-[380px] shrink-0 border-l border-kumo-hairline bg-kumo-base shadow-xl xl:static xl:shadow-none ${showObligations ? "right-[400px]" : "right-0"}`}
@@ -44,7 +47,8 @@ function Shell() {
             <ObligationsPanel />
           </aside>
         )}
-      </div>
+        </>
+      )}
     </div>
   );
 }

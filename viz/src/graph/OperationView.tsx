@@ -512,7 +512,7 @@ export function OperationView({ id }: { id: string }) {
 
   return (
     <div className="h-full overflow-auto">
-      <div className="@container mx-auto max-w-[1240px] space-y-6 p-6">
+      <div className="mx-auto max-w-[1240px] space-y-6 p-6">
         <header className="space-y-4 border-b border-kumo-hairline pb-5">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <Text variant="heading2" as="h1">{shortId(id)}</Text>
@@ -537,26 +537,23 @@ export function OperationView({ id }: { id: string }) {
           </dl>
         </header>
 
-        {/* Sized by the pane (a container), not the window: the detail and
-            obligation asides take room the viewport width doesn't reflect. */}
-        <div className="grid gap-6 @5xl:grid-cols-2">
-          <SectionCard title="Requirements" count={requirementCount} hint="proof obligations on every invocation" bodyClassName="p-0">
-            <div className="overflow-x-auto">
-              <RequirementsTable id={id} op={op} />
-            </div>
-          </SectionCard>
-          <SectionCard title="Inputs" count={inputCount} hint="what starts an invocation" bodyClassName="p-0">
-            <div className="overflow-x-auto">
-              <InputsTable op={op} />
-            </div>
-          </SectionCard>
-        </div>
+        <SectionCard title="Requirements" count={requirementCount} hint="proof obligations on every invocation">
+          <div className="overflow-x-auto">
+            <RequirementsTable id={id} op={op} />
+          </div>
+        </SectionCard>
+
+        <SectionCard title="Inputs" count={inputCount} hint="what starts an invocation">
+          <div className="overflow-x-auto">
+            <InputsTable op={op} />
+          </div>
+        </SectionCard>
 
         <SectionCard
           title="Flows"
           count={flowIds.length}
           hint="alternative invocation paths — an invocation takes exactly one"
-          bodyClassName="@container gap-4"
+          bodyClassName="@container space-y-4 p-4"
         >
           {activeFlow ? (
             <>

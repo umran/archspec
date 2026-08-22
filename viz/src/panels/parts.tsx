@@ -65,21 +65,22 @@ export function Section({
   );
 }
 
-/** A titled page section: Kumo's layered card, a header band above an
- *  inset body. */
+/** A titled page section: a heading row over a single Kumo surface. The
+ *  surface carries no header of its own, so a table inside it has exactly
+ *  one header — its column row. */
 export function SectionCard({
   title, count, hint, aside, bodyClassName, children,
 }: { title: string; count?: number; hint?: string; aside?: ReactNode; bodyClassName?: string; children: ReactNode }) {
   return (
-    <LayerCard render={<section />}>
-      <LayerCard.Secondary className="flex-wrap gap-x-3 gap-y-1">
-        <span className="text-sm font-semibold text-kumo-default">{title}</span>
+    <section className="space-y-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <h2 className="text-sm font-semibold text-kumo-default">{title}</h2>
         {count !== undefined && <Badge variant="neutral">{count}</Badge>}
-        {hint && <span className="text-xs font-normal text-kumo-inactive">{hint}</span>}
+        {hint && <span className="text-xs text-kumo-inactive">{hint}</span>}
         {aside && <span className="ml-auto flex items-center gap-2">{aside}</span>}
-      </LayerCard.Secondary>
-      <LayerCard.Primary className={bodyClassName}>{children}</LayerCard.Primary>
-    </LayerCard>
+      </div>
+      <LayerCard className={bodyClassName}>{children}</LayerCard>
+    </section>
   );
 }
 
