@@ -28,10 +28,10 @@ export function TopBar() {
   return (
     <header className="shrink-0 border-b border-kumo-hairline bg-kumo-base">
       <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-4 px-6">
-        <div className="flex shrink-0 items-baseline gap-2">
-          <span className="font-mono text-sm font-semibold tracking-wide text-kumo-brand">archspec</span>
-          <span className="text-sm font-semibold text-kumo-strong">{data.title}</span>
-          <Badge variant="neutral">rev {model.revision}</Badge>
+        <div className="flex shrink-0 items-baseline gap-2 text-sm">
+          <span className="text-kumo-subtle">archspec</span>
+          <span className="font-medium text-kumo-strong">{data.title}</span>
+          <span className="text-xs text-kumo-subtle">rev {model.revision}</span>
           {report && report.model_revision !== null && report.model_revision !== model.revision && (
             <Badge variant="warning">report @ rev {report.model_revision}</Badge>
           )}
