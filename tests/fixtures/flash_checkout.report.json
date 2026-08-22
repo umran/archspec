@@ -54,7 +54,8 @@
       "summary": "Repeated attempts at operation.apply_payment sharing the declared key produce the effects of a single invocation.",
       "assumptions": [
         "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
-        "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)"
+        "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
+        "no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic"
       ],
       "evidence": []
     },
@@ -145,13 +146,15 @@
         "operation": "operation.create_order",
         "requirement": 0
       },
-      "status": "proven",
+      "status": "unknown",
       "summary": "Repeated attempts at operation.create_order sharing the declared key produce the effects of a single invocation.",
-      "assumptions": [
-        "tx.create_order.new commits are deduplicated by input.create_order.request.idempotency_key, stable across the attempt class",
-        "duplicate executions of effect.create_order.publish_created publish the same logical message under topic.order_events's message identity (intent intent.create_order.publish_created is recovered from tx.create_order.new's keyed commit)"
-      ],
-      "evidence": []
+      "assumptions": [],
+      "evidence": [
+        {
+          "subject": "operation.reserve_inventory",
+          "message": "Flow `flow.create_order.new` publishes `schema.OrderCreated` to `topic.order_events` through `effect.create_order.publish_created`, and `operation.reserve_inventory` consumes it through `input.reserve_inventory.created`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
+        }
+      ]
     },
     {
       "id": "oblig.operation.create_order.response_replay.0",
@@ -244,6 +247,10 @@
         {
           "subject": "tx.reserve_inventory",
           "message": "A duplicate attempt re-drives flow `flow.reserve_inventory` and re-encounters `tx.reserve_inventory`, which is retry-safe by neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
+        },
+        {
+          "subject": "operation.charge_payment",
+          "message": "Flow `flow.reserve_inventory` publishes `schema.InventoryReserved` to `topic.order_events` through `effect.reserve_inventory.publish_reserved`, and `operation.charge_payment` consumes it through `input.charge_payment.reserved`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
         },
         {
           "subject": "tx.reserve_inventory",

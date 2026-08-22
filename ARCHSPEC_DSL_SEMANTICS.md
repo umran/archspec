@@ -595,7 +595,7 @@ These mechanisms are not interchangeable. A transaction that merely prevents a s
 
 The requirement is not discharged merely because the operation has a field named `idempotency_key`, because an `InvocationResult` exists, or because an `EffectIntent` exists.
 
-V1 discharges the requirement over each admitted flow — one with no response, or one with the triggering input's response — under the governing key's population (§12). Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole flow even after terminal completion. Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14). Response consistency is the separate response-replay obligation below. Vacuously discharged: an empty population; no admitted flow, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
+V1 discharges the requirement over each admitted flow — one with no response, or one with the triggering input's response — under the governing key's population (§12). Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole flow even after terminal completion. Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer collapses duplicate deliveries, each through its own proven requirement. A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a least fixpoint. Response consistency is the separate response-replay obligation below. Vacuously discharged: an empty population; no admitted flow, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
 
 ### `ResponseReplayRequirement::replay_consistent`
 
@@ -680,6 +680,8 @@ A recoverability requirement makes retries *expected* rather than merely *possib
 
 - **recoverability without idempotency** is coherent where repeating the work is harmless;
 - **idempotency without recoverability** is coherent where best-effort completion is acceptable.
+
+The checker does not couple them either, but it says when the coupling is absent: a `guaranteed` recoverability proof for an operation that declares no idempotency requirement keyed from the triggering input carries a warning, because the driver makes retries expected and nothing declares them safe.
 
 Neither implies exactly-once external execution. Driving a flow to termination still leaves the effect-level uncertainty described in §14: an external effect may have succeeded before a crash without that success being durably known.
 
@@ -845,9 +847,14 @@ Those properties require additional structure/facts.
 
 ### Duplicate publication
 
-For an upstream idempotency requirement, a duplicate execution of a publication effect is safe exactly when the topic declares a keyed message identity mapping the published schema (§6) and the published instance is class-fixed — replay-deterministic for a direct execution, or an intent replay-available by route A or B of §17. Every attempt then publishes the **same logical message**, so the duplicate creates no new logical work: at most it raises delivery multiplicity, which the topic's delivery semantics already admit and every consumer's own obligations must handle regardless.
+For an upstream idempotency requirement, a duplicate execution of a publication effect is safe exactly when:
 
-`idempotency_key_propagation` plays no role in this discharge: propagation is lineage for the consumer's analysis (§12) and deduplicates nothing on the publishing side.
+1. the topic declares a keyed message identity mapping the published schema (§6) and the published instance is class-fixed — replay-deterministic for a direct execution, or an intent replay-available by route A or B of §17 — so that every attempt publishes the **same logical message**; and
+2. every modeled consumer of that message collapses duplicate deliveries of it. A consumer is an operation subscribing to the topic with a message selection admitting the schema; it collapses duplicates either through an idempotency requirement keyed from that subscription that is itself proven, or by receiving the subscription with `at_most_once` delivery, under which one logical message is delivered no more than once however often it is published.
+
+Condition 1 makes the duplicate no new logical work *at the topic*: at most it raises delivery multiplicity. Condition 2 makes it no new logical work anywhere the model can see. Delivery multiplicity is a degree of freedom the topic contract admits, but the work a redelivery causes in a consumer is still work the upstream attempt caused, and the requirement's "must not cause" is transitive: an operation whose retries double a downstream card charge is not idempotent, however faithfully it republishes one message. A consumer the model does not contain is outside the proof, which is conditional on the model's closed world of consumers (§1.3). Producer and consumer verdicts are mutually dependent; V1 computes them together with request discharge (§13.2) as a least fixpoint, and publication cycles settle unproven.
+
+`idempotency_key_propagation` plays no role in this discharge: a class-fixed instance already makes every duplicate payload-equal, so a consumer's key evaluates equally across them whichever fields it reads. Propagation remains lineage for the consumer's analysis (§12) and deduplicates nothing on the publishing side.
 
 ## 13.2 Request effect
 

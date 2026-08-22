@@ -18,10 +18,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
-    self, ArtifactReplay, EffectSafety, IdempotencyProof, IdempotencyVerdict, InstanceStability,
-    KeyIdentity, RecoverabilityProof, RecoverabilityVerdict, Resolution, ResponseReplayProof,
-    ResponseReplayVerdict, RetryDriver, RetryRoute, SerializationProof, SerializationVerdict,
-    StableRoot, VerificationReport,
+    self, ArtifactReplay, ConsumerCollapse, EffectSafety, IdempotencyProof, IdempotencyVerdict,
+    InstanceStability, KeyIdentity, RecoverabilityProof, RecoverabilityVerdict, Resolution,
+    ResponseReplayProof, ResponseReplayVerdict, RetryDriver, RetryRoute, SerializationProof,
+    SerializationVerdict, StableRoot, VerificationReport,
 };
 use crate::spec::{
     CompletionRequirement, Id, Model, ObjectHistoryRequirement, ValueRef, ValueSource,
@@ -369,6 +369,23 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             RecoverabilityVerdict::Proven { proof } => Ok(recoverability_assumptions(proof)),
             RecoverabilityVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        // Notes ride along as evidence: facts a reader wants next to
+        // the verdict, which they do not change.
+        if let Some(obligation) = report
+            .obligations
+            .iter_mut()
+            .find(|obligation| obligation.id == id)
+        {
+            obligation.evidence.extend(check.notes.iter().map(|note| {
+                let evidence = note.evidence();
+
+                EvidenceItem {
+                    subject: evidence.subject,
+                    message: evidence.message,
+                }
+            }));
+        }
     }
 
     report
@@ -532,34 +549,68 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                 }
 
                 for effect in &flow.effects {
-                    assumptions.push(match &effect.safety {
-                        EffectSafety::ExternallyDeduplicated { key } => format!(
+                    match &effect.safety {
+                        EffectSafety::ExternallyDeduplicated { key } => assumptions.push(format!(
                             "{prefix}the external boundary of {} deduplicates \
                              executions sharing {}",
                             effect.effect,
                             root_labels(key)
-                        ),
+                        )),
 
-                        EffectSafety::SameLogicalMessage { topic, instance } => format!(
-                            "{prefix}duplicate executions of {} publish the same \
-                             logical message under {topic}'s message identity \
-                             ({})",
-                            effect.effect,
-                            instance_label(instance)
-                        ),
+                        EffectSafety::SameLogicalMessage {
+                            topic,
+                            schema,
+                            instance,
+                            consumers,
+                        } => {
+                            assumptions.push(format!(
+                                "{prefix}duplicate executions of {} publish the same \
+                                 logical message under {topic}'s message identity \
+                                 ({})",
+                                effect.effect,
+                                instance_label(instance)
+                            ));
+
+                            if consumers.is_empty() {
+                                assumptions.push(format!(
+                                    "{prefix}no modeled subscription on {topic} admits \
+                                     {schema}; the cascade ends at the topic"
+                                ));
+                            }
+
+                            for consumer in consumers {
+                                assumptions.push(match consumer {
+                                    ConsumerCollapse::ProvenRequirement { operation, input } => {
+                                        format!(
+                                            "{prefix}duplicate deliveries of {schema} to \
+                                             {operation} via {input} fall into one proven \
+                                             idempotency class"
+                                        )
+                                    }
+
+                                    ConsumerCollapse::SingleDelivery { operation, input } => {
+                                        format!(
+                                            "{prefix}{operation} via {input} receives \
+                                             {schema} at most once: one logical message \
+                                             under at-most-once delivery"
+                                        )
+                                    }
+                                });
+                            }
+                        }
 
                         EffectSafety::DeduplicatedByTarget {
                             operation,
                             input,
                             instance,
-                        } => format!(
+                        } => assumptions.push(format!(
                             "{prefix}duplicate requests of {} fall into one \
                              proven idempotency class of {operation} via {input} \
                              ({})",
                             effect.effect,
                             instance_label(instance)
-                        ),
-                    });
+                        )),
+                    }
                 }
             }
 

@@ -64,6 +64,7 @@ use super::describe::{gap_sentences, governing_key_evidence};
 use super::replay::{
     ArtifactReplay, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StableRoot, predicate_roots,
 };
+use super::trigger::collapses_duplicates;
 
 /// The verdict for one declared recoverability requirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +81,10 @@ pub struct RecoverabilityCheck {
     pub completion: CompletionRequirement,
 
     pub verdict: RecoverabilityVerdict,
+
+    /// Facts that do not bear on the verdict but belong next to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<RecoverabilityNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,24 +223,40 @@ pub enum RecoverabilityObstacle {
     },
 }
 
+/// A fact that does not bear on a verdict but belongs next to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoverabilityNote {
+    /// Completion is guaranteed by a retry driver, so repeated
+    /// attempts are expected — yet the operation declares no
+    /// idempotency requirement keyed from the triggering input, so
+    /// the safety of those retries is undeclared and unverified.
+    /// Recoverability discharges progress only (§9); this is where a
+    /// reader would look for the safety half.
+    RetrySafetyUndeclared { input: Id },
+}
+
 /// Checks every recoverability requirement declared by the model.
 pub fn check(model: &Model) -> Vec<RecoverabilityCheck> {
     let mut checks = Vec::new();
 
     for (operation_id, operation) in &model.operations {
         for (index, requirement) in operation.requirements.recoverability.iter().enumerate() {
+            let (verdict, notes) = check_requirement(
+                model,
+                operation_id,
+                operation,
+                &requirement.key,
+                requirement.completion,
+            );
+
             checks.push(RecoverabilityCheck {
                 operation: operation_id.clone(),
                 requirement: index,
                 key: requirement.key.clone(),
                 completion: requirement.completion,
-                verdict: check_requirement(
-                    model,
-                    operation_id,
-                    operation,
-                    &requirement.key,
-                    requirement.completion,
-                ),
+                verdict,
+                notes,
             });
         }
     }
@@ -249,23 +270,29 @@ fn check_requirement(
     operation: &Operation,
     key: &IdempotencyKey,
     completion: CompletionRequirement,
-) -> RecoverabilityVerdict {
+) -> (RecoverabilityVerdict, Vec<RecoverabilityNote>) {
     let analysis = match ReplayAnalysis::new(model, operation, key) {
         Ok(analysis) => analysis,
 
         Err(defect) => {
-            return RecoverabilityVerdict::Unproven {
-                obstacles: vec![RecoverabilityObstacle::GoverningKeyInadmissible { defect }],
-            };
+            return (
+                RecoverabilityVerdict::Unproven {
+                    obstacles: vec![RecoverabilityObstacle::GoverningKeyInadmissible { defect }],
+                },
+                Vec::new(),
+            );
         }
     };
 
     if analysis.admits_no_attempts() {
-        return RecoverabilityVerdict::Proven {
-            proof: RecoverabilityProof::NoAdmittedInvocations {
-                input: analysis.input().clone(),
+        return (
+            RecoverabilityVerdict::Proven {
+                proof: RecoverabilityProof::NoAdmittedInvocations {
+                    input: analysis.input().clone(),
+                },
             },
-        };
+            Vec::new(),
+        );
     }
 
     // Flows an invocation of the triggering input can complete.
@@ -319,15 +346,29 @@ fn check_requirement(
     };
 
     if !obstacles.is_empty() {
-        return RecoverabilityVerdict::Unproven { obstacles };
+        return (RecoverabilityVerdict::Unproven { obstacles }, Vec::new());
     }
 
-    RecoverabilityVerdict::Proven {
-        proof: match driver {
-            None => RecoverabilityProof::Resumable { flows },
-            Some(driver) => RecoverabilityProof::Guaranteed { driver, flows },
-        },
+    // A driver makes retries expected. Recoverability says nothing
+    // about their safety, so when no idempotency requirement keyed
+    // from the triggering input does either, say so next to the proof.
+    let mut notes = Vec::new();
+
+    if driver.is_some() && !collapses_duplicates(operation, analysis.input()) {
+        notes.push(RecoverabilityNote::RetrySafetyUndeclared {
+            input: analysis.input().clone(),
+        });
     }
+
+    (
+        RecoverabilityVerdict::Proven {
+            proof: match driver {
+                None => RecoverabilityProof::Resumable { flows },
+                Some(driver) => RecoverabilityProof::Guaranteed { driver, flows },
+            },
+        },
+        notes,
+    )
 }
 
 /// The same-flow continuation analysis for one admitted flow. Returns
@@ -630,7 +671,51 @@ fn find_driver(
     }
 }
 
+impl RecoverabilityNote {
+    pub fn evidence(&self) -> Evidence {
+        match self {
+            Self::RetrySafetyUndeclared { input } => Evidence {
+                subject: Some(input.clone()),
+                message: format!(
+                    "Completion is guaranteed by re-driving invocations of \
+                     `{input}`, so repeated attempts are expected, but no \
+                     idempotency requirement keyed from `{input}` declares them \
+                     safe; recoverability establishes progress only."
+                ),
+            },
+        }
+    }
+
+    fn diagnostic(&self, operation: &Id, requirement: usize) -> Diagnostic {
+        match self {
+            Self::RetrySafetyUndeclared { input } => Diagnostic {
+                code: DiagnosticCode::Verification(
+                    VerificationCode::RecoverabilityRetrySafetyUndeclared,
+                ),
+                severity: Severity::Warning,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Recoverability requirement {requirement} of `{operation}` \
+                     guarantees completion through retries, but `{operation}` \
+                     declares no idempotency requirement keyed from `{input}`: \
+                     the retries are expected, and their safety is undeclared \
+                     and unverified."
+                ),
+                evidence: vec![self.evidence()],
+            },
+        }
+    }
+}
+
 impl RecoverabilityCheck {
+    /// Warnings worth raising next to a proven verdict.
+    pub fn note_diagnostics(&self) -> Vec<Diagnostic> {
+        self.notes
+            .iter()
+            .map(|note| note.diagnostic(&self.operation, self.requirement))
+            .collect()
+    }
+
     /// The diagnostic for an unproven requirement; a proven one
     /// produces none.
     pub fn diagnostic(&self) -> Option<Diagnostic> {

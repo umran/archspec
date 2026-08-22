@@ -14,8 +14,10 @@
 //! recoverability (`recoverability`), and operation idempotency
 //! (`idempotency`). The latter three share the replay engine
 //! (`replay`): root stability, natural transaction replayability, and
-//! artifact replay availability. Of the §9 requirement families only
-//! ordering remains, pending its precedence-source semantics.
+//! artifact replay availability. Verifiers that follow effects into
+//! other operations share the trigger graph (`trigger`). Of the §9
+//! requirement families only ordering remains, pending its
+//! precedence-source semantics.
 //!
 //! Two rules govern every verdict:
 //!
@@ -44,16 +46,18 @@ pub mod recoverability;
 pub mod replay;
 pub mod response_replay;
 pub mod serialization;
+pub mod trigger;
 pub mod value_identity;
 
 pub use idempotency::{
-    EffectRetrySafety, EffectSafety, FlowRetrySafety, IdempotencyCheck, IdempotencyObstacle,
-    IdempotencyProof, IdempotencyVerdict, InstanceStability, RetryRoute, TransactionRetrySafety,
-    UnstableRoot,
+    ConsumerCollapse, EffectRetrySafety, EffectSafety, FlowRetrySafety, IdempotencyCheck,
+    IdempotencyObstacle, IdempotencyProof, IdempotencyVerdict, InstanceStability, RetryRoute,
+    TransactionRetrySafety, UnstableRoot,
 };
 pub use recoverability::{
-    ArtifactAvailability, FlowResumption, RecoverabilityCheck, RecoverabilityObstacle,
-    RecoverabilityProof, RecoverabilityVerdict, Resolution, RetryDriver, TransactionResolution,
+    ArtifactAvailability, FlowResumption, RecoverabilityCheck, RecoverabilityNote,
+    RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, Resolution, RetryDriver,
+    TransactionResolution,
 };
 pub use replay::{
     ArtifactReplay, GoverningKeyDefect, PayloadIdentityGap, ReplayAnalysis, ReplayGap,
@@ -67,6 +71,7 @@ pub use serialization::{
     KeyIdentity, MessageKeyFact, SerializationCheck, SerializationObstacle, SerializationProof,
     SerializationVerdict,
 };
+pub use trigger::{Consumer, TriggerGraph, collapses_duplicates};
 pub use value_identity::{CanonicalValuePath, canonical_value_path};
 
 use crate::analyzer::Diagnostic;
@@ -84,10 +89,13 @@ pub struct VerificationReport {
 }
 
 impl VerificationReport {
-    /// Diagnostics for the requirements the model does not establish.
+    /// Diagnostics for the requirements the model does not establish,
+    /// and warnings raised next to proven ones.
     ///
-    /// Proven requirements produce no diagnostics; their arguments
-    /// live in the structured verdicts.
+    /// A proven requirement's argument lives in its structured
+    /// verdict; it produces a diagnostic only for a note worth
+    /// raising alongside, such as guaranteed retries whose safety no
+    /// requirement declares.
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
         self.serialization
             .iter()
@@ -106,6 +114,11 @@ impl VerificationReport {
                 self.recoverability
                     .iter()
                     .filter_map(RecoverabilityCheck::diagnostic),
+            )
+            .chain(
+                self.recoverability
+                    .iter()
+                    .flat_map(RecoverabilityCheck::note_diagnostics),
             )
             .collect()
     }

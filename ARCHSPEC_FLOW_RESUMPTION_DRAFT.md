@@ -164,6 +164,14 @@ success; and a request input with no modeled `may_repeat` caller
 supplies no driver, so `guaranteed` on such an operation is
 undischargeable, with the missing driver recorded.
 
+A driver makes retries *expected*. Recoverability says nothing about
+their safety (§6.4), so when the operation also declares no
+idempotency requirement keyed from the triggering input, the proof
+carries a warning: the retries that guarantee completion have
+undeclared, unverified safety. The verdict is unchanged — progress is
+progress — but a reader would look for the safety half exactly there,
+and the model has not supplied it.
+
 ---
 
 ## 5. Worked outcomes on the flash-checkout fixture

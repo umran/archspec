@@ -56,6 +56,12 @@ pub enum VerificationCode {
     /// A declared idempotency requirement is not established by the
     /// declared facts. Epistemic, not a violation (§1.2).
     IdempotencyUnproven,
+
+    /// A recoverability requirement is proven with completion
+    /// guaranteed by retries, but no idempotency requirement keyed
+    /// from the triggering input declares those retries safe. A
+    /// consistency warning, not a verdict.
+    RecoverabilityRetrySafetyUndeclared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

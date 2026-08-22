@@ -20,16 +20,23 @@
 //!   site (§14 — even a recovered intent may re-execute when a crash
 //!   hides a prior success), so each site must be duplicate-safe:
 //!   an external effect through its declared `deduplicated_by` over a
-//!   stable key; a publication by being the *same logical message* —
-//!   a class-fixed instance published to a topic whose message
-//!   identity maps the schema; a request by targeting an input whose
-//!   operation carries a proven idempotency requirement keyed from
-//!   that input, fed by a class-fixed instance.
+//!   stable key; a request by targeting an input whose operation
+//!   carries a proven idempotency requirement keyed from that input,
+//!   fed by a class-fixed instance; a publication by being the *same
+//!   logical message* — a class-fixed instance published to a topic
+//!   whose message identity maps the schema — **and** by every modeled
+//!   consumer of that message collapsing duplicate deliveries of it:
+//!   a proven idempotency requirement keyed from the subscription, or
+//!   `at_most_once` delivery of the one logical message.
 //!
-//! Request discharge makes verdicts mutually dependent, so `check`
-//! computes a least fixpoint: requirements are re-checked as their
-//! request targets become proven, and cyclic dependencies settle
-//! unproven — the conservative answer.
+//! The request and publication legs follow the trigger graph
+//! (`trigger`): duplicate work an attempt causes downstream is still
+//! work it caused, so a requirement is proven only when the cascade
+//! it starts collapses everywhere the model can see. That makes
+//! verdicts mutually dependent, so `check` computes a least fixpoint:
+//! requirements are re-checked as their request targets and message
+//! consumers become proven, and cyclic dependencies settle unproven —
+//! the conservative answer.
 //!
 //! Response consistency is the separate response-replay obligation
 //! and is not re-checked here. Vacuous routes: an empty population,
@@ -55,6 +62,7 @@ use super::describe::{gap_sentences, governing_key_evidence, stability_sentence}
 use super::replay::{
     ArtifactReplay, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StabilityGap, StableRoot,
 };
+use super::trigger::{TriggerGraph, collapses_duplicates};
 
 /// The verdict for one declared idempotency requirement's side-effect
 /// obligation.
@@ -146,10 +154,17 @@ pub enum EffectSafety {
     /// stable key.
     ExternallyDeduplicated { key: Vec<StableRoot> },
 
-    /// Every attempt publishes the same logical message: the instance
+    /// Every attempt publishes the same logical message — the instance
     /// is class-fixed and the topic's message identity maps the
-    /// schema.
-    SameLogicalMessage { topic: Id, instance: InstanceStability },
+    /// schema — and every modeled consumer of it collapses duplicate
+    /// deliveries, so the cascade the publication starts performs the
+    /// work of one logical invocation everywhere the model can see.
+    SameLogicalMessage {
+        topic: Id,
+        schema: Id,
+        instance: InstanceStability,
+        consumers: Vec<ConsumerCollapse>,
+    },
 
     /// Every attempt sends payload-equal requests into one class of
     /// the target's proven idempotency requirement.
@@ -158,6 +173,21 @@ pub enum EffectSafety {
         input: Id,
         instance: InstanceStability,
     },
+}
+
+/// How a modeled consumer of a published message collapses duplicate
+/// deliveries of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsumerCollapse {
+    /// The consumer's idempotency requirement keyed from the
+    /// subscription is proven, so payload-equal deliveries fall into
+    /// one of its classes.
+    ProvenRequirement { operation: Id, input: Id },
+
+    /// The subscription's `at_most_once` delivery bounds one logical
+    /// message to at most one delivery, however often it is published.
+    SingleDelivery { operation: Id, input: Id },
 }
 
 /// Why every attempt constructs the same logical effect instance.
@@ -224,6 +254,30 @@ pub enum IdempotencyObstacle {
         schema: Id,
     },
 
+    /// A modeled consumer of the published message declares no
+    /// idempotency requirement keyed from its subscription, so nothing
+    /// collapses the duplicate work a duplicate delivery causes there.
+    PublicationConsumerNotKeyed {
+        flow: Id,
+        effect: Id,
+        topic: Id,
+        schema: Id,
+        operation: Id,
+        input: Id,
+    },
+
+    /// The consumer declares such a requirement, but it is not proven
+    /// in this analysis — including cyclic dependencies, which settle
+    /// unproven.
+    PublicationConsumerRequirementUnproven {
+        flow: Id,
+        effect: Id,
+        topic: Id,
+        schema: Id,
+        operation: Id,
+        input: Id,
+    },
+
     /// A direct execution declares no instance provenance, so the
     /// instances attempts construct are not class-fixed.
     EffectInstanceUnspecified { flow: Id, effect: Id },
@@ -288,13 +342,28 @@ enum Contract<'a> {
     External(&'a ExternalEffect),
 }
 
+/// What a check reads beyond the operation under analysis: the model,
+/// its trigger graph, and the requirements proven so far in the
+/// fixpoint, keyed by operation and triggering input.
+struct Scope<'a> {
+    model: &'a Model,
+    graph: &'a TriggerGraph<'a>,
+    proven: &'a BTreeSet<(Id, Id)>,
+}
+
 /// Checks every idempotency requirement declared by the model, as a
-/// least fixpoint over cross-operation request discharge.
+/// least fixpoint over cross-operation discharge through request
+/// targets and message consumers.
 pub fn check(model: &Model) -> Vec<IdempotencyCheck> {
+    let graph = TriggerGraph::new(model);
     let mut proven: BTreeSet<(Id, Id)> = BTreeSet::new();
 
     loop {
-        let checks = run(model, &proven);
+        let checks = run(&Scope {
+            model,
+            graph: &graph,
+            proven: &proven,
+        });
 
         let next: BTreeSet<(Id, Id)> = checks
             .iter()
@@ -318,16 +387,16 @@ fn key_input(key: &IdempotencyKey) -> Option<&Id> {
     }
 }
 
-fn run(model: &Model, proven: &BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
+fn run(scope: &Scope<'_>) -> Vec<IdempotencyCheck> {
     let mut checks = Vec::new();
 
-    for (operation_id, operation) in &model.operations {
+    for (operation_id, operation) in &scope.model.operations {
         for (index, requirement) in operation.requirements.idempotency.iter().enumerate() {
             checks.push(IdempotencyCheck {
                 operation: operation_id.clone(),
                 requirement: index,
                 key: requirement.key.clone(),
-                verdict: check_requirement(model, operation, &requirement.key, proven),
+                verdict: check_requirement(scope, operation, &requirement.key),
             });
         }
     }
@@ -336,12 +405,11 @@ fn run(model: &Model, proven: &BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
 }
 
 fn check_requirement(
-    model: &Model,
+    scope: &Scope<'_>,
     operation: &Operation,
     key: &IdempotencyKey,
-    proven: &BTreeSet<(Id, Id)>,
 ) -> IdempotencyVerdict {
-    let analysis = match ReplayAnalysis::new(model, operation, key) {
+    let analysis = match ReplayAnalysis::new(scope.model, operation, key) {
         Ok(analysis) => analysis,
 
         Err(defect) => {
@@ -399,7 +467,7 @@ fn check_requirement(
 
     for (flow_id, flow) in admitted {
         if let Some(safety) =
-            analyze_flow(model, &analysis, operation, flow_id, flow, proven, &mut obstacles)
+            analyze_flow(scope, &analysis, operation, flow_id, flow, &mut obstacles)
         {
             flows.push(safety);
         }
@@ -415,12 +483,11 @@ fn check_requirement(
 }
 
 fn analyze_flow(
-    model: &Model,
+    scope: &Scope<'_>,
     analysis: &ReplayAnalysis<'_>,
     operation: &Operation,
     flow_id: &Id,
     flow: &InvocationFlow,
-    proven: &BTreeSet<(Id, Id)>,
     obstacles: &mut Vec<IdempotencyObstacle>,
 ) -> Option<FlowRetrySafety> {
     let before = obstacles.len();
@@ -471,8 +538,7 @@ fn analyze_flow(
                 };
 
                 if let Some(safety) = contract_safety(
-                    model, analysis, &context, proven, flow_id, effect, &contract, instance,
-                    obstacles,
+                    scope, analysis, &context, flow_id, effect, &contract, instance, obstacles,
                 ) {
                     effects.push(EffectRetrySafety {
                         effect: effect.clone(),
@@ -489,7 +555,7 @@ fn analyze_flow(
                 let effect = &declaration.effect;
 
                 let Some(contract) = operation_contract(operation, effect)
-                    .or_else(|| transition_contract(model, effect))
+                    .or_else(|| transition_contract(scope.model, effect))
                 else {
                     continue;
                 };
@@ -499,8 +565,7 @@ fn analyze_flow(
                 };
 
                 if let Some(safety) = contract_safety(
-                    model, analysis, &context, proven, flow_id, effect, &contract, instance,
-                    obstacles,
+                    scope, analysis, &context, flow_id, effect, &contract, instance, obstacles,
                 ) {
                     effects.push(EffectRetrySafety {
                         effect: effect.clone(),
@@ -640,10 +705,9 @@ fn intent_instance(
 /// external boundary deduplicates by key alone.
 #[allow(clippy::too_many_arguments)]
 fn contract_safety(
-    model: &Model,
+    scope: &Scope<'_>,
     analysis: &ReplayAnalysis<'_>,
     context: &BTreeMap<Id, ArtifactReplay>,
-    proven: &BTreeSet<(Id, Id)>,
     flow: &Id,
     effect: &Id,
     contract: &Contract<'_>,
@@ -700,14 +764,15 @@ fn contract_safety(
         },
 
         Contract::Publication(publication) => {
-            let identified = model
-                .topics
-                .get(&publication.topic)
-                .is_some_and(|topic| match &topic.message_identity {
-                    MessageIdentity::Keyed { mapping } => {
-                        mapping.contains_key(&publication.schema)
-                    }
+            let topic = &publication.topic;
+            let schema = &publication.schema;
 
+            let identified = scope
+                .model
+                .topics
+                .get(topic)
+                .is_some_and(|topic| match &topic.message_identity {
+                    MessageIdentity::Keyed { mapping } => mapping.contains_key(schema),
                     MessageIdentity::Unspecified => false,
                 });
 
@@ -715,16 +780,65 @@ fn contract_safety(
                 obstacles.push(IdempotencyObstacle::PublicationNotIdentified {
                     flow: flow.clone(),
                     effect: effect.clone(),
-                    topic: publication.topic.clone(),
-                    schema: publication.schema.clone(),
+                    topic: topic.clone(),
+                    schema: schema.clone(),
                 });
+            }
+
+            // The cascade: one logical message still reaches every
+            // modeled consumer, and the duplicate work it would do
+            // there is work this attempt caused. Each consumer must
+            // collapse duplicate deliveries — by a proven requirement
+            // keyed from the subscription, or by never seeing a second
+            // delivery of the one message.
+            let mut consumers = Vec::new();
+            let mut collapsed = true;
+
+            for consumer in scope.graph.consumers(topic, schema) {
+                let operation = consumer.operation.clone();
+                let input = consumer.input.clone();
+
+                if identified && consumer.subscription.delivery == DeliverySemantics::AtMostOnce {
+                    consumers.push(ConsumerCollapse::SingleDelivery { operation, input });
+                } else if !scope
+                    .model
+                    .operations
+                    .get(consumer.operation)
+                    .is_some_and(|target| collapses_duplicates(target, consumer.input))
+                {
+                    collapsed = false;
+
+                    obstacles.push(IdempotencyObstacle::PublicationConsumerNotKeyed {
+                        flow: flow.clone(),
+                        effect: effect.clone(),
+                        topic: topic.clone(),
+                        schema: schema.clone(),
+                        operation,
+                        input,
+                    });
+                } else if !scope.proven.contains(&(operation.clone(), input.clone())) {
+                    collapsed = false;
+
+                    obstacles.push(IdempotencyObstacle::PublicationConsumerRequirementUnproven {
+                        flow: flow.clone(),
+                        effect: effect.clone(),
+                        topic: topic.clone(),
+                        schema: schema.clone(),
+                        operation,
+                        input,
+                    });
+                } else {
+                    consumers.push(ConsumerCollapse::ProvenRequirement { operation, input });
+                }
             }
 
             let instance = instance(obstacles)?;
 
-            identified.then_some(EffectSafety::SameLogicalMessage {
-                topic: publication.topic.clone(),
+            (identified && collapsed).then_some(EffectSafety::SameLogicalMessage {
+                topic: topic.clone(),
+                schema: schema.clone(),
                 instance,
+                consumers,
             })
         }
 
@@ -734,7 +848,8 @@ fn contract_safety(
 
             let mut target_ok = false;
 
-            match model
+            match scope
+                .model
                 .operations
                 .get(target_operation)
                 .and_then(|target| target.inputs.get(target_input).map(|input| (target, input)))
@@ -747,19 +862,15 @@ fn contract_safety(
                             expected: declared.schema.clone(),
                             actual: request.schema.clone(),
                         });
-                    } else if !target.requirements.idempotency.iter().any(|requirement| {
-                        !requirement.key.components.is_empty()
-                            && requirement.key.components.iter().all(|component| {
-                                component.source == ValueSource::Input(target_input.clone())
-                            })
-                    }) {
+                    } else if !collapses_duplicates(target, target_input) {
                         obstacles.push(IdempotencyObstacle::RequestTargetHasNoKeyedRequirement {
                             flow: flow.clone(),
                             effect: effect.clone(),
                             operation: target_operation.clone(),
                             input: target_input.clone(),
                         });
-                    } else if !proven
+                    } else if !scope
+                        .proven
                         .contains(&(target_operation.clone(), target_input.clone()))
                     {
                         obstacles.push(IdempotencyObstacle::RequestTargetRequirementUnproven {
@@ -894,6 +1005,42 @@ impl IdempotencyObstacle {
                      `{effect}`, but the topic declares no message identity for \
                      that schema, so duplicate publications are not established \
                      to be the same logical message."
+                ),
+            },
+
+            Self::PublicationConsumerNotKeyed {
+                flow,
+                effect,
+                topic,
+                schema,
+                operation,
+                input,
+            } => Evidence {
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Flow `{flow}` publishes `{schema}` to `{topic}` through \
+                     `{effect}`, and `{operation}` consumes it through `{input}` \
+                     with no idempotency requirement keyed from that input; \
+                     nothing collapses the duplicate work a duplicate delivery \
+                     causes there."
+                ),
+            },
+
+            Self::PublicationConsumerRequirementUnproven {
+                flow,
+                effect,
+                topic,
+                schema,
+                operation,
+                input,
+            } => Evidence {
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Flow `{flow}` publishes `{schema}` to `{topic}` through \
+                     `{effect}`, and `{operation}` consumes it through `{input}`, \
+                     whose idempotency requirement is not proven in this \
+                     analysis, so the duplicate work a duplicate delivery causes \
+                     there is not established to collapse."
                 ),
             },
 

@@ -7,16 +7,15 @@ use std::{
 
 use archspec::{
     analyzer::{
-        validation,
+        DiagnosticCode, Severity, VerificationCode, validation,
         verification::{
-            self, ArtifactReplay, EffectRetrySafety, EffectSafety, GoverningKeyDefect,
-            IdempotencyObstacle, IdempotencyProof, IdempotencyVerdict, InstanceStability,
-            KeyIdentity, PayloadIdentityGap, RecoverabilityObstacle, RecoverabilityProof,
-            RecoverabilityVerdict, ReplayGap, Resolution, ResponseReplayObstacle,
-            ResponseReplayProof, ResponseReplayVerdict, RetryDriver, RetryRoute,
+            self, ArtifactReplay, ConsumerCollapse, EffectRetrySafety, EffectSafety,
+            GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof, IdempotencyVerdict,
+            KeyIdentity, PayloadIdentityGap, RecoverabilityNote, RecoverabilityObstacle,
+            RecoverabilityProof, RecoverabilityVerdict, ReplayGap, Resolution,
+            ResponseReplayObstacle, ResponseReplayProof, ResponseReplayVerdict, RetryDriver,
             SerializationObstacle, SerializationProof, SerializationVerdict, StabilityGap,
-            StabilityRule, StableRoot, TransactionResolution, TransactionRetrySafety,
-            canonical_value_path,
+            StabilityRule, StableRoot, TransactionResolution, canonical_value_path,
         },
     },
     parser::yaml,
@@ -117,10 +116,11 @@ fn flash_checkout_serialization_requirements_are_proven() {
     );
 
     // The fixture's honest gaps: reserve_inventory's recoverability,
-    // reserve_inventory's idempotency, and charge_payment's
-    // idempotency (the not_deduplicated card charge).
+    // reserve_inventory's idempotency, charge_payment's idempotency
+    // (the not_deduplicated card charge), and create_order's
+    // idempotency through its cascade into reserve_inventory.
     assert!(!report.all_proven());
-    assert_eq!(report.diagnostics().len(), 3);
+    assert_eq!(report.diagnostics().len(), 4);
 }
 
 #[test]
@@ -211,9 +211,9 @@ fn request_input_key_without_global_bound_is_unproven() {
 
     let report = verification::verify(&model);
 
-    // The added serialization gap, plus the fixture's three standing
+    // The added serialization gap, plus the fixture's four standing
     // gaps.
-    assert_eq!(report.diagnostics().len(), 4);
+    assert_eq!(report.diagnostics().len(), 5);
 }
 
 #[test]
@@ -1680,36 +1680,30 @@ fn flash_checkout_idempotency_verdicts() {
     assert_eq!(report.idempotency.len(), 4);
 
     // create_order: keyed commit plus a recovered publication intent
-    // whose schema the topic identifies.
+    // whose schema the topic identifies — but its cascade does not
+    // collapse: reserve_inventory consumes OrderCreated, and its own
+    // requirement is unproven, so a retried create_order is not
+    // established to avoid duplicate work downstream.
     let verdict = idempotency_verdict(&model, "operation.create_order", 0);
 
-    let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
-    } = &verdict
-    else {
-        panic!("expected create_order proven, found {verdict:?}");
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected create_order unproven, found {verdict:?}");
     };
 
-    assert_eq!(flows.len(), 1);
-
-    assert!(matches!(
-        &flows[0].transactions[..],
-        [TransactionRetrySafety {
-            route: RetryRoute::KeyedCommit { .. },
-            ..
-        }]
-    ));
-
-    assert!(matches!(
-        &flows[0].effects[..],
-        [EffectRetrySafety {
-            safety: EffectSafety::SameLogicalMessage {
-                instance: InstanceStability::EstablishedIntent { .. },
+    assert!(
+        matches!(
+            &obstacles[..],
+            [IdempotencyObstacle::PublicationConsumerRequirementUnproven {
+                schema,
+                operation,
+                input,
                 ..
-            },
-            ..
-        }]
-    ));
+            }] if schema == &id("schema.OrderCreated")
+                && operation == &id("operation.reserve_inventory")
+                && input == &id("input.reserve_inventory.created")
+        ),
+        "expected only the cascade obstacle for create_order:\n{obstacles:#?}"
+    );
 
     // apply_payment: the transition transaction and its implicitly
     // established intent, both through the keyed commit.
@@ -1753,6 +1747,14 @@ fn flash_checkout_idempotency_verdicts() {
         obstacle,
         IdempotencyObstacle::IntentNotReplayAvailable { intent, .. }
             if intent == &id("intent.reserve_inventory.publish_reserved")
+    )));
+
+    // Its cascade reaches charge_payment, whose card charge is not
+    // deduplicated.
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        IdempotencyObstacle::PublicationConsumerRequirementUnproven { operation, .. }
+            if operation == &id("operation.charge_payment")
     )));
 }
 
@@ -1888,9 +1890,19 @@ fn single_delivery_discharges_idempotency_vacuously() {
 fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
     let mut model = load_flash_checkout();
 
+    // create_order's own requirement proves only when its cascade
+    // collapses: deliver OrderCreated to reserve_inventory at most
+    // once, so the one logical message reaches it once.
+    subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    )
+    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+
     // transfer_stock forwards a class-fixed request into create_order,
     // whose own idempotency requirement is proven; the fixpoint's
-    // second round discharges the request leg.
+    // rounds discharge the cascade and then the request leg.
     let operation = model
         .operations
         .get_mut(&id("operation.transfer_stock"))
@@ -2053,6 +2065,243 @@ fn cyclic_request_dependencies_settle_unproven() {
             "expected the cyclic request obstacle for `{operation}`:\n{obstacles:#?}"
         );
     }
+}
+
+#[test]
+fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
+    let mut model = load_flash_checkout();
+
+    // With the card charge deduplicated, charge_payment's remaining
+    // leg is its cascade: PaymentCaptured reaches apply_payment, whose
+    // own requirement the fixpoint proves in its first round, so the
+    // second round discharges the publication.
+    let Some(archspec::spec::Effect::External(card)) = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.charge_payment.card"))
+    else {
+        panic!("card charge should be an external effect");
+    };
+
+    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
+        key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
+    };
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafeFlows { flows },
+    } = &verdict
+    else {
+        panic!("expected charge_payment proven, found {verdict:?}");
+    };
+
+    assert!(matches!(
+        &flows[0].effects[..],
+        [
+            EffectRetrySafety {
+                safety: EffectSafety::ExternallyDeduplicated { .. },
+                ..
+            },
+            EffectRetrySafety {
+                safety: EffectSafety::SameLogicalMessage {
+                    schema,
+                    consumers,
+                    ..
+                },
+                ..
+            },
+        ] if schema == &id("schema.PaymentCaptured")
+            && consumers
+                == &vec![ConsumerCollapse::ProvenRequirement {
+                    operation: id("operation.apply_payment"),
+                    input: id("input.apply_payment.captured"),
+                }]
+    ));
+
+    // Without the consumer's requirement, nothing collapses the
+    // duplicate deliveries a duplicate publication causes there.
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .requirements
+        .idempotency
+        .clear();
+
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected charge_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        matches!(
+            &obstacles[..],
+            [IdempotencyObstacle::PublicationConsumerNotKeyed {
+                schema,
+                operation,
+                input,
+                ..
+            }] if schema == &id("schema.PaymentCaptured")
+                && operation == &id("operation.apply_payment")
+                && input == &id("input.apply_payment.captured")
+        ),
+        "expected the unkeyed-consumer obstacle:\n{obstacles:#?}"
+    );
+}
+
+#[test]
+fn at_most_once_consumers_collapse_duplicates_by_delivery() {
+    let mut model = load_flash_checkout();
+
+    // An at-most-once consumer never sees a second delivery of the one
+    // logical message, so it needs no requirement of its own.
+    subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    )
+    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+
+    model
+        .operations
+        .get_mut(&id("operation.reserve_inventory"))
+        .unwrap()
+        .requirements
+        .idempotency
+        .clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.create_order", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafeFlows { flows },
+    } = &verdict
+    else {
+        panic!("expected create_order proven, found {verdict:?}");
+    };
+
+    assert!(matches!(
+        &flows[0].effects[..],
+        [EffectRetrySafety {
+            safety: EffectSafety::SameLogicalMessage { consumers, .. },
+            ..
+        }] if consumers
+            == &vec![ConsumerCollapse::SingleDelivery {
+                operation: id("operation.reserve_inventory"),
+                input: id("input.reserve_inventory.created"),
+            }]
+    ));
+}
+
+#[test]
+fn cyclic_publication_dependencies_settle_unproven() {
+    let mut model = load_flash_checkout();
+
+    // apply_payment also consumes the OrderPaid it publishes, so its
+    // cascade collapses only if its own requirement is proven; the
+    // least fixpoint leaves it unproven.
+    subscription_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .messages = MessageSelector::Only(
+        [id("schema.PaymentCaptured"), id("schema.OrderPaid")]
+            .into_iter()
+            .collect(),
+    );
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected apply_payment unproven, found {verdict:?}");
+    };
+
+    assert!(
+        matches!(
+            &obstacles[..],
+            [IdempotencyObstacle::PublicationConsumerRequirementUnproven {
+                schema,
+                operation,
+                ..
+            }] if schema == &id("schema.OrderPaid")
+                && operation == &id("operation.apply_payment")
+        ),
+        "expected the cyclic cascade obstacle:\n{obstacles:#?}"
+    );
+}
+
+#[test]
+fn guaranteed_completion_without_keyed_idempotency_is_noted() {
+    let mut model = load_flash_checkout();
+
+    let apply_payment = |model: &Model| {
+        verification::verify(model)
+            .recoverability
+            .into_iter()
+            .find(|check| check.operation == id("operation.apply_payment"))
+            .expect("apply_payment declares recoverability")
+    };
+
+    // apply_payment guarantees completion through at-least-once
+    // redelivery and declares those retries safe with an idempotency
+    // requirement keyed from the same input: nothing to note.
+    let check = apply_payment(&model);
+
+    assert!(matches!(
+        check.verdict,
+        RecoverabilityVerdict::Proven {
+            proof: RecoverabilityProof::Guaranteed { .. }
+        }
+    ));
+
+    assert!(check.notes.is_empty());
+
+    // Without that requirement the proof stands — recoverability is
+    // progress only — but the expected retries have undeclared safety.
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .requirements
+        .idempotency
+        .clear();
+
+    assert!(validation::validate(&model).is_empty());
+
+    let check = apply_payment(&model);
+
+    assert!(matches!(check.verdict, RecoverabilityVerdict::Proven { .. }));
+
+    assert_eq!(
+        check.notes,
+        vec![RecoverabilityNote::RetrySafetyUndeclared {
+            input: id("input.apply_payment.captured"),
+        }]
+    );
+
+    let diagnostics = verification::verify(&model).diagnostics();
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.code
+                    == DiagnosticCode::Verification(
+                        VerificationCode::RecoverabilityRetrySafetyUndeclared,
+                    )
+                && diagnostic.subject == Some(id("operation.apply_payment"))
+        }),
+        "expected the retry-safety warning:\n{diagnostics:#?}"
+    );
 }
 
 #[test]

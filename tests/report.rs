@@ -90,11 +90,12 @@ fn obligations_carry_real_verdicts() {
             .count()
     };
 
-    // 3 serialization + create_order/apply_payment idempotency +
-    // create_order response replay + create_order/apply_payment
-    // recoverability.
-    assert_eq!(count(Status::Proven), 8);
-    assert_eq!(count(Status::Unknown), 8);
+    // 3 serialization + apply_payment idempotency + create_order
+    // response replay + create_order/apply_payment recoverability.
+    // create_order's idempotency is unknown through its cascade:
+    // reserve_inventory consumes OrderCreated and is itself unproven.
+    assert_eq!(count(Status::Proven), 7);
+    assert_eq!(count(Status::Unknown), 9);
     assert_eq!(count(Status::Disproven), 0);
 
     // Proven obligations state the facts their proofs rely on;

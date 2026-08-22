@@ -64,36 +64,61 @@ what may happen, not what does.
 
 ---
 
-## 3. Publications: same logical message
+## 3. Publications: same logical message, collapsed by every consumer
 
-A duplicate publication is discharged by message identity:
+A duplicate publication is discharged at the topic by message
+identity, and downstream by the consumers of that message:
 
 > A duplicate execution of a publication effect is safe iff the topic
-> declares a keyed message identity mapping the published schema, and
-> the published instance is class-fixed.
+> declares a keyed message identity mapping the published schema, the
+> published instance is class-fixed, **and** every modeled consumer of
+> the message collapses duplicate deliveries of it: an operation
+> subscribing to the topic with a message selection admitting the
+> schema either holds a proven idempotency requirement keyed from that
+> subscription, or receives it with `at_most_once` delivery.
 
-*Soundness.* A class-fixed instance makes every attempt publish
-payload-equal messages, hence equal identity tuples; by the declared
-guarantee they are the **same logical message**. The duplicate
-therefore creates no new logical work — at most it raises delivery
-multiplicity, and delivery multiplicity is already an admitted degree
-of freedom of the topic's delivery semantics, which every consumer's
-own obligations must handle regardless (`at_least_once` admits
-redelivery with or without duplicate publication; `at_most_once`
-bounds deliveries of one logical message however often it is
-published).
+*Soundness at the topic.* A class-fixed instance makes every attempt
+publish payload-equal messages, hence equal identity tuples; by the
+declared guarantee they are the **same logical message**. The
+duplicate therefore creates no new logical work *there* — at most it
+raises delivery multiplicity.
+
+*Soundness downstream.* Delivery multiplicity is an admitted degree
+of freedom of the topic's delivery semantics, but the work a
+redelivery causes in a consumer is still work the upstream attempt
+caused, and the requirement's "must not cause" is transitive. Each
+consumer collapses it by one of two facts. Payload-equal deliveries
+evaluate the consumer's key equally, so they fall into one class of a
+requirement keyed from the subscription; that requirement being proven
+means the class performs the work of one logical invocation — and,
+recursively, that its own cascade collapses. Or `at_most_once`
+delivery bounds the one logical message to at most one delivery,
+however often it is published, so the consumer never sees a second.
+
+An earlier version of this document stopped at the topic, on the
+argument that consumers must handle redelivery anyway. That argument
+explains why the producer is not *to blame* for a consumer's defect;
+it does not make the producer idempotent. On the flash-checkout
+fixture it proved `create_order` while a retried `create_order` could
+charge a card twice through `reserve_inventory` and `charge_payment`.
+The consumer leg closes exactly that gap, and — because a consumer
+that declares no requirement is checked nowhere else — it is also
+where such a consumer first becomes visible.
 
 This does not quietly turn identity into a mechanism. The §24
 distinction stands: the identity fixes *what* the repeated
-publications are — one message — and the admitted delivery semantics
-govern how often anything downstream observes it. Without the identity
-declaration, or with an instance that is not class-fixed, two
-publications are not established to be one message, and the duplicate
-is unproven-safe.
+publications are — one message — and the consumers' mechanisms fix
+what that one message can do. Without the identity declaration, or
+with an instance that is not class-fixed, two publications are not
+established to be one message, and the duplicate is unproven-safe. A
+consumer the model does not contain is outside the proof, which is
+conditional on the model's closed world of consumers (§1.3).
 
-Idempotency-key propagation plays no role here: propagation is
-lineage for the *consumer's* analysis (§12) and deduplicates nothing
-on the publishing side.
+Idempotency-key propagation plays no role here: a class-fixed
+instance already makes every duplicate payload-equal, so a consumer's
+key evaluates equally across them whichever fields it reads.
+Propagation remains lineage for the *consumer's* analysis (§12) and
+deduplicates nothing on the publishing side.
 
 ---
 
@@ -124,15 +149,24 @@ invocation multiplicity, which nothing admits by default.
 
 ### 4.1 The fixpoint
 
-Request discharge makes idempotency verdicts mutually dependent, and
-request cycles between operations are legal models. V1 computes the
-verdicts as a **least fixpoint**: starting from no proven targets,
-requirements are re-checked as their request targets become proven,
-until nothing changes. The iteration is monotone — discharge
-conditions only improve as targets prove — and terminates within one
-pass per requirement. A cyclic dependency therefore settles as
-unproven on the request legs, which is the conservative answer: V1
-asserts nothing about whether some cycles are coinductively safe.
+Request discharge (§4) and consumer discharge (§3) make idempotency
+verdicts mutually dependent, and cycles between operations — request
+cycles, publication cycles, an operation consuming what it publishes
+— are legal models. V1 computes the verdicts as a **least fixpoint**:
+starting from no proven operations, requirements are re-checked as
+their request targets and message consumers become proven, until
+nothing changes. The iteration is monotone — discharge conditions
+only improve as operations prove — and terminates within one pass per
+requirement. A cyclic dependency therefore settles as unproven on the
+legs that cross it, which is the conservative answer: V1 asserts
+nothing about whether some cycles are coinductively safe, though the
+property is a safety property and a greatest-fixpoint treatment may
+well be sound.
+
+Both legs resolve their edges through one trigger graph
+(`verification::trigger`): a request names its target; a publication
+reaches every subscription on its topic whose message selection admits
+the published schema.
 
 ---
 
@@ -191,7 +225,11 @@ populations, not schedules.
 
 - **`create_order`**: keyed commit over the governing key; the
   publication intent is recovered and `OrderCreated` is
-  identity-mapped on the topic. **Proven.**
+  identity-mapped on the topic — but `reserve_inventory` consumes
+  `OrderCreated` and is itself unproven, so the cascade does not
+  collapse. **Unproven**, with exactly that obstacle: a retried
+  `create_order` may reserve inventory twice and, through
+  `charge_payment`, charge the card twice.
 - **`apply_payment`**: keyed commit over `event_id`; the transition
   intent is recovered; `OrderPaid` is identity-mapped. **Proven.**
 - **`charge_payment`**: the capture publication is safe — its direct
@@ -209,16 +247,20 @@ populations, not schedules.
 
 ## 9. What V1 deliberately does not infer
 
-1. **Coinductive request cycles** (§4.1): settled unproven.
-2. **Partial-payload publication identity**: a direct instance whose
+1. **Coinductive cycles** (§4.1), request or publication: settled
+   unproven.
+2. **Consumers outside the model**: the cascade is followed through
+   the modeled subscriptions only; the proof is conditional on that
+   closed world.
+3. **Partial-payload publication identity**: a direct instance whose
    derivation is unspecified or unstable is never class-fixed, even if
    its identity fields alone might be; the DSL declares instance
    provenance at whole-instance granularity.
-3. **Compensation or permitted-duplicate contracts**: "beyond what the
+4. **Compensation or permitted-duplicate contracts**: "beyond what the
    declared idempotency contract permits" currently has no DSL surface
    for declaring permitted duplicates; V1 treats every unproven
    duplicate as unpermitted.
-4. **Delivery-driven attempt bounding for requests**: no fact bounds
+5. **Delivery-driven attempt bounding for requests**: no fact bounds
    caller retries, so the single-delivery route is subscription-only.
 
 ---
@@ -235,3 +277,9 @@ Executed 2026-08-21:
    publication/request asymmetry.
 3. **Implementation**: `analyzer::verification::idempotency`, reusing
    the replay engine, with the request fixpoint of §4.1.
+
+Revised 2026-08-21: §3 gained the consumer leg, §4.1 the publication
+edges of the fixpoint, and §8 the corrected `create_order` outcome;
+the main document's §9 and §13.1 and the implementation (with the
+trigger graph in `analyzer::verification::trigger`) were reconciled
+the same day.
