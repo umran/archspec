@@ -76,3 +76,9 @@ svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: non
 .arch-sm-edge-label { font-size: 11px; fill: var(--arch-text-subtle); pointer-events: all; cursor: pointer; }
 .arch-sm-edge-label.selected { fill: var(--arch-accent); }
 .arch-sm-edge-label .fx { fill: var(--arch-edge-publish); }
+
+/* Kumo's Flow centres its diagram inside the wrapper; the operation page
+   reads top-down from the left edge like the rest of its sections. */
+.arch-flow [data-testid="flow-contents"] {
+  margin-left: 0;
+}

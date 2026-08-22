@@ -43,27 +43,42 @@ execute them through intents and marked "via transition". Click
 anything for a structured detail panel; double-click an operation to
 drill in. The filter box dims non-matching vertices.
 
-**Operation view** (`#/op/<id>`). Inputs and requirements across the
-top, then the operation's invocation flows as tabs, one flow at a
-time — flows are alternative execution paths (an invocation takes
-exactly one), so they are never shown side by side. The active tab is
-part of the route (`#/op/<id>?flow=<flow id>`), so a flow can be
-deep-linked, and clicking a flow in the operation's detail panel or an
-obligation's subject lands directly on it. Within a flow, steps run in
-order: transaction steps expand in place into their transaction's
-steps (reads, writes, inserts, deletes, locks, transitions, artifact
+**Operation view** (`#/op/<id>`). A page header (name, copyable id,
+description, and a fact strip: service, concurrency, transaction and
+flow counts, the state machines it drives, verdict tally), then three
+sections as Kumo layer cards. **Requirements** is a table — one row
+per declared requirement with its key, its semantics (replay-consistent
+response, guaranteed completion) and, when a report is loaded, the
+verdict over its obligations; **Inputs** is a table of what starts an
+invocation (kind, source schema or topic, delivery and dispatch
+semantics, request identity). The two sit side by side when the pane
+is wide enough and stack otherwise. **Flows** shows the operation's
+invocation flows as tabs, one flow at a time — flows are alternative
+execution paths (an invocation takes exactly one), so they are never
+shown side by side. The active tab is part of the route
+(`#/op/<id>?flow=<flow id>`), so a flow can be deep-linked, and
+clicking a flow in the operation's detail panel or an obligation's
+subject lands directly on it. The flow itself is a Kumo `Flow`
+diagram: steps in order with connectors drawn between them;
+transaction steps expand in place into their transaction's steps
+(reads, writes, inserts, deletes, locks, transitions, artifact
 establishments), each with its selector, provenance, and a full detail
 panel; execute-effect steps are badged with the effect's kind
-(publication, request, external). Transition steps link into the
-owning state machine. Requirement chips carry per-requirement verdicts
-when a report is loaded.
+(publication, request, external); transition steps link into the
+owning state machine. Selecting any row or card opens its detail
+panel.
 
-**State machine view** (`#/machine/<id>`). The state graph: legal
-states, initial state, transitions (with ⚡ badges for transition-owned
-side effects). Selecting a transition shows its from/to sets, its side
-effects resolved to topics/operations, the operations that execute
-those effects via intents, and every transaction step that takes the
-transition. `?t=<transition id>` deep-links with a highlight.
+**State machine view** (`#/machine/<id>`). A page header (name,
+copyable id, governed object and state field, initial state, counts,
+verdict tally), the state graph as a section — legal states, initial
+state, transitions with ⚡ badges counting transition-owned side
+effects — and a transitions table: from/to sets, each side effect
+structured as kind, effect, target topic or operation, and the
+operations that execute it through an intent, plus every transaction
+step that takes the transition. The selected transition is part of
+the route (`#/machine/<id>?t=<transition id>`): selecting one in the
+graph or the table navigates there, selecting a state drops it, and a
+deep link or history navigation selects what the address bar names.
 
 ## Panels
 

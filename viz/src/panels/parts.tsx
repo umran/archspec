@@ -1,9 +1,10 @@
 import { Badge } from "@cloudflare/kumo/components/badge";
+import { LayerCard } from "@cloudflare/kumo/components/layer-card";
 import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Text } from "@cloudflare/kumo/components/text";
 import { useState, type ReactNode } from "react";
 
-import { pathText } from "../lib/ids";
+import { pathText, shortId } from "../lib/ids";
 import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
 import { predicateText, typeText } from "../lib/text";
 import { useApp, useObligationsAt } from "../state/AppState";
@@ -62,6 +63,43 @@ export function Section({
       </Collapsible.DefaultPanel>
     </Collapsible.Root>
   );
+}
+
+/** A titled page section: Kumo's layered card, a header band above an
+ *  inset body. */
+export function SectionCard({
+  title, count, hint, aside, bodyClassName, children,
+}: { title: string; count?: number; hint?: string; aside?: ReactNode; bodyClassName?: string; children: ReactNode }) {
+  return (
+    <LayerCard render={<section />}>
+      <LayerCard.Secondary className="flex-wrap gap-x-3 gap-y-1">
+        <span className="text-sm font-semibold text-kumo-default">{title}</span>
+        {count !== undefined && <Badge variant="neutral">{count}</Badge>}
+        {hint && <span className="text-xs font-normal text-kumo-inactive">{hint}</span>}
+        {aside && <span className="ml-auto flex items-center gap-2">{aside}</span>}
+      </LayerCard.Secondary>
+      <LayerCard.Primary className={bodyClassName}>{children}</LayerCard.Primary>
+    </LayerCard>
+  );
+}
+
+/** One label/value pair in a page header's fact strip. */
+export function Fact({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[11px] font-medium uppercase tracking-wider text-kumo-inactive">{label}</dt>
+      <dd className="mt-0.5 flex flex-wrap items-center gap-1.5 text-sm text-kumo-default">{children}</dd>
+    </div>
+  );
+}
+
+/** Row classes for single-select tables. Kumo's zebra striping stays as a
+ *  reading aid, so the selected row is marked by a brand accent bar and
+ *  tint rather than the same tint the even rows already carry. */
+export function selectableRow(selected: boolean): string {
+  return selected
+    ? "cursor-pointer [&>td]:bg-kumo-brand/10 [&>td:first-child]:shadow-[inset_3px_0_0_0_var(--color-kumo-brand)]"
+    : "cursor-pointer [&:hover>td]:bg-kumo-contrast/5";
 }
 
 export function KeyValue({ rows }: { rows: [string, ReactNode | null | undefined][] }) {
@@ -135,11 +173,13 @@ export function StatusChips({ obKey }: { obKey: string }) {
   );
 }
 
+/** `kind(source).path`. The source's kind prefix is already spelled out,
+ *  so the link shows the short id; the whole reference stays on one line. */
 export function RefText({ value }: { value: ValueRef }) {
   return (
-    <Mono>
+    <Mono className="whitespace-nowrap">
       <span className="text-kumo-subtle">{value.source.kind}(</span>
-      <IdLink id={value.source.id} />
+      <IdLink id={value.source.id}>{shortId(value.source.id)}</IdLink>
       <span className="text-kumo-subtle">).{pathText(value.path)}</span>
     </Mono>
   );

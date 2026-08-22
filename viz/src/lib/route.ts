@@ -20,7 +20,14 @@ export function parseHash(hash: string): Route {
 export function routeKey(route: Route): string {
   if (route.view === "system") return "system";
   if (route.view === "op") return `op:${route.id}` + (route.flow ? `?${route.flow}` : "");
-  return `machine:${route.id}`;
+  return `machine:${route.id}` + (route.highlight ? `?${route.highlight}` : "");
+}
+
+/** The subject a route names by itself: a machine route's transition.
+ *  The page selects it, so deep links and history navigation agree with
+ *  what the address bar says. */
+export function impliedSubject(route: Route): string | null {
+  return route.view === "machine" ? route.highlight : null;
 }
 
 export const hashes = {

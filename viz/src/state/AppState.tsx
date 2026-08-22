@@ -11,7 +11,7 @@ import {
 
 import { buildIndex, flowContaining, type ModelIndex } from "../lib/index";
 import { buildObligationIndex, type ObligationIndex } from "../lib/obligations";
-import { hashes, navigate, routeKey, useRoute, type Route } from "../lib/route";
+import { hashes, impliedSubject, navigate, routeKey, useRoute, type Route } from "../lib/route";
 import type { Graph } from "../types/graph";
 import type { Id, Model, RequirementKind } from "../types/model";
 import type { PageData } from "../types/page";
@@ -75,6 +75,7 @@ function initialTheme(): Theme {
 export function AppStateProvider({ data, children }: { data: PageData; children: ReactNode }) {
   const route = useRoute();
   const key = routeKey(route);
+  const implied = impliedSubject(route);
 
   const index = useMemo(() => buildIndex(data.model), [data.model]);
   const obligations = useMemo(() => buildObligationIndex(data.report), [data.report]);
@@ -90,12 +91,19 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
 
   const pendingSelection = useRef<string | null>(null);
 
-  // A route change clears the selection unless a cross-view focus is
-  // pending; the detail panel survives so links keep their context.
+  // A route change resets the selection to whatever is pending from a
+  // cross-view focus, else to the subject the route itself names. The
+  // detail panel survives so links keep their context, but when the
+  // route names a subject an open panel is retargeted to it, so history
+  // navigation and deep links show what the address bar says.
   useEffect(() => {
-    setSelection(pendingSelection.current);
+    const pending = pendingSelection.current;
     pendingSelection.current = null;
-  }, [key]);
+    setSelection(pending ?? (implied ? `t:${implied}` : null));
+    if (pending === null && implied) {
+      setDetail((current) => (current ? { id: implied, ctx: {} } : current));
+    }
+  }, [key, implied]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -120,7 +128,10 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
   const closeDetail = useCallback(() => {
     setDetail(null);
     setSelection(null);
-  }, []);
+    // The address bar must not keep naming a selection the page no
+    // longer shows.
+    if (route.view === "machine" && route.highlight) navigate(hashes.machine(route.id));
+  }, [route]);
 
   const toggleTx = useCallback((txKey: string) => {
     setExpandedTx((current) => {
@@ -134,6 +145,11 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
   const requestFit = useCallback(() => setFitRequest((n) => n + 1), []);
 
   const navigateTo = useCallback((hash: string, nextSelection?: string) => {
+    if (window.location.hash === hash) {
+      // Already there: no route change will apply the selection for us.
+      if (nextSelection !== undefined) setSelection(nextSelection);
+      return;
+    }
     pendingSelection.current = nextSelection ?? null;
     navigate(hash);
   }, []);
