@@ -30,6 +30,8 @@ topics:
             - OrderCreated
         ordering:
             kind: unordered
+        message_identity:
+            kind: unspecified
 
 state_machines: {}
 

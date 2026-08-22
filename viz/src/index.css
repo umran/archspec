@@ -1,0 +1,84 @@
+@source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
+@import "@cloudflare/kumo/styles/tailwind";
+@import "tailwindcss";
+
+/* ---------- archspec graph theme on Kumo tokens ---------- */
+
+:root {
+  --arch-edge-publish: #a87fe0;
+  --arch-edge-subscribe: #6ea8fe;
+  --arch-edge-request: #e0a640;
+  --arch-edge-external: #e08a5a;
+  --arch-edge-client: #58b884;
+
+  --arch-proven: var(--color-kumo-success);
+  --arch-disproven: var(--color-kumo-danger);
+  --arch-unknown: var(--color-kumo-warning);
+  --arch-accent: var(--color-kumo-brand);
+
+  --arch-node-fill: var(--color-kumo-elevated);
+  --arch-node-line: var(--color-kumo-line);
+  --arch-text: var(--text-color-kumo-default);
+  --arch-text-subtle: var(--text-color-kumo-subtle);
+  --arch-text-faint: var(--text-color-kumo-inactive);
+}
+
+html, body, #root { height: 100%; }
+body { overflow: hidden; }
+
+svg.arch-canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+svg.arch-canvas.panning { cursor: grabbing; }
+svg.arch-canvas text { font-size: 12px; fill: var(--arch-text); user-select: none; pointer-events: none; }
+
+.arch-node { cursor: pointer; transition: opacity 120ms ease; }
+.arch-node.dimmed { opacity: 0.22; }
+.arch-node .body { fill: var(--arch-node-fill); stroke: var(--arch-node-line); stroke-width: 1.2; }
+.arch-node:hover .body { stroke: var(--arch-accent); }
+.arch-node.selected .body { stroke: var(--arch-accent); stroke-width: 2; }
+.arch-node .title { font-weight: 600; font-size: 12px; }
+.arch-node .subtitle { fill: var(--arch-text-subtle); font-size: 10.5px; }
+.arch-node .badge-text { fill: var(--arch-text-faint); font-size: 9.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.04em; }
+
+.arch-node.topic .body { stroke: var(--arch-edge-publish); fill: color-mix(in srgb, var(--arch-edge-publish) 12%, var(--arch-node-fill)); }
+.arch-node.external .body { stroke: var(--arch-edge-external); fill: color-mix(in srgb, var(--arch-edge-external) 12%, var(--arch-node-fill)); stroke-dasharray: 4 3; }
+.arch-node.client .body { stroke: var(--arch-edge-client); fill: color-mix(in srgb, var(--arch-edge-client) 12%, var(--arch-node-fill)); }
+.arch-node.state-node .body { stroke: var(--arch-node-line); }
+.arch-node.state-node.initial .body { stroke: var(--arch-edge-client); }
+.arch-node .init-mark { fill: var(--arch-edge-client); font-size: 9.5px; }
+
+.arch-service .box { fill: color-mix(in srgb, var(--color-kumo-base) 70%, transparent); stroke: var(--color-kumo-hairline); stroke-width: 1; }
+.arch-service .label { font-weight: 600; font-size: 11px; fill: var(--arch-text-subtle); letter-spacing: 0.06em; text-transform: uppercase; }
+.arch-service .kind { fill: var(--arch-text-faint); font-size: 10px; }
+.arch-service.dimmed { opacity: 0.35; }
+.arch-service { cursor: pointer; }
+
+.arch-edge { fill: none; stroke-width: 1.6; transition: opacity 120ms ease; }
+.arch-edge.publish { stroke: var(--arch-edge-publish); }
+.arch-edge.subscribe { stroke: var(--arch-edge-subscribe); }
+.arch-edge.request { stroke: var(--arch-edge-request); }
+.arch-edge.external { stroke: var(--arch-edge-external); }
+.arch-edge.client { stroke: var(--arch-edge-client); }
+.arch-edge.unexecuted { stroke-dasharray: 5 4; opacity: 0.7; }
+.arch-edge.dimmed { opacity: 0.12; }
+.arch-edge.selected { stroke-width: 2.6; }
+.arch-edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; pointer-events: stroke; }
+.arch-edge-label { font-size: 10.5px; fill: var(--arch-text-subtle); }
+
+.arch-status-ring { fill: none; stroke-width: 2; stroke-dasharray: 3 3; opacity: 0.9; }
+.arch-status-ring.proven { stroke: var(--arch-proven); }
+.arch-status-ring.disproven { stroke: var(--arch-disproven); }
+.arch-status-ring.unknown { stroke: var(--arch-unknown); }
+.arch-status-chip text { font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+
+.arch-sm-edge { fill: none; stroke: var(--arch-text-subtle); stroke-width: 1.5; }
+.arch-sm-edge.selected { stroke-width: 2.4; }
+.arch-sm-edge-label { font-size: 11px; fill: var(--arch-text-subtle); pointer-events: all; cursor: pointer; }
+.arch-sm-edge-label.selected { fill: var(--arch-accent); }
+.arch-sm-edge-label .fx { fill: var(--arch-edge-publish); }
+
+/* Kumo's Flow centres its diagram inside the wrapper; the operation page
+   reads top-down from the left edge like the rest of its sections. */
+.arch-flow [data-testid="flow-contents"] {
+  margin-left: 0;
+}

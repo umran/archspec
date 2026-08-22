@@ -1,8 +1,12 @@
 //! Assembly of the self-contained HTML document.
 //!
-//! Everything the page needs — style, script, and data — is inlined at
-//! build time, so the output opens from disk with no server and makes
-//! no external requests.
+//! The front end is a Vite/React application in `viz/`, built into a
+//! single `dist/index.html` with every script and stylesheet inlined.
+//! This module embeds that bundle and injects the page data, so the
+//! output opens from disk with no server and makes no external
+//! requests. Rebuild the bundle with `npm run build` in `viz/` after
+//! changing the front end; the built file is committed so `cargo`
+//! needs no Node toolchain.
 
 use archspec::spec::Model;
 use serde::Serialize;
@@ -10,9 +14,10 @@ use serde::Serialize;
 use crate::graph;
 use crate::report::ProverReport;
 
-const TEMPLATE: &str = include_str!("assets/template.html");
-const STYLE: &str = include_str!("assets/style.css");
-const SCRIPT: &str = include_str!("assets/app.js");
+const BUNDLE: &str = include_str!("../../../viz/dist/index.html");
+
+const DATA_PLACEHOLDER: &str = "/*__ARCHSPEC_DATA__*/";
+const TITLE_PLACEHOLDER: &str = "<title>archspec</title>";
 
 #[derive(Serialize)]
 struct PageData<'a> {
@@ -20,6 +25,23 @@ struct PageData<'a> {
     model: &'a Model,
     graph: graph::Graph,
     report: Option<&'a ProverReport>,
+}
+
+/// The page data as pretty JSON, for the front end's development loop.
+pub fn page_data_json(
+    model: &Model,
+    report: Option<&ProverReport>,
+    title: &str,
+) -> Result<String, String> {
+    let data = PageData {
+        title,
+        model,
+        graph: graph::extract(model),
+        report,
+    };
+
+    serde_json::to_string_pretty(&data)
+        .map_err(|error| format!("cannot serialize page data: {error}"))
 }
 
 pub fn render(
@@ -43,11 +65,16 @@ pub fn render(
     // script-data escaped states) inert in the inline data block.
     let json = json.replace('<', "\\u003c");
 
-    Ok(TEMPLATE
-        .replace("__TITLE__", &escape_html(title))
-        .replace("/*__STYLE__*/", STYLE)
-        .replace("/*__DATA__*/", &format!("window.ARCHSPEC = {json};"))
-        .replace("/*__SCRIPT__*/", SCRIPT))
+    if !BUNDLE.contains(DATA_PLACEHOLDER) {
+        return Err("the embedded front-end bundle lacks the page-data placeholder".to_string());
+    }
+
+    Ok(BUNDLE
+        .replace(DATA_PLACEHOLDER, &format!("window.ARCHSPEC = {json};"))
+        .replace(
+            TITLE_PLACEHOLDER,
+            &format!("<title>{} · archspec</title>", escape_html(title)),
+        ))
 }
 
 fn escape_html(text: &str) -> String {
@@ -73,19 +100,20 @@ mod tests {
         let html =
             render(&model, None, "smoke </script> test").expect("renders");
 
-        // All placeholders substituted.
-        assert!(!html.contains("__TITLE__"));
-        assert!(!html.contains("/*__STYLE__*/"));
-        assert!(!html.contains("/*__DATA__*/"));
-        assert!(!html.contains("/*__SCRIPT__*/"));
+        // Placeholders substituted.
+        assert!(!html.contains(DATA_PLACEHOLDER));
+        assert!(!html.contains(TITLE_PLACEHOLDER));
 
         assert!(html.contains("window.ARCHSPEC"));
         assert!(html.contains("operation.create_order"));
+        assert!(html.contains("<title>smoke &lt;/script&gt; test · archspec</title>"));
 
         // No unescaped close tag may survive inside the data block:
-        // exactly the template's own two script closers remain (the
-        // title's is HTML-escaped).
-        assert_eq!(html.matches("</script>").count(), 2);
+        // the bundle's own script closers are the only ones present.
+        assert_eq!(
+            html.matches("</script>").count(),
+            BUNDLE.matches("</script>").count()
+        );
     }
 
     #[test]
@@ -112,9 +140,12 @@ mod tests {
 
         let html = render(&model, None, "hostile").expect("renders");
 
-        assert!(!html.contains("<!--"));
         assert!(!html.contains("of <script>"));
         assert!(html.contains("Beware \\u003c!-- of \\u003cscript"));
-        assert_eq!(html.matches("</script>").count(), 2);
+        assert_eq!(html.matches("<!--").count(), BUNDLE.matches("<!--").count());
+        assert_eq!(
+            html.matches("</script>").count(),
+            BUNDLE.matches("</script>").count()
+        );
     }
 }

@@ -208,6 +208,8 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
 
     errors.extend(validate_topics(model));
 
+    errors.extend(validate_request_identity_shape(model));
+
     errors.extend(validate_state_machines(model));
 
     errors.extend(validate_transactions(model, &index));
@@ -347,6 +349,79 @@ fn validate_topics(model: &Model) -> Vec<ValidationError> {
     validate_publication_topic_membership(model, &mut errors);
 
     validate_topic_ordering_shape(model, &mut errors);
+
+    validate_message_identity_shape(model, &mut errors);
+
+    errors
+}
+
+fn validate_message_identity_shape(model: &Model, errors: &mut Vec<ValidationError>) {
+    for (topic_id, topic) in &model.topics {
+        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+            continue;
+        };
+
+        // The mapping may cover a subset of the carried schemas;
+        // identity is meaningful knowledge per schema, unlike the
+        // ordering key.
+        for schema in mapping.keys() {
+            if !topic.messages.contains(schema) {
+                errors.push(ValidationError::MessageIdentitySchemaNotOnTopic {
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                });
+            }
+        }
+
+        // Identity tuple positions correspond across schemas, so every
+        // mapped tuple shares one arity. Empty tuples are reported on
+        // their own and excluded from the arity baseline.
+        let expected = mapping.values().map(Vec::len).find(|len| *len > 0);
+
+        for (schema, identity) in mapping {
+            if identity.is_empty() {
+                errors.push(ValidationError::EmptyMessageIdentity {
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                });
+
+                continue;
+            }
+
+            if let Some(expected) = expected
+                && identity.len() != expected
+            {
+                errors.push(ValidationError::MessageIdentityArityMismatch {
+                    topic: topic_id.clone(),
+                    schema: schema.clone(),
+                    expected,
+                    actual: identity.len(),
+                });
+            }
+        }
+    }
+}
+
+fn validate_request_identity_shape(model: &Model) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    for operation in model.operations.values() {
+        for (input_id, input) in &operation.inputs {
+            let Input::Request(request) = input else {
+                continue;
+            };
+
+            let RequestIdentity::Keyed { fields } = &request.identity else {
+                continue;
+            };
+
+            if fields.is_empty() {
+                errors.push(ValidationError::EmptyRequestIdentity {
+                    input: input_id.clone(),
+                });
+            }
+        }
+    }
 
     errors
 }
@@ -703,6 +778,19 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
         }
     }
 
+    // Topic message-identity fields.
+    for (topic_id, topic) in &model.topics {
+        let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+            continue;
+        };
+
+        for (schema, identity) in mapping {
+            for path in identity {
+                validate_schema_path(model, topic_id, schema, path, &mut errors);
+            }
+        }
+    }
+
     // State-machine state fields.
     for (machine_id, machine) in &model.state_machines {
         match &machine.subject {
@@ -714,6 +802,20 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
 
     // Operations.
     for (operation_id, operation) in &model.operations {
+        for (input_id, input) in &operation.inputs {
+            let Input::Request(request) = input else {
+                continue;
+            };
+
+            let RequestIdentity::Keyed { fields } = &request.identity else {
+                continue;
+            };
+
+            for path in fields {
+                validate_schema_path(model, input_id, &request.schema, path, &mut errors);
+            }
+        }
+
         for requirement in &operation.requirements.serialization {
             validate_value_ref_path(
                 model,
@@ -1481,6 +1583,12 @@ fn validate_topic_references(
 
         if let TopicOrdering::Keyed(key) = &topic.ordering {
             for schema in key.mapping.keys() {
+                expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
+            }
+        }
+
+        if let MessageIdentity::Keyed { mapping } = &topic.message_identity {
+            for schema in mapping.keys() {
                 expect_reference(index, topic_id, schema, ReferenceKind::Schema, errors);
             }
         }

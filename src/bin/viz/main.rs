@@ -5,9 +5,11 @@
 //! (services, operations, topics, externals; publications,
 //! subscriptions, and requests routing via topics), per-operation flow
 //! drill-down (flows → steps → transactions → transitions), and
-//! interactive state-machine graphs. A prover report, in the
-//! provisional format defined in `report.rs`, can be overlaid to mark
-//! obligations proven, disproven, or unknown.
+//! interactive state-machine graphs. The model checker's obligation
+//! report (`archspec::analyzer::report`) can be overlaid — computed
+//! in-process with `--verify`, or loaded with `--report` — to mark
+//! obligations proven, disproven, or unknown. The front end itself is
+//! the React application in `viz/`, embedded as a built bundle.
 
 mod graph;
 mod render;
@@ -24,6 +26,8 @@ struct Args {
     report: Option<PathBuf>,
     title: Option<String>,
     example_report: bool,
+    verify: bool,
+    json: bool,
     validate: bool,
 }
 
@@ -37,6 +41,11 @@ OPTIONS:
     --out <PATH>       Output path. Defaults to <MODEL>.html, or stdout
                        for --example-report.
     --report <PATH>    Prover report (JSON) to overlay on the model.
+    --verify           Run the model checker and overlay its obligation
+                       report, instead of reading one from --report.
+    --json             Instead of rendering HTML, emit the page data
+                       (title, model, graph, report) as JSON, for the
+                       front end's development server.
     --title <TITLE>    Page title. Defaults to the model file name.
     --example-report   Instead of rendering, emit a scaffold prover
                        report enumerating every obligation implied by
@@ -96,7 +105,13 @@ fn run(args: &Args) -> Result<(), String> {
         };
     }
 
-    let prover_report = match &args.report {
+    let prover_report = if args.verify {
+        Some(report::obligations(
+            &model,
+            &archspec::analyzer::verification::verify(&model),
+        ))
+    } else {
+        match &args.report {
         Some(path) => {
             let raw = std::fs::read_to_string(path).map_err(|error| {
                 format!("cannot read {}: {error}", path.display())
@@ -107,19 +122,20 @@ fn run(args: &Args) -> Result<(), String> {
                     format!("cannot parse {}: {error}", path.display())
                 })?;
 
-            if let Some(revision) = parsed.model_revision {
-                if revision != model.revision.0 {
-                    eprintln!(
-                        "warning: report was produced against model \
-                         revision {revision}, but the model is revision {}",
-                        model.revision.0
-                    );
-                }
+            if let Some(revision) = parsed.model_revision
+                && revision != model.revision.0
+            {
+                eprintln!(
+                    "warning: report was produced against model \
+                     revision {revision}, but the model is revision {}",
+                    model.revision.0
+                );
             }
 
             Some(parsed)
         }
         None => None,
+        }
     };
 
     let title = args.title.clone().unwrap_or_else(|| {
@@ -128,6 +144,22 @@ fn run(args: &Args) -> Result<(), String> {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "archspec model".to_string())
     });
+
+    if args.json {
+        let json = render::page_data_json(&model, prover_report.as_ref(), &title)?;
+
+        return match &args.out {
+            Some(path) => {
+                write_output(path, &format!("{json}\n"))?;
+                eprintln!("wrote {}", path.display());
+                Ok(())
+            }
+            None => {
+                println!("{json}");
+                Ok(())
+            }
+        };
+    }
 
     let html = render::render(&model, prover_report.as_ref(), &title)?;
 
@@ -186,6 +218,8 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut report = None;
     let mut title = None;
     let mut example_report = false;
+    let mut verify = false;
+    let mut json = false;
     let mut validate = true;
 
     let mut argv = std::env::args().skip(1);
@@ -206,6 +240,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                 title = Some(expect_value(&arg, &mut argv)?);
             }
             "--example-report" => example_report = true,
+            "--verify" => verify = true,
+            "--json" => json = true,
             "--no-validate" => validate = false,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option {other}"));
@@ -222,12 +258,18 @@ fn parse_args() -> Result<Option<Args>, String> {
         return Err("no model path given".to_string());
     };
 
+    if verify && report.is_some() {
+        return Err("--verify and --report are mutually exclusive".to_string());
+    }
+
     Ok(Some(Args {
         model,
         out,
         report,
         title,
         example_report,
+        verify,
+        json,
         validate,
     }))
 }
