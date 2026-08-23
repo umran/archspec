@@ -138,45 +138,57 @@ function FlowSummary({ opId, flowId }: { opId: Id; flowId: Id }) {
     kind ? <Badge variant={kind === "publication" ? "purple" : kind === "request" ? "orange" : "warning"}>{kind}</Badge> : null;
   return (
     <div className="space-y-1.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
         <button
           type="button"
-          className="flex cursor-pointer items-center gap-1.5 font-mono text-[12px] text-kumo-link hover:underline"
+          className="inline-flex min-w-0 cursor-pointer items-center gap-1.5 text-left font-mono text-[12px] text-kumo-link hover:underline"
           title="Open this flow in the operation view"
           onClick={() => navigateTo(hashes.op(opId, flowId), `flow:${flowId}`)}
         >
-          {shortId(flowId)}
-          <ArrowSquareOutIcon size={12} />
+          <span className="break-all">{shortId(flowId)}</span>
+          <ArrowSquareOutIcon size={12} className="shrink-0" />
         </button>
         <StatusChips obKey={`${opId}/${flowId}`} />
       </div>
-      <ol className="space-y-1">
-        {flow.steps.map((s, i) => (
-          <li key={i} className="flex flex-wrap items-center gap-1.5 text-xs">
-            <Tag>{i + 1}</Tag>
-            {s.kind === "transaction" && (
-              <>
-                <span className="text-kumo-subtle">transaction</span>
-                <IdLink id={s.transaction}>{shortId(s.transaction)}</IdLink>
-                <span className="text-kumo-inactive">{op.transactions[s.transaction]?.steps.length ?? "?"} steps</span>
-              </>
-            )}
-            {s.kind === "execute_effect" && (
-              <>
-                <span className="text-kumo-subtle">execute</span>
-                {kindBadge(effectKind(s.effect))}
-                <IdLink id={s.effect}>{shortId(s.effect)}</IdLink>
-              </>
-            )}
-            {s.kind === "execute_effect_intent" && (
-              <>
-                <span className="text-kumo-subtle">execute intent</span>
-                {kindBadge(op.effect_intents[s.intent] ? effectKind(op.effect_intents[s.intent].effect) : null)}
-                <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
-              </>
-            )}
-          </li>
-        ))}
+      {/* Each step is a fixed number column beside a text column, so a
+          long name wraps within its column instead of under the number. */}
+      <ol className="space-y-1.5">
+        {flow.steps.map((s, i) => {
+          const [kind, badge, target, note] =
+            s.kind === "transaction"
+              ? [
+                  "transaction",
+                  null,
+                  s.transaction,
+                  (() => {
+                    const n = op.transactions[s.transaction]?.steps.length;
+                    return n === undefined ? "? steps" : `${n} step${n === 1 ? "" : "s"}`;
+                  })(),
+                ]
+              : s.kind === "execute_effect"
+                ? ["execute effect", kindBadge(effectKind(s.effect)), s.effect, null]
+                : [
+                    "execute intent",
+                    kindBadge(op.effect_intents[s.intent] ? effectKind(op.effect_intents[s.intent].effect) : null),
+                    s.intent,
+                    null,
+                  ];
+          return (
+            <li key={i} className="flex items-start gap-2 text-xs">
+              <span className="shrink-0"><Tag>{i + 1}</Tag></span>
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                  <span className="text-kumo-subtle">{kind}</span>
+                  {badge}
+                </div>
+                <div className="min-w-0">
+                  <IdLink id={target}>{shortId(target)}</IdLink>
+                  {note && <span className="ml-1.5 text-kumo-inactive">{note}</span>}
+                </div>
+              </div>
+            </li>
+          );
+        })}
       </ol>
       <div className="text-xs text-kumo-subtle">
         terminal response: {flow.response ? <IdLink id={flow.response}>{shortId(flow.response)}</IdLink> : "none"}
@@ -209,9 +221,24 @@ function OperationDetail({ id }: { id: Id }) {
     </div>));
 
   return (
-    <Frame kind="operation" title={id} subtitle={<span>operation on <IdLink id={op.service} /></span>} description={op.description}>
+    <Frame
+      kind="operation"
+      title={
+        <button
+          type="button"
+          className="inline-flex max-w-full cursor-pointer items-center gap-1.5 text-left text-kumo-link hover:underline"
+          title="Open the operation page"
+          onClick={() => navigateTo(hashes.op(id))}
+        >
+          <span className="break-all">{id}</span>
+          <ArrowSquareOutIcon size={13} className="shrink-0" />
+        </button>
+      }
+      subtitle={<span>operation on <IdLink id={op.service} /></span>}
+      description={op.description}
+    >
       <Button variant="secondary" size="xs" icon={ArrowSquareOutIcon} onClick={() => navigateTo(hashes.op(id))}>
-        open flow view
+        open operation page
       </Button>
       <Section title="execution">
         <KeyValue rows={[["concurrency", concurrencyText(op.execution.concurrency)]]} />
