@@ -62,6 +62,16 @@ pub enum VerificationCode {
     /// from the triggering input declares those retries safe. A
     /// consistency warning, not a verdict.
     RecoverabilityRetrySafetyUndeclared,
+
+    /// A declared ordering requirement is not established by the
+    /// declared facts. Epistemic, not a violation (§1.2).
+    OrderingUnproven,
+
+    /// A subscription admits duplicate deliveries and its operation
+    /// declares no idempotency requirement keyed from it, so the work
+    /// a duplicate repeats is checked by nothing. A warning, not a
+    /// verdict.
+    DuplicateDeliveryUnchecked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

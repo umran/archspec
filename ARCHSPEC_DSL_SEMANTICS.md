@@ -500,6 +500,8 @@ It does not itself imply that the lane processes one invocation at a time.
 
 ### Lane concurrency
 
+A logical lane dispatches its deliveries in the order they entered it. Affinity therefore preserves the topic's delivery order within a lane; whether dispatched invocations may then overlap is the lane's concurrency.
+
 #### `bounded(n)`
 
 At most `n` operation invocations from the same logical lane may be simultaneously active.
@@ -566,6 +568,8 @@ A proof must therefore establish both:
 Arbitrarily serializing concurrent inputs can satisfy a serialization requirement but cannot invent a semantic precedence required by an ordering proof.
 
 Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
+
+V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order, and lane concurrency `bounded(1)` stops overtaking. Because a redelivered earlier message may be processed after a later one, `at_least_once` or unspecified delivery preserves the precedence only when the operation's idempotency requirement keyed from the same input is proven, so that the late duplicate does no distinguishable work; `at_most_once` delivery admits no redelivery. Vacuously discharged: a subscription admitting no message schemas. See `ARCHSPEC_ORDERING_DRAFT.md`.
 
 ### Serialization versus ordering
 
@@ -809,6 +813,8 @@ It can bridge renamed fields or different message/request schemas.
 
 Propagation does **not** itself deduplicate anything. It allows the verifier to trace the same logical key across an effect boundary.
 
+V1 reads it on the consumer's side: for a governing key whose population rests on a topic's keyed message identity, each modeled producer of an admitted schema either declares a propagation whose targets cover the identity fields — the identity then carries the producer's key, and when that key is one of the producer's own idempotency requirements, distinct logical invocations of the producer publish distinct messages — or declares none, in which case the identity rests on the topic declaration alone. Both facts are recorded next to the consumer's verdict; neither changes it.
+
 ---
 
 ## 13. Effects
@@ -884,7 +890,7 @@ No retry fact is available.
 
 ### Duplicate request
 
-A duplicate execution of a request effect invokes the target again, and nothing admits invocation multiplicity by default — the asymmetry with duplicate publication is deliberate: a request identity on the target input fixes payload consistency, but only a mechanism collapses invocations. The duplicate is safe exactly when the instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement, keyed from the targeted input, that is itself proven: payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation. V1 computes these mutually dependent verdicts as a least fixpoint; cyclic request dependencies settle unproven.
+A duplicate execution of a request effect invokes the target again, and nothing admits invocation multiplicity by default — the asymmetry with duplicate publication is deliberate: a request identity on the target input fixes payload consistency, but only a mechanism collapses invocations. The duplicate is safe exactly when the instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement, keyed from the targeted input, that is itself proven: payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation. V1 computes these mutually dependent verdicts as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven, by the minimal-counterexample argument of `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1, and such proofs are marked coinductive.
 
 ## 13.3 External effect
 

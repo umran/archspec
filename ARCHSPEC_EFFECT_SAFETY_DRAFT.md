@@ -149,24 +149,36 @@ invocation multiplicity, which nothing admits by default.
 
 ### 4.1 The fixpoint
 
-Request discharge (§4) and consumer discharge (§3) make idempotency
-verdicts mutually dependent, and cycles between operations — request
-cycles, publication cycles, an operation consuming what it publishes
-— are legal models. V1 computes the verdicts as a **least fixpoint**:
-starting from no proven operations, requirements are re-checked as
-their request targets and message consumers become proven, until
-nothing changes. The iteration is monotone — discharge conditions
-only improve as operations prove — and terminates within one pass per
-requirement. A cyclic dependency therefore settles as unproven on the
-legs that cross it, which is the conservative answer: V1 asserts
-nothing about whether some cycles are coinductively safe, though the
-property is a safety property and a greatest-fixpoint treatment may
-well be sound.
+Request and consumer discharge make idempotency verdicts mutually
+dependent, and cycles — request cycles between operations, or
+publication cycles through topics — are legal models. V1 computes the
+verdicts as a **greatest fixpoint**: every requirement with an
+admissible governing key is assumed, and whatever fails under that
+assumption is dropped until nothing more fails. The iteration is
+monotone — fewer assumptions never prove more — and terminates within
+one pass per requirement. A cycle whose members each pass their local
+checks under the mutual assumption is therefore proven, and the proof
+is marked *coinductive*.
 
-Both legs resolve their edges through one trigger graph
-(`verification::trigger`): a request names its target; a publication
-reaches every subscription on its topic whose message selection admits
-the published schema.
+*Soundness.* Suppose some member of a self-consistent set `P` were
+violated: some execution in which duplicate attempts at one of its
+logical invocations cause distinguishable duplicate work. Among all
+such violations across `P`, take one whose duplicate work lies at the
+shortest causal distance from the duplicated attempts. That work is
+not in the invocation's own flow — the state leg and the external and
+publication legs are discharged by local facts that assume nothing
+about `P`. So it lies downstream of a request or publication, and the
+local check establishes that the duplicates reached the target or
+consumer as payload-equal inputs, falling into one class of its
+requirement, which is in `P`. The duplicate work is then caused by
+duplicate attempts of *that* invocation, at a strictly shorter
+distance — contradicting the choice of the violation. Every causal
+chain in a real execution is finite, so no violation exists. The
+argument uses the downstream requirement only for what its local check
+provides — a key over the input that collapses payload-equal attempts
+— never for its verdict, which is why assuming the verdict is
+harmless. The least fixpoint is computed alongside, only to mark which
+proofs rest on a cycle.
 
 ---
 
@@ -247,8 +259,9 @@ populations, not schedules.
 
 ## 9. What V1 deliberately does not infer
 
-1. **Coinductive cycles** (§4.1), request or publication: settled
-   unproven.
+1. **Nothing about cycles beyond §4.1**: a cycle proves only when
+   every member passes its local checks; a member failing for any
+   other reason fails the cycle with it.
 2. **Consumers outside the model**: the cascade is followed through
    the modeled subscriptions only; the proof is conditional on that
    closed world.

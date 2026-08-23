@@ -98,6 +98,11 @@ the proof-status colouring on or off across every view, and an
 obligations panel. The bar shares the pages' content column, so its
 edges line up with the page headers beneath it.
 
+**Notes.** Model-wide warnings the checker raises that belong to no
+single obligation — today, a subscription that admits duplicate
+deliveries while its operation declares no idempotency requirement
+keyed from it — appear at the top of the obligations panel.
+
 **Obligations panel.** The checker's obligations, grouped by the
 operation (or data model, machine, topic) they anchor to, with a
 segmented status filter (all / unknown / proven / disproven), a text
