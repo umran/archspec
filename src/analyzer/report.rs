@@ -666,17 +666,36 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
                     .to_string(),
             );
 
-            assumptions.push(match duplicates {
-                DuplicateHandling::SingleDelivery => format!(
-                    "{input} receives each logical message at most once, so no late \
-                     duplicate can reorder"
-                ),
+            match duplicates {
+                DuplicateHandling::SingleDelivery => assumptions.push(format!(
+                    "{input} receives each logical message at most once, so neither \
+                     redelivery nor a duplicate exists"
+                )),
 
-                DuplicateHandling::CollapsedByIdempotency { requirement } => format!(
-                    "a redelivered earlier message does no distinguishable work: \
-                     idempotency requirement #{requirement} keyed from {input} is proven"
-                ),
-            });
+                DuplicateHandling::HeadOfLineRetry { idempotency } => {
+                    assumptions.push(
+                        "a failed delivery is re-dispatched at the head of its lane, \
+                         so a redelivery precedes every later message"
+                            .to_string(),
+                    );
+
+                    assumptions.push(match idempotency {
+                        Some(coverage) => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; its work is idempotency \
+                             requirement #{}'s obligation ({})",
+                            coverage.requirement,
+                            if coverage.proven { "proven" } else { "unproven" }
+                        ),
+
+                        None => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; no idempotency \
+                             requirement keyed from {input} answers for its work"
+                        ),
+                    });
+                }
+            }
 
             assumptions
         }

@@ -117,12 +117,10 @@ fn flash_checkout_serialization_requirements_are_proven() {
 
     // The fixture's honest gaps: reserve_inventory's recoverability,
     // reserve_inventory's idempotency, charge_payment's idempotency
-    // (the not_deduplicated card charge), create_order's idempotency
-    // through its cascade into reserve_inventory, and the ordering of
-    // reserve_inventory and charge_payment, which inherit their
-    // idempotency gaps through redelivery.
+    // (the not_deduplicated card charge), and create_order's
+    // idempotency through its cascade into reserve_inventory.
     assert!(!report.all_proven());
-    assert_eq!(report.diagnostics().len(), 6);
+    assert_eq!(report.diagnostics().len(), 4);
 }
 
 #[test]
@@ -213,9 +211,9 @@ fn request_input_key_without_global_bound_is_unproven() {
 
     let report = verification::verify(&model);
 
-    // The added serialization gap, plus the fixture's six standing
+    // The added serialization gap, plus the fixture's four standing
     // gaps.
-    assert_eq!(report.diagnostics().len(), 7);
+    assert_eq!(report.diagnostics().len(), 5);
 }
 
 #[test]
@@ -2400,8 +2398,8 @@ fn flash_checkout_ordering_verdicts() {
     assert_eq!(report.ordering.len(), 3);
 
     // apply_payment: the keyed topic is the precedence, by_topic_key at
-    // lane concurrency one preserves it, and its proven idempotency
-    // requirement collapses a redelivered earlier message.
+    // lane concurrency one preserves it through head-of-line retry, and
+    // its proven idempotency requirement answers for duplicates.
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
     let verification::OrderingVerdict::Proven {
@@ -2430,33 +2428,42 @@ fn flash_checkout_ordering_verdicts() {
 
     assert_eq!(
         *duplicates,
-        verification::DuplicateHandling::CollapsedByIdempotency { requirement: 0 }
+        verification::DuplicateHandling::HeadOfLineRetry {
+            idempotency: Some(verification::DuplicateCoverage {
+                requirement: 0,
+                proven: true,
+            }),
+        }
     );
 
-    // reserve_inventory and charge_payment inherit their idempotency
-    // gaps: a redelivered earlier message is not shown to do no work.
+    // reserve_inventory and charge_payment prove by the same facts; the
+    // proofs record that the requirements answering for duplicates are
+    // unproven — the gap is reported under idempotency, not here.
     for operation in ["operation.reserve_inventory", "operation.charge_payment"] {
         let verdict = ordering_verdict(&model, operation, 0);
 
-        let verification::OrderingVerdict::Unproven { obstacles } = &verdict else {
-            panic!("expected `{operation}` unproven, found {verdict:?}");
-        };
-
         assert!(
             matches!(
-                &obstacles[..],
-                [verification::OrderingObstacle::RedeliveryNotCollapsed {
-                    delivery: archspec::spec::DeliverySemantics::AtLeastOnce,
-                    ..
-                }]
+                &verdict,
+                verification::OrderingVerdict::Proven {
+                    proof: verification::OrderingProof::LaneOrder {
+                        duplicates: verification::DuplicateHandling::HeadOfLineRetry {
+                            idempotency: Some(verification::DuplicateCoverage {
+                                requirement: 0,
+                                proven: false,
+                            }),
+                        },
+                        ..
+                    }
+                }
             ),
-            "expected the redelivery obstacle for `{operation}`:\n{obstacles:#?}"
+            "expected `{operation}` proven with unproven duplicate coverage, found {verdict:?}"
         );
     }
 }
 
 #[test]
-fn at_most_once_delivery_needs_no_idempotency_for_ordering() {
+fn at_most_once_delivery_records_single_delivery() {
     let mut model = load_flash_checkout();
 
     subscription_mut(&mut model, "operation.reserve_inventory", "input.reserve_inventory.created")

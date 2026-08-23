@@ -500,7 +500,7 @@ It does not itself imply that the lane processes one invocation at a time.
 
 ### Lane concurrency
 
-A logical lane dispatches its deliveries in the order they entered it. Affinity therefore preserves the topic's delivery order within a lane; whether dispatched invocations may then overlap is the lane's concurrency.
+A logical lane dispatches its deliveries in the order they entered it, and it does not advance past an incomplete delivery: a delivery leaves the lane only when its invocation has completed, and a failed attempt is re-dispatched at the head of the lane before any later delivery. Affinity therefore preserves the topic's delivery order within a lane, through redelivery included; whether dispatched invocations may overlap is the lane's concurrency. A transport whose lane skips a failed delivery and redelivers it later does not conform to this declaration.
 
 #### `bounded(n)`
 
@@ -569,7 +569,7 @@ Arbitrarily serializing concurrent inputs can satisfy a serialization requiremen
 
 Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
 
-V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order, and lane concurrency `bounded(1)` stops overtaking. Because a redelivered earlier message may be processed after a later one, `at_least_once` or unspecified delivery preserves the precedence only when the operation's idempotency requirement keyed from the same input is proven, so that the late duplicate does no distinguishable work; `at_most_once` delivery admits no redelivery. Vacuously discharged: a subscription admitting no message schemas. See `ARCHSPEC_ORDERING_DRAFT.md`.
+V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order and re-dispatches a failed delivery at its head, and lane concurrency `bounded(1)` stops overtaking. Redelivery therefore cannot invert the precedence: a failure-driven redelivery precedes every later message of its lane, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas. See `ARCHSPEC_ORDERING_DRAFT.md`.
 
 ### Serialization versus ordering
 

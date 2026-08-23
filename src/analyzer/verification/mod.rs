@@ -60,8 +60,8 @@ pub use idempotency::{
     LineageFact, ProducerRef, RetryRoute, TransactionRetrySafety, UnstableRoot,
 };
 pub use ordering::{
-    DuplicateHandling, LaneFact, OrderingCheck, OrderingObstacle, OrderingProof, OrderingVerdict,
-    PrecedenceSource,
+    DuplicateCoverage, DuplicateHandling, LaneFact, OrderingCheck, OrderingObstacle, OrderingProof,
+    OrderingVerdict, PrecedenceSource,
 };
 pub use recoverability::{
     ArtifactAvailability, FlowResumption, RecoverabilityCheck, RecoverabilityNote,

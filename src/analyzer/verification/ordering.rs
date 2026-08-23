@@ -17,15 +17,16 @@
 //!
 //! The mechanism is the §8.2 composition: same-key deliveries enter
 //! one lane (`by_topic_key`, or `single_lane` for every delivery), a
-//! lane dispatches in the order deliveries entered it, and lane
-//! concurrency one stops overtaking within it. One more fact is
-//! needed that serialization does not: a redelivery. Under
-//! `at_least_once` an earlier message may be delivered again after a
-//! later one was processed, and re-executing the earlier logical
-//! invocation behind the later one would invert the precedence —
-//! unless the late duplicate does no distinguishable work, which is
-//! exactly a proven idempotency requirement keyed from the same
-//! input. `at_most_once` delivery admits no redelivery.
+//! lane dispatches in the order deliveries entered it and does not
+//! advance past an incomplete delivery — a failed attempt is
+//! re-dispatched at the head of the lane — and lane concurrency one
+//! stops overtaking within it. Redelivery therefore cannot invert
+//! the precedence: a failure-driven redelivery precedes every later
+//! message of the lane, and a duplicate of an already completed
+//! message is a repeated attempt at a logical invocation that took
+//! effect in order, whose work is the idempotency requirement's
+//! obligation rather than ordering's. The proof records which
+//! requirement covers it, or that none does.
 //!
 //! Request inputs carry no ordering fact in the DSL (arrival order of
 //! unmodeled callers is not a logical precedence), and a key sourced
@@ -45,7 +46,6 @@ use super::idempotency::{IdempotencyCheck, IdempotencyVerdict};
 use super::serialization::{
     MessageKeyFact, SerializationObstacle, admits_no_messages, is_serial_lane, keyed_lane_facts,
 };
-use super::trigger::collapses_duplicates;
 
 /// The verdict for one declared ordering requirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,17 +112,34 @@ pub enum LaneFact {
     SingleLane,
 }
 
-/// Why a redelivered earlier message cannot invert the precedence.
+/// Why redelivery cannot invert the precedence, and who answers for
+/// the work a duplicate does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DuplicateHandling {
     /// `at_most_once` delivery: a logical message is never delivered
-    /// again, so no late duplicate exists.
+    /// again, so neither redelivery nor a duplicate exists.
     SingleDelivery,
 
-    /// The operation's idempotency requirement keyed from this input
-    /// is proven: a late duplicate performs no distinguishable work.
-    CollapsedByIdempotency { requirement: usize },
+    /// A failed delivery is re-dispatched at the head of its lane
+    /// (§8.2), so it precedes every later message; a duplicate of a
+    /// completed delivery is a repeated attempt at an invocation that
+    /// already took effect in order, and what it does is the
+    /// idempotency requirement's obligation — `idempotency` names the
+    /// requirement keyed from this input when one is declared.
+    HeadOfLineRetry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency: Option<DuplicateCoverage>,
+    },
+}
+
+/// The idempotency requirement that answers for duplicate attempts
+/// through an input, and its verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuplicateCoverage {
+    pub requirement: usize,
+    pub proven: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,19 +193,12 @@ pub enum OrderingObstacle {
         input: Id,
         declared: LaneConcurrency,
     },
-
-    /// A redelivered earlier message may be processed after a later
-    /// one, and nothing proven collapses the duplicate: the
-    /// operation's idempotency requirement keyed from this input is
-    /// absent or unproven.
-    RedeliveryNotCollapsed {
-        input: Id,
-        delivery: DeliverySemantics,
-    },
 }
 
-/// Checks every ordering requirement declared by the model, given the
-/// idempotency verdicts redelivery discharge depends on.
+/// Checks every ordering requirement declared by the model. The
+/// idempotency verdicts are read only to record which requirement
+/// answers for duplicate attempts; no ordering verdict depends on
+/// them.
 pub fn check(model: &Model, idempotency: &[IdempotencyCheck]) -> Vec<OrderingCheck> {
     let mut checks = Vec::new();
 
@@ -354,43 +364,35 @@ fn check_requirement(
         });
     }
 
-    // Redelivery: a late duplicate of an earlier message must do no
-    // distinguishable work.
+    // Redelivery: a failed delivery retries at the head of its lane,
+    // and a duplicate of a completed one is idempotency's concern. The
+    // proof records which requirement answers for it.
     let duplicates = match subscription.delivery {
-        DeliverySemantics::AtMostOnce => Some(DuplicateHandling::SingleDelivery),
+        DeliverySemantics::AtMostOnce => DuplicateHandling::SingleDelivery,
 
-        delivery @ (DeliverySemantics::AtLeastOnce | DeliverySemantics::Unspecified) => {
-            let collapsed = collapses_duplicates(operation, input_id)
-                .then(|| {
-                    idempotency.iter().find(|check| {
-                        &check.operation == operation_id
-                            && matches!(check.verdict, IdempotencyVerdict::Proven { .. })
-                            && check.key.components.iter().all(|component| {
-                                component.source == ValueSource::Input(input_id.clone())
-                            })
-                    })
+        DeliverySemantics::AtLeastOnce | DeliverySemantics::Unspecified => {
+            let coverage = idempotency
+                .iter()
+                .find(|check| {
+                    &check.operation == operation_id
+                        && !check.key.components.is_empty()
+                        && check.key.components.iter().all(|component| {
+                            component.source == ValueSource::Input(input_id.clone())
+                        })
                 })
-                .flatten();
-
-            match collapsed {
-                Some(check) => Some(DuplicateHandling::CollapsedByIdempotency {
+                .map(|check| DuplicateCoverage {
                     requirement: check.requirement,
-                }),
+                    proven: matches!(check.verdict, IdempotencyVerdict::Proven { .. }),
+                });
 
-                None => {
-                    obstacles.push(OrderingObstacle::RedeliveryNotCollapsed {
-                        input: input_id.clone(),
-                        delivery,
-                    });
-
-                    None
-                }
+            DuplicateHandling::HeadOfLineRetry {
+                idempotency: coverage,
             }
         }
     };
 
-    match (precedence, lane, duplicates) {
-        (Some(precedence), Some(lane), Some(duplicates)) if obstacles.is_empty() => {
+    match (precedence, lane) {
+        (Some(precedence), Some(lane)) if obstacles.is_empty() => {
             OrderingVerdict::Proven {
                 proof: OrderingProof::LaneOrder {
                     input: input_id.clone(),
@@ -544,26 +546,6 @@ impl OrderingObstacle {
                     LaneConcurrency::Unspecified => format!(
                         "`{input}` declares no lane concurrency fact; overtaking \
                          within a lane cannot be excluded."
-                    ),
-                },
-            },
-
-            Self::RedeliveryNotCollapsed { input, delivery } => Evidence {
-                subject: Some(input.clone()),
-                message: match delivery {
-                    DeliverySemantics::AtLeastOnce => format!(
-                        "`{input}` has at-least-once delivery: an earlier message \
-                         may be redelivered after a later one was processed, and \
-                         the operation has no proven idempotency requirement \
-                         keyed from this input to make the late duplicate do no \
-                         distinguishable work."
-                    ),
-
-                    _ => format!(
-                        "`{input}` declares no delivery fact, so a redelivered \
-                         earlier message cannot be excluded, and the operation \
-                         has no proven idempotency requirement keyed from this \
-                         input to collapse it."
                     ),
                 },
             },

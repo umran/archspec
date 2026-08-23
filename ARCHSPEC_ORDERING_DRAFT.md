@@ -75,9 +75,13 @@ does distinct work:
    topic declares no key domain to route by (§8.2), so that pairing
    is an obstacle rather than a proof.
 2. **Order within the lane.** A logical lane dispatches its deliveries
-   in the order they entered it. §8.2 now states this explicitly; it
-   is what makes a lane a lane rather than a pool, and the §8.2 proof
-   pattern was always read this way.
+   in the order they entered it, and it does not advance past an
+   incomplete delivery: a failed attempt is re-dispatched at the head
+   of the lane before any later delivery. §8.2 now states both
+   explicitly; they are what make a lane a lane rather than a pool,
+   and the §8.2 proof pattern was always read this way. A transport
+   whose lane skips a failed delivery and redelivers it later does
+   not conform to the declaration.
 3. **No overtaking.** Lane concurrency `bounded(1)` means invocations
    in one lane cannot overlap, so a later one cannot overtake an
    earlier one through its execution. Any larger or absent bound
@@ -85,29 +89,45 @@ does distinct work:
 
 ---
 
-## 4. Redelivery: the fact serialization does not need
+## 4. Redelivery and duplicates
 
-Serialization only asks that same-key invocations not overlap.
-Ordering asks that they take effect in order, and a redelivery can
-break that without any overlap: under `at_least_once`, an earlier
-message may be delivered again after a later one was processed.
-Executing the earlier logical invocation behind the later one inverts
-the precedence.
+Serialization only asks that same-key invocations not overlap;
+ordering asks that they take effect in order, so `at_least_once`
+delivery raises a question serialization never meets. Two different
+things hide under "redelivery", and they are answered differently.
 
-V1 discharges this in one of two ways:
+**Failure-driven redelivery.** An attempt at `m1` fails before taking
+effect and `m1` is delivered again. If the lane had advanced to `m2`
+in the meantime, the redelivered attempt — `m1`'s *first effective*
+execution — would take effect after `m2`, and no idempotency fact
+could repair that: there is no duplicate work to collapse, only an
+inversion. What prevents it is the lane semantic of §3: the lane does
+not advance past an incomplete delivery, so the retry precedes `m2`.
+Lane concurrency one keeps the retried attempt from overlapping what
+follows; it is the head-of-line rule that keeps it in place. This is
+why the §8.2 composition is sufficient on its own.
 
-- `at_most_once` delivery: a logical message is never delivered
-  again, so no late duplicate exists; or
-- the operation's **idempotency requirement keyed from the same input
-  is proven**: a late duplicate is another attempt at a logical
-  invocation that already took effect, and the proof says it does no
-  externally distinguishable work — so the observable history still
-  respects the precedence.
+**Duplicates of a completed delivery.** A transport may deliver `m1`
+again after its invocation completed and `m2` was processed. That
+attempt belongs to a logical invocation that already took effect in
+its place; the precedence between logical invocations is intact. What
+the repeated attempt *does* is the idempotency requirement's
+obligation (§9 keeps the two families separate, as it does for
+recoverability), so the ordering proof does not depend on it. The
+proof records which idempotency requirement keyed from the input
+answers for the duplicate and whether it is proven, or that none does
+— in which case the model-wide note on unchecked duplicate deliveries
+already points at the gap.
 
-`unspecified` delivery is treated like `at_least_once`: redelivery
-cannot be excluded. This is the one place ordering depends on another
-family's verdicts; the ordering verifier therefore runs after
-idempotency's fixpoint and reads its verdicts.
+`at_most_once` delivery admits neither case. `unspecified` delivery
+is treated like `at_least_once`: a lost failed attempt takes effect
+never, which inverts nothing, and a redelivered one retries in place.
+
+An earlier revision of this document required a proven idempotency
+requirement for `at_least_once` subscriptions. That was both too
+strong — idempotency is not what keeps a retry in place — and
+unsound for the failure-driven case, where a proven requirement
+collapses nothing; the head-of-line rule replaces it.
 
 ---
 
@@ -128,12 +148,14 @@ Per requirement, in order:
   on a global one) or `single_lane`; otherwise
   `RoutingDoesNotPreserveOrder`. Lane concurrency `bounded(1)`;
   otherwise `LaneConcurrencyNotSerial`.
-- **Redelivery.** `at_most_once`, or a proven idempotency requirement
-  keyed from the input; otherwise `RedeliveryNotCollapsed`.
+- **Duplicates.** Recorded, never an obstacle: `at_most_once`
+  (`SingleDelivery`), or head-of-line retry with the idempotency
+  requirement keyed from the input that answers for duplicates, and
+  its verdict, when one is declared.
 
 A proof (`LaneOrder`) cites the precedence source with its per-schema
 key facts, the lane fact, and the duplicate handling; every citation is
-a declared fact or a proven requirement.
+a declared fact.
 
 ---
 
@@ -144,15 +166,13 @@ is keyed by `order_id` for every schema; the three subscribers route
 `by_topic_key` at lane concurrency one with `at_least_once` delivery,
 and each declares its ordering key as `order_id` of its subscription.
 
-- **`apply_payment`**: keyed precedence, keyed lane, and its
-  idempotency requirement keyed from `captured` is proven.
-  **Proven.**
-- **`reserve_inventory`** and **`charge_payment`**: the same
-  precedence and lane facts, but their idempotency requirements are
-  unproven (a read-dependent reservation; an undeduplicated card
-  charge), so a redelivered earlier message is not established to do
-  no work. **Unproven** on exactly that obstacle — the ordering
-  verdict inherits the idempotency gap rather than hiding it.
+- **`apply_payment`**, **`reserve_inventory`**, **`charge_payment`**:
+  keyed precedence, keyed lane at concurrency one, head-of-line retry.
+  **All proven.** The proofs differ only in what they record about
+  duplicates: `apply_payment`'s idempotency requirement is proven;
+  the other two name their requirements as unproven, which is where
+  the read-dependent reservation and the undeduplicated card charge
+  are reported — under idempotency, not smuggled into ordering.
 
 Video streaming (`tests/fixtures/video_streaming.yaml`):
 `transcode_video` and `publish_video` order by `video_id` on a topic
@@ -171,10 +191,10 @@ both idempotency requirements are proven. **Both proven.**
 3. **Cross-input and cross-operation precedence.** Ordering among
    invocations triggered through different inputs, or a causal order
    across operations, has no source in the DSL.
-4. **Order-preserving redelivery.** Some transports redeliver an
-   ordered suffix rather than a single message; the DSL declares no
-   such fact, so redelivery is collapsed through idempotency or not at
-   all.
+4. **Lane conformance.** Head-of-line retry is a stated lane
+   semantic, not an inferred one; a transport whose ordered lane can
+   skip a failed delivery is outside the declaration, and no fact in
+   the DSL distinguishes it.
 
 ---
 
@@ -187,5 +207,5 @@ Executed 2026-08-22:
 2. **Main document §9** (`OrderingRequirement`): the V1 analysis
    summary — precedence source, mechanism, redelivery.
 3. **Implementation**: `analyzer::verification::ordering`, reusing the
-   serialization verifier's key identity and reading the idempotency
-   verdicts.
+   serialization verifier's key identity; the idempotency verdicts are
+   read only to record duplicate coverage.

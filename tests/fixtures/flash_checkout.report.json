@@ -38,7 +38,8 @@
         "for schema.PaymentCaptured, the topic key order_id is the ordering key field",
         "by_topic_key dispatch keeps same-key deliveries of input.apply_payment.captured in one lane, which dispatches them in delivery order",
         "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
-        "a redelivered earlier message does no distinguishable work: idempotency requirement #0 keyed from input.apply_payment.captured is proven"
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (proven)"
       ],
       "evidence": []
     },
@@ -110,15 +111,17 @@
         "operation": "operation.charge_payment",
         "requirement": 0
       },
-      "status": "unknown",
+      "status": "proven",
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id take effect in their semantic order.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "subject": "input.charge_payment.reserved",
-          "message": "`input.charge_payment.reserved` has at-least-once delivery: an earlier message may be redelivered after a later one was processed, and the operation has no proven idempotency requirement keyed from this input to make the late duplicate do no distinguishable work."
-        }
-      ]
+      "assumptions": [
+        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
+        "for schema.InventoryReserved, the topic key order_id is the ordering key field",
+        "by_topic_key dispatch keeps same-key deliveries of input.charge_payment.reserved in one lane, which dispatches them in delivery order",
+        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
+      ],
+      "evidence": []
     },
     {
       "id": "oblig.operation.charge_payment.idempotency.0",
@@ -227,15 +230,17 @@
         "operation": "operation.reserve_inventory",
         "requirement": 0
       },
-      "status": "unknown",
+      "status": "proven",
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id take effect in their semantic order.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "subject": "input.reserve_inventory.created",
-          "message": "`input.reserve_inventory.created` has at-least-once delivery: an earlier message may be redelivered after a later one was processed, and the operation has no proven idempotency requirement keyed from this input to make the late duplicate do no distinguishable work."
-        }
-      ]
+      "assumptions": [
+        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
+        "for schema.OrderCreated, the topic key order_id is the ordering key field",
+        "by_topic_key dispatch keeps same-key deliveries of input.reserve_inventory.created in one lane, which dispatches them in delivery order",
+        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
+      ],
+      "evidence": []
     },
     {
       "id": "oblig.operation.reserve_inventory.idempotency.0",
