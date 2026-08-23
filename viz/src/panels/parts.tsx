@@ -206,12 +206,23 @@ export function StatusChips({ obKey }: { obKey: string }) {
 
 /** `kind(source).path`. The source's kind prefix is already spelled out,
  *  so the link shows the short id; the whole reference stays on one line. */
+/** A value reference, `kind(source).path`.
+ *
+ *  It holds no spaces, so left to itself it is one unbreakable word: in
+ *  a panel this narrow it overflowed its row and the tail was simply
+ *  clipped, with nothing to scroll to reach it. The seams — after the
+ *  source kind, and after the source — are where a reader would break
+ *  the expression anyway, so they are marked as the places to break
+ *  first; `break-words` catches a segment that still does not fit. */
 export function RefText({ value }: { value: ValueRef }) {
   return (
-    <Mono className="whitespace-nowrap">
+    <Mono className="break-words">
       <span className="text-kumo-subtle">{value.source.kind}(</span>
+      <wbr />
       <IdLink id={value.source.id}>{shortId(value.source.id)}</IdLink>
-      <span className="text-kumo-subtle">).{pathText(value.path)}</span>
+      <span className="text-kumo-subtle">).</span>
+      <wbr />
+      <span className="text-kumo-subtle">{pathText(value.path)}</span>
     </Mono>
   );
 }

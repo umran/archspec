@@ -1,5 +1,5 @@
-import { useCallback, useRef, useState } from "react";
-import type { PointerEvent, WheelEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent } from "react";
 
 export interface ViewBox {
   x: number;
@@ -35,14 +35,29 @@ export function useViewBox(svgRef: React.RefObject<SVGSVGElement | null>) {
     [svgRef],
   );
 
-  const onWheel = useCallback(
-    (e: WheelEvent<SVGSVGElement>) => {
-      e.preventDefault();
+  // Registered natively, and explicitly not passively.
+  //
+  // React attaches `wheel` at the root as a *passive* listener, where
+  // `preventDefault` does nothing at all: the graph would zoom, and the
+  // browser would zoom the whole page underneath it at the same time.
+  // A trackpad pinch arrives here too — as a wheel event carrying
+  // `ctrlKey` — and that is the gesture the page would otherwise steal.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+
+    const onWheel = (event: globalThis.WheelEvent) => {
+      event.preventDefault();
+
       setViewBox((vb) => {
-        const factor = Math.exp(e.deltaY * 0.0015);
-        const next = Math.min(MAX_W, Math.max(MIN_W, vb.w * factor));
+        // A pinch reports far smaller deltas than a wheel notch for the
+        // same intent, so it needs a longer lever to feel like one
+        // gesture rather than a nudge.
+        const sensitivity = event.ctrlKey ? 0.01 : 0.0015;
+        const next = Math.min(MAX_W, Math.max(MIN_W, vb.w * Math.exp(event.deltaY * sensitivity)));
         const real = next / vb.w;
-        const p = clientToWorld(e.clientX, e.clientY, vb);
+        const p = clientToWorld(event.clientX, event.clientY, vb);
+
         return {
           x: p.x - (p.x - vb.x) * real,
           y: p.y - (p.y - vb.y) * real,
@@ -50,9 +65,11 @@ export function useViewBox(svgRef: React.RefObject<SVGSVGElement | null>) {
           h: vb.h * real,
         };
       });
-    },
-    [clientToWorld],
-  );
+    };
+
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, [svgRef, clientToWorld]);
 
   const onPointerDown = useCallback(
     (e: PointerEvent<SVGSVGElement>) => {
@@ -109,7 +126,7 @@ export function useViewBox(svgRef: React.RefObject<SVGSVGElement | null>) {
     viewBox,
     isDragging: () => drag.current?.moved ?? false,
     wasDragged: () => suppressClick.current,
-    handlers: { onWheel, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp },
+    handlers: { onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp },
     fitBounds,
   };
 }
