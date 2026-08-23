@@ -16,3 +16,10 @@ npm run build    # typecheck + single-file bundle → dist/index.html
 `include_str!`, so rebuild and commit it after changing the front end.
 See `ARCHSPEC_VIZ.md` at the repository root for the views, panels, and
 report format.
+
+`App` also takes an optional `theme` prop. Without it the app owns the
+colour mode — restoring the stored choice, setting `data-mode`, and
+offering a toggle — which is what the embedded build needs. With it,
+the host owns the mode and the app neither persists it nor shows a
+toggle, so an application embedding these views has exactly one
+control for it.

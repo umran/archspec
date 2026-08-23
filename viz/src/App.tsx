@@ -6,13 +6,22 @@ import { OperationView } from "./graph/OperationView";
 import { SystemView } from "./graph/SystemView";
 import { DetailPanel } from "./panels/DetailPanel";
 import { ObligationsPanel } from "./panels/ObligationsPanel";
-import { AppStateProvider, useApp } from "./state/AppState";
+import { AppStateProvider, useApp, type Theme } from "./state/AppState";
 import type { PageData } from "./types/page";
 
-export function App({ data }: { data: PageData }) {
+export interface AppProps {
+  data: PageData;
+
+  /** Colour mode, when a host owns it. Given one, the app follows it and
+   *  offers no toggle of its own; left out, it manages its own, as the
+   *  self-contained page `archspec-viz` writes does. */
+  theme?: Theme;
+}
+
+export function App({ data, theme }: AppProps) {
   return (
     <TooltipProvider>
-      <AppStateProvider data={data}>
+      <AppStateProvider data={data} theme={theme}>
         <Shell />
       </AppStateProvider>
     </TooltipProvider>

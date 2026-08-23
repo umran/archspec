@@ -94,9 +94,16 @@ clickable ids that open the referenced entity in place.
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded
 — an "Obligations" button carrying the report's tally that opens the
-obligations panel. Proof-status colouring is always on when a report
+obligations panel. It names the model, not the tool: the document
+title already reads `<model> · archspec`, and a host embedding the
+views has a name of its own in its chrome. Proof-status colouring is always on when a report
 is loaded. The bar shares the pages' content column, so its edges
-line up with the page headers beneath it.
+line up with the page headers beneath it. As the bar narrows it gives
+width away in order of what it costs the reader: the breadcrumbs go
+first (the page header below already says where you are), then the
+model title truncates, then the filter narrows. The controls keep
+their size throughout — a control pushed out of reach is worse than a
+crowded one.
 
 **Notes.** Model-wide warnings the checker raises that belong to no
 single obligation — today, a subscription that admits duplicate
@@ -149,6 +156,21 @@ built with Vite, styled with Tailwind CSS v4 and Cloudflare's
 [Kumo](https://kumo-ui.com/) design system (dark and light modes via
 `data-mode`). The graph views are SVG rendered by React; the layout
 algorithms live in `viz/src/graph/layout*.ts`.
+
+`App` takes the page data and, optionally, a colour mode:
+
+```tsx
+<App data={pageData} />                  // manages its own mode
+<App data={pageData} theme={hostTheme} /> // follows the host's
+```
+
+Left alone — as in the page `archspec-viz` writes, which has no host —
+the app restores the stored choice, sets `data-mode` on the document,
+and offers a toggle in the top bar. An application embedding the views
+usually has a colour mode already, and a second toggle for one setting
+is a control that can disagree with itself; passing `theme` hands
+ownership over, and the app then follows the host, touches neither the
+document nor storage, and shows no toggle.
 
 ```
 cd viz

@@ -11,10 +11,16 @@ import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
 
 /** The top bar sits in the content column and uses the pages' container,
- *  so its edges line up with the page headers below it. */
+ *  so its edges line up with the page headers below it.
+ *
+ *  Width is given away in order of how little it costs: the breadcrumbs
+ *  go first (the page header below repeats where you are), then the
+ *  model title truncates, then the filter narrows. The controls on the
+ *  right keep their full size at every width — a control that cannot be
+ *  reached is worse than one that is crowded. */
 export function TopBar() {
   const app = useApp();
-  const { data, model, report, route, search, obligationsOpen, theme } = app;
+  const { data, model, report, route, search, obligationsOpen, theme, themeControllable } = app;
   const counts = report ? statusCounts(report.obligations) : null;
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
@@ -24,18 +30,26 @@ export function TopBar() {
     : "";
 
   return (
-    <header className="shrink-0 border-b border-kumo-hairline bg-kumo-base">
-      <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-4 px-6">
-        <div className="flex shrink-0 items-baseline gap-2 text-sm">
-          <span className="text-kumo-subtle">archspec</span>
-          <span className="font-medium text-kumo-strong">{data.title}</span>
-          <span className="text-xs text-kumo-subtle">rev {model.revision}</span>
+    // Container queries, not viewport ones: embedded in an application
+    // the views often sit in a pane far narrower than the window, and a
+    // bar that measured the window would lay itself out for room it does
+    // not have.
+    <header className="@container shrink-0 border-b border-kumo-hairline bg-kumo-base">
+      <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-3 px-4 @md:gap-4 @md:px-6">
+        {/* The model, not the tool: the document title already reads
+            "<model> · archspec", and a host embedding these views has a
+            name of its own in its chrome. */}
+        <div className="flex min-w-0 items-baseline gap-2 text-sm">
+          <span className="truncate font-medium text-kumo-strong">{data.title}</span>
+          <span className="hidden shrink-0 text-xs text-kumo-subtle @sm:inline">
+            rev {model.revision}
+          </span>
           {report && report.model_revision !== null && report.model_revision !== model.revision && (
             <Badge variant="warning">report @ rev {report.model_revision}</Badge>
           )}
         </div>
 
-        <div className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden">
+        <div className="hidden min-w-0 flex-1 items-center gap-3 overflow-hidden @3xl:flex">
           <Breadcrumbs size="sm">
             {route.view === "system" ? (
               <Breadcrumbs.Current>system</Breadcrumbs.Current>
@@ -59,13 +73,15 @@ export function TopBar() {
           </Breadcrumbs>
         </div>
 
-        <div className="flex shrink-0 items-center gap-3">
+        <div className="ml-auto flex min-w-0 items-center gap-2 @md:gap-3">
           {/* The filter dims vertices in the system graph; it has no effect
-              on the other pages, so it only appears where it acts. */}
+              on the other pages, so it only appears where it acts. It is
+              the one control here that stays usable while narrowing, so
+              it absorbs the squeeze. */}
           {route.view === "system" && (
             <Input
               size="sm"
-              className="w-44"
+              className="w-44 min-w-16 shrink"
               placeholder="filter ids…"
               value={search}
               onChange={(e) => app.setSearch(e.target.value)}
@@ -73,34 +89,44 @@ export function TopBar() {
             />
           )}
           {report && (
-            <>
-              <Button
-                variant={obligationsOpen ? "primary" : "secondary"}
-                size="sm"
-                icon={ListChecksIcon}
-                aria-pressed={obligationsOpen}
-                aria-expanded={obligationsOpen}
-                title={obligationsOpen ? "Close the obligations panel" : "Open the obligations panel"}
-                onClick={() => app.setObligationsOpen(!obligationsOpen)}
-              >
-                Obligations
-                {tally && <span className={`ml-1.5 font-mono text-xs ${obligationsOpen ? "opacity-80" : "text-kumo-subtle"}`}>{tally}</span>}
-              </Button>
-            </>
+            <Button
+              className="shrink-0"
+              variant={obligationsOpen ? "primary" : "secondary"}
+              size="sm"
+              icon={ListChecksIcon}
+              aria-pressed={obligationsOpen}
+              aria-expanded={obligationsOpen}
+              title={obligationsOpen ? "Close the obligations panel" : "Open the obligations panel"}
+              onClick={() => app.setObligationsOpen(!obligationsOpen)}
+            >
+              <span className="hidden @lg:inline">Obligations</span>
+              {tally && (
+                <span
+                  className={`font-mono text-xs @lg:ml-1.5 ${obligationsOpen ? "opacity-80" : "text-kumo-subtle"}`}
+                >
+                  {tally}
+                </span>
+              )}
+            </Button>
           )}
-          <Tooltip
-            content={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-            render={
-              <Button
-                variant="ghost"
-                size="sm"
-                shape="square"
-                icon={theme === "dark" ? SunIcon : MoonIcon}
-                aria-label="Toggle color mode"
-                onClick={() => app.setTheme(theme === "dark" ? "light" : "dark")}
-              />
-            }
-          />
+          {/* Absent when a host owns the colour mode: its control is the
+              only one, so the two can never disagree. */}
+          {themeControllable && (
+            <Tooltip
+              content={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+              render={
+                <Button
+                  className="shrink-0"
+                  variant="ghost"
+                  size="sm"
+                  shape="square"
+                  icon={theme === "dark" ? SunIcon : MoonIcon}
+                  aria-label="Toggle color mode"
+                  onClick={() => app.setTheme(theme === "dark" ? "light" : "dark")}
+                />
+              }
+            />
+          )}
         </div>
       </div>
     </header>
