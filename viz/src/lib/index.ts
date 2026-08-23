@@ -99,6 +99,28 @@ export function effectSummary(model: Model, index: ModelIndex, effectId: Id): st
   }
 }
 
+/** The transaction that establishes an artifact: a result or intent by an
+ *  explicit establishing step, or an intent implicitly established by the
+ *  transaction whose transition owns the intent's effect. */
+export function establishingTransaction(model: Model, operation: Operation, artifact: Id): Id | null {
+  for (const [txId, tx] of Object.entries(operation.transactions)) {
+    for (const step of tx.steps) {
+      if (step.kind === "establish_invocation_result" && step.result === artifact) return txId;
+      if (step.kind === "establish_effect_intent" && step.intent === artifact) return txId;
+    }
+  }
+  const intent = operation.effect_intents[artifact];
+  if (!intent) return null;
+  for (const [txId, tx] of Object.entries(operation.transactions)) {
+    for (const step of tx.steps) {
+      if (step.kind !== "transition") continue;
+      const transition = model.state_machines[step.machine]?.transitions[step.transition];
+      if (transition && intent.effect in transition.side_effects) return txId;
+    }
+  }
+  return null;
+}
+
 /** The first declared flow whose steps run the transaction, if any. */
 export function flowContaining(operation: Operation, transaction: Id): Id | null {
   for (const [flowId, flow] of Object.entries(operation.flows)) {

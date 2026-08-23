@@ -1979,11 +1979,12 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
 }
 
 #[test]
-fn cyclic_request_dependencies_settle_unproven() {
+fn cyclic_request_dependencies_prove_coinductively() {
     let mut model = load_flash_checkout();
 
-    // transfer_stock and cancel_order request each other; the least
-    // fixpoint leaves both request legs unproven.
+    // transfer_stock and cancel_order request each other; each passes
+    // its local checks under the mutual assumption, so the greatest
+    // fixpoint proves the cycle and marks both proofs coinductive.
     let transfer = model
         .operations
         .get_mut(&id("operation.transfer_stock"))
@@ -2050,21 +2051,49 @@ fn cyclic_request_dependencies_settle_unproven() {
 
     assert!(validation::validate(&model).is_empty());
 
-    for operation in ["operation.transfer_stock", "operation.cancel_order"] {
-        let verdict = idempotency_verdict(&model, operation, 0);
+    let report = verification::verify(&model);
 
-        let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
-            panic!("expected `{operation}` unproven, found {verdict:?}");
-        };
+    for operation in ["operation.transfer_stock", "operation.cancel_order"] {
+        let check = report
+            .idempotency
+            .iter()
+            .find(|check| check.operation == id(operation))
+            .unwrap();
 
         assert!(
-            matches!(
-                &obstacles[..],
-                [IdempotencyObstacle::RequestTargetRequirementUnproven { .. }]
-            ),
-            "expected the cyclic request obstacle for `{operation}`:\n{obstacles:#?}"
+            matches!(check.verdict, IdempotencyVerdict::Proven { .. }),
+            "expected `{operation}` proven, found {:?}",
+            check.verdict
         );
+
+        assert!(check.coinductive, "`{operation}` should be marked coinductive");
     }
+
+    // A member failing locally fails the cycle with it: with an
+    // unspecified instance, cancel_order's request leg is unsafe, and
+    // transfer_stock's target is no longer proven.
+    model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap()
+        .flows
+        .get_mut(&id("flow.cancel_order"))
+        .unwrap()
+        .steps = vec![FlowStep::ExecuteEffect {
+        effect: id("effect.cancel_order.transfer"),
+        values: archspec::spec::Derivation::Unspecified,
+    }];
+
+    let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            IdempotencyVerdict::Unproven { obstacles }
+                if matches!(&obstacles[..], [IdempotencyObstacle::RequestTargetRequirementUnproven { .. }])
+        ),
+        "expected transfer_stock unproven through its failed partner, found {verdict:?}"
+    );
 }
 
 #[test]
@@ -2201,12 +2230,13 @@ fn at_most_once_consumers_collapse_duplicates_by_delivery() {
 }
 
 #[test]
-fn cyclic_publication_dependencies_settle_unproven() {
+fn cyclic_publication_dependencies_prove_coinductively() {
     let mut model = load_flash_checkout();
 
     // apply_payment also consumes the OrderPaid it publishes, so its
-    // cascade collapses only if its own requirement is proven; the
-    // least fixpoint leaves it unproven.
+    // cascade collapses only if its own requirement is proven. Its
+    // local checks pass under that assumption, so the greatest
+    // fixpoint proves it and marks the proof coinductive.
     subscription_mut(
         &mut model,
         "operation.apply_payment",
@@ -2220,23 +2250,32 @@ fn cyclic_publication_dependencies_settle_unproven() {
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+    let check = verification::verify(&model)
+        .idempotency
+        .into_iter()
+        .find(|check| check.operation == id("operation.apply_payment"))
+        .unwrap();
 
-    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
-        panic!("expected apply_payment unproven, found {verdict:?}");
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafeFlows { flows },
+    } = &check.verdict
+    else {
+        panic!("expected apply_payment proven, found {:?}", check.verdict);
     };
 
+    assert!(check.coinductive, "the self-consuming proof should be marked coinductive");
+
     assert!(
-        matches!(
-            &obstacles[..],
-            [IdempotencyObstacle::PublicationConsumerRequirementUnproven {
-                schema,
-                operation,
-                ..
-            }] if schema == &id("schema.OrderPaid")
-                && operation == &id("operation.apply_payment")
-        ),
-        "expected the cyclic cascade obstacle:\n{obstacles:#?}"
+        flows[0].effects.iter().any(|effect| matches!(
+            &effect.safety,
+            EffectSafety::SameLogicalMessage { consumers, .. }
+                if consumers.iter().any(|consumer| matches!(
+                    consumer,
+                    verification::ConsumerCollapse::ProvenRequirement { operation, .. }
+                        if operation == &id("operation.apply_payment")
+                ))
+        )),
+        "the proof should cite apply_payment as its own collapsing consumer:\n{flows:#?}"
     );
 }
 
@@ -2334,5 +2373,345 @@ fn no_admitted_flow_is_vacuously_idempotent() {
                 input: id("input.cancel_order.request"),
             },
         }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ordering
+// ---------------------------------------------------------------------------
+
+fn ordering_verdict(model: &Model, operation: &str, requirement: usize) -> verification::OrderingVerdict {
+    verification::verify(model)
+        .ordering
+        .into_iter()
+        .find(|check| check.operation == id(operation) && check.requirement == requirement)
+        .unwrap_or_else(|| panic!("no ordering check for `{operation}` #{requirement}"))
+        .verdict
+}
+
+#[test]
+fn flash_checkout_ordering_verdicts() {
+    let model = load_flash_checkout();
+
+    let report = verification::verify(&model);
+
+    assert_eq!(report.ordering.len(), 3);
+
+    // apply_payment: the keyed topic is the precedence, by_topic_key at
+    // lane concurrency one preserves it through head-of-line retry, and
+    // its proven idempotency requirement answers for duplicates.
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    let verification::OrderingVerdict::Proven {
+        proof:
+            verification::OrderingProof::LaneOrder {
+                input,
+                topic,
+                precedence,
+                lane,
+                duplicates,
+            },
+    } = &verdict
+    else {
+        panic!("expected apply_payment proven, found {verdict:?}");
+    };
+
+    assert_eq!(input, &id("input.apply_payment.captured"));
+    assert_eq!(topic, &id("topic.order_events"));
+
+    assert!(matches!(
+        precedence,
+        verification::PrecedenceSource::KeyedTopic { message_keys } if message_keys.len() == 1
+    ));
+
+    assert_eq!(*lane, verification::LaneFact::ByTopicKey);
+
+    assert_eq!(
+        *duplicates,
+        verification::DuplicateHandling::HeadOfLineRetry {
+            idempotency: Some(verification::DuplicateCoverage {
+                requirement: 0,
+                proven: true,
+            }),
+        }
+    );
+
+    // reserve_inventory and charge_payment prove by the same facts; the
+    // proofs record that the requirements answering for duplicates are
+    // unproven — the gap is reported under idempotency, not here.
+    for operation in ["operation.reserve_inventory", "operation.charge_payment"] {
+        let verdict = ordering_verdict(&model, operation, 0);
+
+        assert!(
+            matches!(
+                &verdict,
+                verification::OrderingVerdict::Proven {
+                    proof: verification::OrderingProof::LaneOrder {
+                        duplicates: verification::DuplicateHandling::HeadOfLineRetry {
+                            idempotency: Some(verification::DuplicateCoverage {
+                                requirement: 0,
+                                proven: false,
+                            }),
+                        },
+                        ..
+                    }
+                }
+            ),
+            "expected `{operation}` proven with unproven duplicate coverage, found {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn at_most_once_delivery_records_single_delivery() {
+    let mut model = load_flash_checkout();
+
+    subscription_mut(&mut model, "operation.reserve_inventory", "input.reserve_inventory.created")
+        .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+
+    let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Proven {
+                proof: verification::OrderingProof::LaneOrder {
+                    duplicates: verification::DuplicateHandling::SingleDelivery,
+                    ..
+                }
+            }
+        ),
+        "expected reserve_inventory proven by single delivery, found {verdict:?}"
+    );
+}
+
+#[test]
+fn request_inputs_have_no_precedence_source() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .requirements
+        .ordering
+        .push(archspec::spec::OrderingRequirement {
+            key: input_key("input.create_order.request", &["idempotency_key"]),
+        });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = ordering_verdict(&model, "operation.create_order", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Unproven { obstacles }
+            if matches!(&obstacles[..], [verification::OrderingObstacle::RequestInputHasNoPrecedenceSource { .. }])
+    ), "{verdict:?}");
+}
+
+#[test]
+fn ordering_key_not_carrying_the_topic_key_inherits_no_precedence() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .requirements
+        .ordering[0]
+        .key = input_key("input.apply_payment.captured", &["event_id"]);
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Unproven { obstacles }
+            if matches!(
+                &obstacles[..],
+                [verification::OrderingObstacle::KeyIdentityUnestablished { schema, .. }]
+                    if schema == &id("schema.PaymentCaptured")
+            )
+    ), "{verdict:?}");
+}
+
+#[test]
+fn lane_concurrency_above_one_admits_overtaking() {
+    let mut model = load_flash_checkout();
+
+    subscription_mut(&mut model, "operation.apply_payment", "input.apply_payment.captured")
+        .dispatch
+        .lane_concurrency = LaneConcurrency::Unbounded;
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Unproven { obstacles }
+            if matches!(&obstacles[..], [verification::OrderingObstacle::LaneConcurrencyNotSerial { .. }])
+    ), "{verdict:?}");
+}
+
+#[test]
+fn a_global_topic_orders_any_key_through_a_single_lane() {
+    let mut model = load_flash_checkout();
+
+    model
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = archspec::spec::TopicOrdering::Global;
+
+    // by_topic_key has no key domain to route by on a global topic.
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Unproven { obstacles }
+            if matches!(&obstacles[..], [verification::OrderingObstacle::ByTopicKeyWithoutKeyDomain { .. }])
+    ), "{verdict:?}");
+
+    subscription_mut(&mut model, "operation.apply_payment", "input.apply_payment.captured")
+        .dispatch
+        .routing = archspec::spec::DispatchRouting::SingleLane;
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Proven {
+            proof: verification::OrderingProof::LaneOrder {
+                precedence: verification::PrecedenceSource::GlobalTopic,
+                lane: verification::LaneFact::SingleLane,
+                ..
+            }
+        }
+    ), "{verdict:?}");
+}
+
+#[test]
+fn an_unordered_topic_provides_no_precedence() {
+    let mut model = load_flash_checkout();
+
+    model
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = archspec::spec::TopicOrdering::Unordered;
+
+    let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(matches!(
+        &verdict,
+        verification::OrderingVerdict::Unproven { obstacles }
+            if obstacles.iter().any(|obstacle| matches!(
+                obstacle,
+                verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
+                    declared: archspec::spec::TopicOrdering::Unordered,
+                    ..
+                }
+            ))
+    ), "{verdict:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Model notes and lineage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_delivery_without_a_keyed_requirement_is_noted() {
+    let mut model = load_flash_checkout();
+
+    assert!(verification::verify(&model).notes.is_empty());
+
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .requirements
+        .idempotency
+        .clear();
+
+    let report = verification::verify(&model);
+
+    assert!(
+        matches!(
+            &report.notes[..],
+            [verification::ModelNote::DuplicateDeliveryUnchecked { operation, input, .. }]
+                if operation == &id("operation.apply_payment")
+                    && input == &id("input.apply_payment.captured")
+        ),
+        "{:#?}",
+        report.notes
+    );
+
+    assert!(report.diagnostics().iter().any(|diagnostic| {
+        diagnostic.severity == archspec::analyzer::Severity::Warning
+            && matches!(
+                diagnostic.code,
+                archspec::analyzer::DiagnosticCode::Verification(
+                    archspec::analyzer::VerificationCode::DuplicateDeliveryUnchecked
+                )
+            )
+    }));
+}
+
+#[test]
+fn consumer_checks_record_producer_lineage() {
+    let mut model = load_flash_checkout();
+
+    let lineage = |model: &Model| {
+        verification::verify(model)
+            .idempotency
+            .into_iter()
+            .find(|check| check.operation == id("operation.apply_payment"))
+            .unwrap()
+            .lineage
+    };
+
+    // charge_payment propagates its governing key onto PaymentCaptured's
+    // identity, so apply_payment's population rests on a carried key.
+    let facts = lineage(&model);
+
+    assert!(
+        matches!(
+            &facts[..],
+            [verification::IdentityLineage {
+                schema,
+                producer: verification::ProducerRef::Operation { operation, effect },
+                fact: verification::LineageFact::Propagated { requirement: Some(0), .. },
+                ..
+            }] if schema == &id("schema.PaymentCaptured")
+                && operation == &id("operation.charge_payment")
+                && effect == &id("effect.charge_payment.publish_captured")
+        ),
+        "{facts:#?}"
+    );
+
+    // Without the declaration the identity rests on the topic alone.
+    let archspec::spec::Effect::Publication(publication) = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.charge_payment.publish_captured"))
+        .unwrap()
+    else {
+        panic!("publish_captured should be a publication");
+    };
+
+    publication.idempotency_key_propagation.clear();
+
+    let facts = lineage(&model);
+
+    assert!(
+        matches!(
+            &facts[..],
+            [verification::IdentityLineage {
+                fact: verification::LineageFact::Undeclared,
+                ..
+            }]
+        ),
+        "{facts:#?}"
     );
 }

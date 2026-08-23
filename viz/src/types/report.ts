@@ -46,6 +46,8 @@ export interface ProverReport {
   format: number;
   model_revision: number | null;
   obligations: Obligation[];
+  /** Model-wide warnings that belong to no single obligation. */
+  notes?: EvidenceItem[];
 }
 
 export function propertyName(property: Property): string {

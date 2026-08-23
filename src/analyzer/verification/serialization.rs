@@ -356,7 +356,7 @@ fn is_serial_bound(concurrency: OperationConcurrency) -> bool {
     matches!(concurrency, OperationConcurrency::Bounded(bound) if bound.get() == 1)
 }
 
-fn is_serial_lane(concurrency: LaneConcurrency) -> bool {
+pub(super) fn is_serial_lane(concurrency: LaneConcurrency) -> bool {
     matches!(concurrency, LaneConcurrency::Bounded(bound) if bound.get() == 1)
 }
 
@@ -367,7 +367,7 @@ fn is_serial_lane(concurrency: LaneConcurrency) -> bool {
 /// topic's declared messages, so it is empty only when the topic is
 /// resolvable and declares none; an unresolvable topic leaves the
 /// admitted set unknown, which must not become a vacuous proof.
-fn admits_no_messages(model: &Model, subscription: &SubscriptionInput) -> bool {
+pub(super) fn admits_no_messages(model: &Model, subscription: &SubscriptionInput) -> bool {
     match &subscription.messages {
         MessageSelector::Only(messages) => messages.is_empty(),
 
@@ -381,7 +381,7 @@ fn admits_no_messages(model: &Model, subscription: &SubscriptionInput) -> bool {
 /// Establishes the affinity leg of the keyed-lane route: for every
 /// admitted message schema, the topic's ordering key must carry the
 /// same logical value as the serialization key.
-fn keyed_lane_facts(
+pub(super) fn keyed_lane_facts(
     model: &Model,
     input_id: &Id,
     subscription: &SubscriptionInput,

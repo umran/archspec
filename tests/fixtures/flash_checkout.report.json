@@ -31,14 +31,17 @@
         "operation": "operation.apply_payment",
         "requirement": 0
       },
-      "status": "unknown",
+      "status": "proven",
       "summary": "Invocations of operation.apply_payment sharing key input.apply_payment.captured.order_id take effect in their semantic order.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "message": "No V1 verifier attempts ordering obligations; the precedence-source semantics are not yet defined."
-        }
-      ]
+      "assumptions": [
+        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
+        "for schema.PaymentCaptured, the topic key order_id is the ordering key field",
+        "by_topic_key dispatch keeps same-key deliveries of input.apply_payment.captured in one lane, which dispatches them in delivery order",
+        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (proven)"
+      ],
+      "evidence": []
     },
     {
       "id": "oblig.operation.apply_payment.idempotency.0",
@@ -55,7 +58,8 @@
       "assumptions": [
         "tx.apply_payment commits are deduplicated by input.apply_payment.captured.event_id, stable across the attempt class",
         "duplicate executions of effect.order.paid publish the same logical message under topic.order_events's message identity (intent intent.apply_payment.order_paid is recovered from tx.apply_payment's keyed commit)",
-        "no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic"
+        "no modeled subscription on topic.order_events admits schema.OrderPaid; the cascade ends at the topic",
+        "the identity of schema.PaymentCaptured on topic.order_events is carried by its producer's idempotency key (input.charge_payment.reserved.event_id, requirement #0): declared propagation from operation.charge_payment through effect.charge_payment.publish_captured"
       ],
       "evidence": []
     },
@@ -107,14 +111,17 @@
         "operation": "operation.charge_payment",
         "requirement": 0
       },
-      "status": "unknown",
+      "status": "proven",
       "summary": "Invocations of operation.charge_payment sharing key input.charge_payment.reserved.order_id take effect in their semantic order.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "message": "No V1 verifier attempts ordering obligations; the precedence-source semantics are not yet defined."
-        }
-      ]
+      "assumptions": [
+        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
+        "for schema.InventoryReserved, the topic key order_id is the ordering key field",
+        "by_topic_key dispatch keeps same-key deliveries of input.charge_payment.reserved in one lane, which dispatches them in delivery order",
+        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
+      ],
+      "evidence": []
     },
     {
       "id": "oblig.operation.charge_payment.idempotency.0",
@@ -128,7 +135,9 @@
       },
       "status": "unknown",
       "summary": "Repeated attempts at operation.charge_payment sharing the declared key produce the effects of a single invocation.",
-      "assumptions": [],
+      "assumptions": [
+        "the identity of schema.InventoryReserved on topic.order_events is carried by its producer's idempotency key (input.reserve_inventory.created.event_id, requirement #0): declared propagation from operation.reserve_inventory through effect.reserve_inventory.publish_reserved"
+      ],
       "evidence": [
         {
           "subject": "effect.charge_payment.card",
@@ -221,14 +230,17 @@
         "operation": "operation.reserve_inventory",
         "requirement": 0
       },
-      "status": "unknown",
+      "status": "proven",
       "summary": "Invocations of operation.reserve_inventory sharing key input.reserve_inventory.created.order_id take effect in their semantic order.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "message": "No V1 verifier attempts ordering obligations; the precedence-source semantics are not yet defined."
-        }
-      ]
+      "assumptions": [
+        "topic.order_events orders same-key messages (keyed ordering); that order is the precedence",
+        "for schema.OrderCreated, the topic key order_id is the ordering key field",
+        "by_topic_key dispatch keeps same-key deliveries of input.reserve_inventory.created in one lane, which dispatches them in delivery order",
+        "lane concurrency bounded(1) stops a later invocation overtaking an earlier one",
+        "a failed delivery is re-dispatched at the head of its lane, so a redelivery precedes every later message",
+        "a duplicate of a completed delivery repeats an invocation that already took effect in order; its work is idempotency requirement #0's obligation (unproven)"
+      ],
+      "evidence": []
     },
     {
       "id": "oblig.operation.reserve_inventory.idempotency.0",
@@ -242,7 +254,9 @@
       },
       "status": "unknown",
       "summary": "Repeated attempts at operation.reserve_inventory sharing the declared key produce the effects of a single invocation.",
-      "assumptions": [],
+      "assumptions": [
+        "the identity of schema.OrderCreated on topic.order_events is carried by its producer's idempotency key (input.create_order.request.idempotency_key, requirement #0): declared propagation from operation.create_order through effect.create_order.publish_created"
+      ],
       "evidence": [
         {
           "subject": "tx.reserve_inventory",

@@ -53,16 +53,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, Derivation, Effect, ExternalEffect, FlowStep, Id, IdempotencyGuarantee,
-    IdempotencyKey, Input, InvocationFlow, MessageIdentity, Model, Operation, PublicationEffect,
-    RequestEffect, TransitionSideEffect, ValueRef, ValueSource,
+    DeliverySemantics, Derivation, Effect, ExternalEffect, FieldPath, FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, InvocationFlow, MessageIdentity, MessageSelector, Model, Operation, PublicationEffect, RequestEffect, TransitionSideEffect, ValueRef, ValueSource,
 };
 
 use super::describe::{gap_sentences, governing_key_evidence, stability_sentence};
 use super::replay::{
     ArtifactReplay, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StabilityGap, StableRoot,
 };
-use super::trigger::{TriggerGraph, collapses_duplicates};
+use super::trigger::{ProducerSite, TriggerGraph, collapses_duplicates};
 
 /// The verdict for one declared idempotency requirement's side-effect
 /// obligation.
@@ -78,6 +76,59 @@ pub struct IdempotencyCheck {
     pub key: IdempotencyKey,
 
     pub verdict: IdempotencyVerdict,
+
+    /// Set when the proof holds only together with the proofs of the
+    /// requirements it reaches through request targets or message
+    /// consumers, and theirs hold only with it: the greatest fixpoint
+    /// admits such a cycle by the minimal-counterexample argument of
+    /// `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1.
+    #[serde(default)]
+    pub coinductive: bool,
+
+    /// For a governing key whose population is a subscription's
+    /// messages on a topic with a keyed identity: per admitted schema
+    /// and modeled producer, whether a declared propagation (§12)
+    /// carries a key onto the identity fields the population rests on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<IdentityLineage>,
+}
+
+/// How a message's declared identity on its topic relates to the key
+/// of the declaration that publishes it — the propagation lineage of
+/// §12, read from the consumer's side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityLineage {
+    pub topic: Id,
+    pub schema: Id,
+    pub producer: ProducerRef,
+    pub fact: LineageFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProducerRef {
+    Operation { operation: Id, effect: Id },
+    Transition { machine: Id, transition: Id, effect: Id },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LineageFact {
+    /// The producer declares a propagation whose targets cover the
+    /// identity fields, so the identity carries `source`; when the
+    /// source is the key of one of the producing operation's own
+    /// idempotency requirements, `requirement` names it, and distinct
+    /// logical invocations of the producer publish distinct messages.
+    Propagated {
+        source: IdempotencyKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requirement: Option<usize>,
+    },
+
+    /// No declared propagation carries a key onto the identity fields:
+    /// the identity rests on the topic declaration alone.
+    Undeclared,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,31 +403,181 @@ struct Scope<'a> {
 }
 
 /// Checks every idempotency requirement declared by the model, as a
-/// least fixpoint over cross-operation discharge through request
-/// targets and message consumers.
+/// fixpoint over cross-operation discharge through request targets and
+/// message consumers.
+///
+/// The verdicts are the greatest fixpoint: every requirement with an
+/// admissible governing key is assumed, and whatever fails under that
+/// assumption is dropped until nothing more fails, so a cycle of
+/// requirements that each collapse the others' duplicates proves
+/// (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1). The least fixpoint is
+/// computed alongside to mark which proofs rest on such a cycle.
 pub fn check(model: &Model) -> Vec<IdempotencyCheck> {
     let graph = TriggerGraph::new(model);
-    let mut proven: BTreeSet<(Id, Id)> = BTreeSet::new();
 
+    let least = proven_set(&fixpoint(model, &graph, BTreeSet::new()));
+
+    let every: BTreeSet<(Id, Id)> = model
+        .operations
+        .iter()
+        .flat_map(|(operation, declaration)| {
+            declaration
+                .requirements
+                .idempotency
+                .iter()
+                .filter_map(move |requirement| {
+                    Some((operation.clone(), key_input(&requirement.key)?.clone()))
+                })
+        })
+        .collect();
+
+    let mut checks = fixpoint(model, &graph, every);
+
+    for check in &mut checks {
+        if matches!(check.verdict, IdempotencyVerdict::Proven { .. })
+            && let Some(input) = key_input(&check.key)
+            && !least.contains(&(check.operation.clone(), input.clone()))
+        {
+            check.coinductive = true;
+        }
+    }
+
+    checks
+}
+
+/// Iterates `run` from `assumed` until the proven set is stable. From
+/// the empty set the chain ascends to the least fixpoint; from every
+/// admissible requirement it descends to the greatest, since fewer
+/// assumptions never prove more.
+fn fixpoint(model: &Model, graph: &TriggerGraph<'_>, mut assumed: BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
     loop {
         let checks = run(&Scope {
             model,
-            graph: &graph,
-            proven: &proven,
+            graph,
+            proven: &assumed,
         });
 
-        let next: BTreeSet<(Id, Id)> = checks
-            .iter()
-            .filter(|check| matches!(check.verdict, IdempotencyVerdict::Proven { .. }))
-            .filter_map(|check| Some((check.operation.clone(), key_input(&check.key)?.clone())))
-            .collect();
+        let next = proven_set(&checks);
 
-        if next == proven {
+        if next == assumed {
             return checks;
         }
 
-        proven = next;
+        assumed = next;
     }
+}
+
+fn proven_set(checks: &[IdempotencyCheck]) -> BTreeSet<(Id, Id)> {
+    checks
+        .iter()
+        .filter(|check| matches!(check.verdict, IdempotencyVerdict::Proven { .. }))
+        .filter_map(|check| Some((check.operation.clone(), key_input(&check.key)?.clone())))
+        .collect()
+}
+
+/// The propagation lineage behind a subscription-triggered governing
+/// key: for every admitted schema on the input's topic and every
+/// modeled producer of it, whether a declared propagation carries a
+/// key onto the identity fields the population rests on.
+fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Vec<IdentityLineage> {
+    let Some(input_id) = key_input(key) else {
+        return Vec::new();
+    };
+
+    let Some(Input::Subscription(subscription)) = operation.inputs.get(input_id) else {
+        return Vec::new();
+    };
+
+    let Some(topic) = scope.model.topics.get(&subscription.topic) else {
+        return Vec::new();
+    };
+
+    let MessageIdentity::Keyed { mapping } = &topic.message_identity else {
+        return Vec::new();
+    };
+
+    let admitted: Vec<&Id> = match &subscription.messages {
+        MessageSelector::All => topic.messages.iter().collect(),
+        MessageSelector::Only(schemas) => schemas.iter().collect(),
+    };
+
+    let mut out = Vec::new();
+
+    for schema in admitted {
+        let Some(identity) = mapping.get(schema) else {
+            continue;
+        };
+
+        for producer in scope.graph.producers(&subscription.topic, schema) {
+            let fact = producer
+                .publication
+                .idempotency_key_propagation
+                .iter()
+                .find_map(|propagation| {
+                    let targets: Vec<&FieldPath> = propagation
+                        .target
+                        .components
+                        .iter()
+                        .filter(|component| {
+                            component.source == ValueSource::Effect(producer.effect.clone())
+                        })
+                        .map(|component| &component.path)
+                        .collect();
+
+                    identity
+                        .iter()
+                        .all(|field| targets.contains(&field))
+                        .then(|| {
+                            let requirement = match producer.site {
+                                ProducerSite::Operation { operation } => scope
+                                    .model
+                                    .operations
+                                    .get(operation)
+                                    .and_then(|declaration| {
+                                        declaration
+                                            .requirements
+                                            .idempotency
+                                            .iter()
+                                            .position(|requirement| {
+                                                requirement.key == propagation.source
+                                            })
+                                    }),
+
+                                ProducerSite::Transition { .. } => None,
+                            };
+
+                            LineageFact::Propagated {
+                                source: propagation.source.clone(),
+                                requirement,
+                            }
+                        })
+                })
+                .unwrap_or(LineageFact::Undeclared);
+
+            out.push(IdentityLineage {
+                topic: subscription.topic.clone(),
+                schema: schema.clone(),
+                producer: match producer.site {
+                    ProducerSite::Operation { operation } => ProducerRef::Operation {
+                        operation: operation.clone(),
+                        effect: producer.effect.clone(),
+                    },
+
+                    ProducerSite::Transition {
+                        machine,
+                        transition,
+                    } => ProducerRef::Transition {
+                        machine: machine.clone(),
+                        transition: transition.clone(),
+                        effect: producer.effect.clone(),
+                    },
+                },
+                fact,
+            });
+        }
+    }
+
+    out
 }
 
 /// The triggering input of an admissible governing key.
@@ -397,6 +598,8 @@ fn run(scope: &Scope<'_>) -> Vec<IdempotencyCheck> {
                 requirement: index,
                 key: requirement.key.clone(),
                 verdict: check_requirement(scope, operation, &requirement.key),
+                coinductive: false,
+                lineage: lineage(scope, operation, &requirement.key),
             });
         }
     }

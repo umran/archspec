@@ -569,9 +569,12 @@ commit by the idempotency key itself — repairs it.
    with replay-deterministic payload derivations — turning the
    assumption into a checked conclusion, and may even infer stability
    without the declaration by tracing lineage across the topic. V1
-   consumes only the declaration. The recursion across operations
-   (including publication cycles) needs its own well-foundedness
-   treatment and is out of V1 scope.
+   consumes only the declaration, but since 2026-08-22 it also reads
+   the declared propagations on the consumer's side and records, per
+   producer, whether the identity is carried by the producer's key
+   (§12 of the main document); the record informs the verdict's
+   reader without changing the verdict. Inferring stability from that
+   lineage remains out of scope.
 2. **Read invariance.** No `R(S) = R(T(S))` analysis; `TransactionRead`
    remains excluded (§18).
 3. **Subject invariance.** No lifecycle or immutability analysis makes

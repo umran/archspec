@@ -94,8 +94,8 @@ fn obligations_carry_real_verdicts() {
     // response replay + create_order/apply_payment recoverability.
     // create_order's idempotency is unknown through its cascade:
     // reserve_inventory consumes OrderCreated and is itself unproven.
-    assert_eq!(count(Status::Proven), 7);
-    assert_eq!(count(Status::Unknown), 9);
+    assert_eq!(count(Status::Proven), 10);
+    assert_eq!(count(Status::Unknown), 6);
     assert_eq!(count(Status::Disproven), 0);
 
     // Proven obligations state the facts their proofs rely on;
@@ -118,14 +118,14 @@ fn obligations_carry_real_verdicts() {
         }
     }
 
-    // The unverified families say why they are unknown.
+    // The unverified family says why it is unknown.
     assert!(
         report
             .obligations
             .iter()
             .filter(|obligation| matches!(
                 obligation.property,
-                Property::Ordering | Property::ObjectHistory
+                Property::ObjectHistory
             ))
             .all(|obligation| {
                 obligation

@@ -18,6 +18,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
+    DuplicateHandling, LaneFact, LineageFact, ModelNote, OrderingProof, OrderingVerdict,
+    PrecedenceSource,
+};
+use crate::analyzer::verification::{
     self, ArtifactReplay, ConsumerCollapse, EffectSafety, IdempotencyProof, IdempotencyVerdict,
     InstanceStability, KeyIdentity, RecoverabilityProof, RecoverabilityVerdict, Resolution,
     ResponseReplayProof, ResponseReplayVerdict, RetryDriver, RetryRoute, SerializationProof,
@@ -40,6 +44,11 @@ pub struct ProverReport {
     pub model_revision: Option<u64>,
 
     pub obligations: Vec<Obligation>,
+
+    /// Model-wide notes that belong to no single obligation: warnings
+    /// the checker raises about gaps no declaration covers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<EvidenceItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +313,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
         format: 1,
         model_revision: Some(model.revision.0),
         obligations,
+        notes: Vec::new(),
     }
 }
 
@@ -318,13 +328,6 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
 
     for obligation in &mut report.obligations {
         match obligation.property {
-            Property::Ordering => obligation.evidence.push(EvidenceItem {
-                subject: None,
-                message: "No V1 verifier attempts ordering obligations; the \
-                          precedence-source semantics are not yet defined."
-                    .to_string(),
-            }),
-
             Property::ObjectHistory => obligation.evidence.push(EvidenceItem {
                 subject: None,
                 message: "No V1 verifier attempts object-history obligations."
@@ -344,6 +347,15 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         });
     }
 
+    for check in &verification.ordering {
+        let id = obligation_id(&check.operation, "ordering", check.requirement);
+
+        patch(&mut report, &id, || match &check.verdict {
+            OrderingVerdict::Proven { proof } => Ok(ordering_assumptions(proof)),
+            OrderingVerdict::Unproven { .. } => Err(check.diagnostic()),
+        });
+    }
+
     for check in &verification.idempotency {
         let id = obligation_id(&check.operation, "idempotency", check.requirement);
 
@@ -351,6 +363,79 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             IdempotencyVerdict::Proven { proof } => Ok(idempotency_assumptions(proof)),
             IdempotencyVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        if let Some(obligation) = report
+            .obligations
+            .iter_mut()
+            .find(|obligation| obligation.id == id)
+        {
+            if check.coinductive {
+                obligation.assumptions.insert(
+                    0,
+                    "proven coinductively: this requirement and the ones it reaches \
+                     through request targets or message consumers collapse each \
+                     other's duplicates, and the greatest fixpoint admits the cycle \
+                     (effect-safety draft §4.1)"
+                        .to_string(),
+                );
+            }
+
+            // Lineage facts ride along: declared propagations become
+            // assumptions the identity-based population rests on, and
+            // their absence is evidence a reader wants next to it.
+            for lineage in &check.lineage {
+                let producer = match &lineage.producer {
+                    verification::ProducerRef::Operation { operation, effect } => {
+                        format!("{operation} through {effect}")
+                    }
+                    verification::ProducerRef::Transition {
+                        machine,
+                        transition,
+                        effect,
+                    } => format!("{machine}'s {transition} through {effect}"),
+                };
+
+                match &lineage.fact {
+                    LineageFact::Propagated { source, requirement } => {
+                        let key = source
+                            .components
+                            .iter()
+                            .map(value_ref_label)
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+
+                        obligation.assumptions.push(match requirement {
+                            Some(index) => format!(
+                                "the identity of {} on {} is carried by its producer's \
+                                 idempotency key ({key}, requirement #{index}): declared \
+                                 propagation from {producer}",
+                                lineage.schema, lineage.topic
+                            ),
+                            None => format!(
+                                "the identity of {} on {} carries {key} by declared \
+                                 propagation from {producer}",
+                                lineage.schema, lineage.topic
+                            ),
+                        });
+                    }
+
+                    LineageFact::Undeclared => obligation.evidence.push(EvidenceItem {
+                        subject: match &lineage.producer {
+                            verification::ProducerRef::Operation { effect, .. }
+                            | verification::ProducerRef::Transition { effect, .. } => {
+                                Some(effect.clone())
+                            }
+                        },
+                        message: format!(
+                            "{producer} publishes {} to {} without a declared \
+                             propagation onto its identity fields; the identity this \
+                             population rests on is the topic declaration alone.",
+                            lineage.schema, lineage.topic
+                        ),
+                    }),
+                }
+            }
+        }
     }
 
     for check in &verification.response_replay {
@@ -387,6 +472,15 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             }));
         }
     }
+
+    report.notes = verification
+        .notes
+        .iter()
+        .map(|note: &ModelNote| EvidenceItem {
+            subject: note.subject(),
+            message: note.message(),
+        })
+        .collect();
 
     report
 }
@@ -503,6 +597,105 @@ fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
 
             assumptions
                 .push("lane concurrency bounded(1) prevents overlap within the lane".to_string());
+
+            assumptions
+        }
+    }
+}
+
+fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
+    match proof {
+        OrderingProof::NoAdmittedInvocations { input } => vec![format!(
+            "{input} admits no message schemas; no invocation bears the key and \
+             no precedence exists to preserve"
+        )],
+
+        OrderingProof::LaneOrder {
+            input,
+            topic,
+            precedence,
+            lane,
+            duplicates,
+        } => {
+            let mut assumptions = Vec::new();
+
+            match precedence {
+                PrecedenceSource::KeyedTopic { message_keys } => {
+                    assumptions.push(format!(
+                        "{topic} orders same-key messages (keyed ordering); that order \
+                         is the precedence"
+                    ));
+
+                    for key in message_keys {
+                        assumptions.push(match &key.identity {
+                            KeyIdentity::SamePath => format!(
+                                "for {}, the topic key {} is the ordering key field",
+                                key.schema, key.topic_key
+                            ),
+
+                            KeyIdentity::SameCanonicalValue { schema, path } => format!(
+                                "for {}, the topic key {} and the ordering key both \
+                                 denote {schema}.{path} through declared fragment mappings",
+                                key.schema, key.topic_key
+                            ),
+                        });
+                    }
+                }
+
+                PrecedenceSource::GlobalTopic => assumptions.push(format!(
+                    "{topic} orders every message (global ordering); that order is \
+                     the precedence for any key"
+                )),
+            }
+
+            assumptions.push(match lane {
+                LaneFact::ByTopicKey => format!(
+                    "by_topic_key dispatch keeps same-key deliveries of {input} in one \
+                     lane, which dispatches them in delivery order"
+                ),
+
+                LaneFact::SingleLane => format!(
+                    "every delivery of {input} enters one lane (single_lane), which \
+                     dispatches them in delivery order"
+                ),
+            });
+
+            assumptions.push(
+                "lane concurrency bounded(1) stops a later invocation overtaking an \
+                 earlier one"
+                    .to_string(),
+            );
+
+            match duplicates {
+                DuplicateHandling::SingleDelivery => assumptions.push(format!(
+                    "{input} receives each logical message at most once, so neither \
+                     redelivery nor a duplicate exists"
+                )),
+
+                DuplicateHandling::HeadOfLineRetry { idempotency } => {
+                    assumptions.push(
+                        "a failed delivery is re-dispatched at the head of its lane, \
+                         so a redelivery precedes every later message"
+                            .to_string(),
+                    );
+
+                    assumptions.push(match idempotency {
+                        Some(coverage) => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; its work is idempotency \
+                             requirement #{}'s obligation ({})",
+                            coverage.requirement,
+                            if coverage.proven { "proven" } else { "unproven" }
+                        ),
+
+                        None => format!(
+                            "a duplicate of a completed delivery repeats an invocation \
+                             that already took effect in order; no idempotency \
+                             requirement keyed from {input} answers for its work"
+                        ),
+                    });
+                }
+            }
 
             assumptions
         }

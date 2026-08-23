@@ -43,7 +43,6 @@ interface AppState {
   detail: DetailTarget | null;
   expandedTx: ReadonlySet<string>;
   search: string;
-  overlay: boolean;
   obligationsOpen: boolean;
   theme: Theme;
   fitRequest: number;
@@ -54,7 +53,6 @@ interface AppState {
   closeDetail: () => void;
   toggleTx: (key: string) => void;
   setSearch: (value: string) => void;
-  setOverlay: (value: boolean) => void;
   setObligationsOpen: (value: boolean) => void;
   setTheme: (value: Theme) => void;
   requestFit: () => void;
@@ -84,7 +82,6 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
-  const [overlay, setOverlay] = useState(true);
   const [obligationsOpen, setObligationsOpen] = useState(false);
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [fitRequest, setFitRequest] = useState(0);
@@ -202,7 +199,6 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
       detail,
       expandedTx,
       search,
-      overlay,
       obligationsOpen,
       theme,
       fitRequest,
@@ -211,7 +207,6 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
       closeDetail,
       toggleTx,
       setSearch,
-      setOverlay,
       setObligationsOpen,
       setTheme,
       requestFit,
@@ -219,7 +214,7 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
       focusSubject,
     }),
     [
-      data, index, obligations, route, selection, detail, expandedTx, search, overlay,
+      data, index, obligations, route, selection, detail, expandedTx, search,
       obligationsOpen, theme, fitRequest, select, openDetail, closeDetail, toggleTx,
       requestFit, navigateTo, focusSubject,
     ],

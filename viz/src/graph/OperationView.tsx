@@ -10,13 +10,14 @@ import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
+import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, responseSource, routing } from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
 import { effectDef, effectSummary } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { concurrencyText, predicateText } from "../lib/text";
 import { useApp, type DetailContext } from "../state/AppState";
-import { Fact, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
+import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
 import type { Effect, Id, InvocationFlow, Operation, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
 
 type EffectKind = (Effect | TransitionSideEffect)["kind"];
@@ -197,11 +198,15 @@ function FlowBody({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowId:
             <StepTitle>{shortId(step.transaction)}</StepTitle>
             {tx ? (
               <>
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                  <FactBadge fact={commitGuarantee(tx.idempotency)} />
+                  {tx.idempotency.kind === "deduplicated_by" && (
+                    <span>by <KeyComponents value={tx.idempotency.key} /></span>
+                  )}
+                </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                  <span>{tx.isolation}</span>
-                  <span>·</span>
-                  <Badge variant={tx.idempotency.kind === "deduplicated_by" ? "success" : "warning"}>{tx.idempotency.kind}</Badge>
-                  {tx.data_model && <span>· {shortId(tx.data_model)}</span>}
+                  <FactBadge fact={isolation(tx.isolation)} />
+                  {tx.data_model && <span>on {shortId(tx.data_model)}</span>}
                 </div>
                 <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(expandKey)}>
                   <Collapsible.Trigger
@@ -274,8 +279,10 @@ function FlowBody({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowId:
           {resp && (
             <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
               <IdLink id={resp.schema}>{shortId(resp.schema)}</IdLink>
-              <span>· source</span>
-              <Badge variant={resp.source.kind === "invocation_result" ? "info" : "warning"}>{resp.source.kind}</Badge>
+              <FactBadge fact={responseSource(resp.source.kind === "invocation_result" ? resp.source.result : null)} />
+              {resp.source.kind === "invocation_result" && (
+                <span>from <IdLink id={resp.source.result}>{shortId(resp.source.result)}</IdLink></span>
+              )}
             </div>
           )}
         </StepCard>
@@ -338,7 +345,7 @@ function FlowBody({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowId:
 // ---------------------------------------------------------------------------
 
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
-  const { obligations, overlay, selection, select } = useApp();
+  const { obligations, selection, select } = useApp();
   const reqs = op.requirements;
 
   const rows: { prop: RequirementKind; i: number; declares: ReactNode }[] = [];
@@ -381,11 +388,9 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       <Table.Body>
         {rows.map((row) => {
           const key = `req:${row.prop}:${row.i}`;
-          const obs = overlay
-            ? (obligations.get(id) ?? []).filter(
+          const obs = (obligations.get(id) ?? []).filter(
                 (ob) => ob.subject.kind === "operation" && ob.subject.requirement === row.i &&
-                  propertyMatchesRequirement(ob.property, row.prop))
-            : [];
+                  propertyMatchesRequirement(ob.property, row.prop));
           const status = obs.length ? worstStatus(obs) : null;
           return (
             <Table.Row
@@ -461,16 +466,12 @@ function InputsTable({ op }: { op: Operation }) {
               <Table.Cell>
                 <span className="flex flex-wrap items-center gap-1.5">
                   {input.kind === "request" ? (
-                    input.identity.kind === "keyed" ? (
-                      <Badge variant="success">identity keyed</Badge>
-                    ) : (
-                      <Badge variant="neutral">identity unspecified</Badge>
-                    )
+                    <FactBadge fact={requestIdentity(input.identity)} />
                   ) : (
                     <>
-                      <Badge variant="neutral">{input.delivery}</Badge>
-                      <Badge variant="neutral">{input.dispatch.routing}</Badge>
-                      <span className="text-xs text-kumo-subtle">lane {concurrencyText(input.dispatch.lane_concurrency)}</span>
+                      <FactBadge fact={delivery(input.delivery)} />
+                      <FactBadge fact={routing(input.dispatch.routing)} />
+                      <FactBadge fact={laneConcurrency(input.dispatch.lane_concurrency)} />
                     </>
                   )}
                 </span>

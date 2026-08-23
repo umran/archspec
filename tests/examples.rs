@@ -55,8 +55,8 @@ fn video_streaming_example_proves_every_verifiable_obligation() {
 
     for obligation in &report.obligations {
         match obligation.property {
-            // Ordering and object history have no V1 verifier.
-            Property::Ordering | Property::ObjectHistory => {
+            // Object history has no V1 verifier.
+            Property::ObjectHistory => {
                 assert_eq!(obligation.status, Status::Unknown, "{}", obligation.id);
             }
 
@@ -72,6 +72,6 @@ fn video_streaming_example_proves_every_verifiable_obligation() {
             .iter()
             .filter(|obligation| obligation.status == Status::Proven)
             .count(),
-        13
+        15
     );
 }

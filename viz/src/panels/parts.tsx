@@ -1,5 +1,8 @@
 import { Badge } from "@cloudflare/kumo/components/badge";
 import { LayerCard } from "@cloudflare/kumo/components/layer-card";
+import { Tooltip } from "@cloudflare/kumo/components/tooltip";
+
+import type { Explanation } from "../lib/explain";
 import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Text } from "@cloudflare/kumo/components/text";
 import { useState, type ReactNode } from "react";
@@ -103,6 +106,34 @@ export function selectableRow(selected: boolean): string {
     : "cursor-pointer [&:hover>td]:bg-kumo-contrast/5";
 }
 
+/** A declared fact as a badge, with its implication as a tooltip. */
+export function FactBadge({ fact }: { fact: Explanation }) {
+  return (
+    <Tooltip
+      content={fact.summary}
+      render={
+        <span className="inline-flex">
+          <Badge variant={fact.tone}>{fact.label}</Badge>
+        </span>
+      }
+    />
+  );
+}
+
+/** A declared fact as a block: badge, the declaration itself, and what it
+ *  implies in plain words. */
+export function FactNote({ fact, children }: { fact: Explanation; children?: ReactNode }) {
+  return (
+    <div className="space-y-1 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <Badge variant={fact.tone}>{fact.label}</Badge>
+        {children}
+      </div>
+      <p className="text-xs leading-relaxed text-kumo-subtle">{fact.summary}</p>
+    </div>
+  );
+}
+
 export function KeyValue({ rows }: { rows: [string, ReactNode | null | undefined][] }) {
   return (
     <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-sm">
@@ -157,9 +188,8 @@ export function StatusBadge({ status }: { status: Status }) {
 
 /** Compact per-status counts for the obligations anchored to an entity. */
 export function StatusChips({ obKey }: { obKey: string }) {
-  const { overlay } = useApp();
   const obs = useObligationsAt(obKey);
-  if (!overlay || !obs.length) return null;
+  if (!obs.length) return null;
   const counts = statusCounts(obs);
   return (
     <span className="inline-flex items-center gap-1">

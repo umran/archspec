@@ -5,13 +5,13 @@ import { Empty } from "@cloudflare/kumo/components/empty";
 import { Input } from "@cloudflare/kumo/components/input";
 import { Tabs } from "@cloudflare/kumo/components/tabs";
 import { Text } from "@cloudflare/kumo/components/text";
-import { CaretRightIcon, ListChecksIcon, XIcon } from "@phosphor-icons/react";
+import { CaretRightIcon, ListChecksIcon, WarningIcon, XIcon } from "@phosphor-icons/react";
 import { useMemo, useState } from "react";
 
 import { shortId } from "../lib/ids";
 import { STATUS_GLYPH, STATUS_ORDER, statusCounts, subjectGroup, subjectText, worstStatus } from "../lib/obligations";
 import { useApp } from "../state/AppState";
-import { propertyName, type Obligation, type Status } from "../types/report";
+import { propertyName, type EvidenceItem, type Obligation, type Status } from "../types/report";
 import { ObligationCard } from "./ObligationCard";
 import { StatusBadge } from "./parts";
 
@@ -78,6 +78,9 @@ export function ObligationsPanel() {
         <Input size="sm" placeholder="filter obligations…" value={query} onChange={(e) => setQuery(e.target.value)} />
       </div>
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3">
+        {filter === "all" && !query && (report.notes?.length ?? 0) > 0 && (
+          <NotesGroup notes={report.notes ?? []} />
+        )}
         {groups.length === 0 && (
           <Empty size="sm" title="no obligations match" description="Adjust the status filter or the search." />
         )}
@@ -86,6 +89,38 @@ export function ObligationsPanel() {
         ))}
       </div>
     </div>
+  );
+}
+
+/** Model-wide warnings: gaps no obligation covers, raised by the checker. */
+function NotesGroup({ notes }: { notes: EvidenceItem[] }) {
+  const { openDetail } = useApp();
+  const [open, setOpen] = useState(true);
+  return (
+    <Collapsible.Root open={open} onOpenChange={setOpen}>
+      <Collapsible.Trigger className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-1 py-1 text-left hover:bg-kumo-tint">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <CaretRightIcon size={12} className={`shrink-0 text-kumo-inactive transition-transform ${open ? "rotate-90" : ""}`} />
+          <WarningIcon size={14} className="shrink-0 text-kumo-warning" />
+          <span className="truncate text-[12px] font-semibold text-kumo-strong">notes</span>
+        </span>
+        <Badge variant="warning" appearance="dot">{notes.length}</Badge>
+      </Collapsible.Trigger>
+      <Collapsible.Panel>
+        <ul className="space-y-2 pl-1 pt-2">
+          {notes.map((note, i) => (
+            <li key={i} className="rounded-md border border-kumo-warning/40 bg-kumo-warning-tint/40 p-2.5 text-xs leading-relaxed text-kumo-default">
+              {note.subject && (
+                <button type="button" className="mb-1 block cursor-pointer font-mono text-[11px] text-kumo-link hover:underline" onClick={() => openDetail(note.subject!)}>
+                  {shortId(note.subject)}
+                </button>
+              )}
+              {note.message}
+            </li>
+          ))}
+        </ul>
+      </Collapsible.Panel>
+    </Collapsible.Root>
   );
 }
 

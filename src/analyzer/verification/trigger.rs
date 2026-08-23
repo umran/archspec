@@ -11,7 +11,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::spec::{Id, Input, MessageSelector, Model, Operation, SubscriptionInput, ValueSource};
+use crate::spec::{
+    Effect, Id, Input, MessageSelector, Model, Operation, PublicationEffect, SubscriptionInput,
+    TransitionSideEffect, ValueSource,
+};
 
 /// A modeled consumer of messages on a topic: the operation and the
 /// subscription input through which it consumes them.
@@ -22,12 +25,34 @@ pub struct Consumer<'a> {
     pub subscription: &'a SubscriptionInput,
 }
 
+/// A modeled producer of messages on a topic: a publication effect and
+/// the declaration that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Producer<'a> {
+    pub site: ProducerSite<'a>,
+    pub effect: &'a Id,
+    pub publication: &'a PublicationEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerSite<'a> {
+    /// An effect declared by an operation.
+    Operation { operation: &'a Id },
+
+    /// A side effect owned by a state-machine transition (§22).
+    Transition { machine: &'a Id, transition: &'a Id },
+}
+
 #[derive(Debug)]
 pub struct TriggerGraph<'a> {
     model: &'a Model,
 
     /// Subscriptions per topic, in model order.
     subscriptions: BTreeMap<&'a Id, Vec<Consumer<'a>>>,
+
+    /// Publications per topic, in model order: operation effects, then
+    /// transition side effects.
+    publications: BTreeMap<&'a Id, Vec<Producer<'a>>>,
 }
 
 impl<'a> TriggerGraph<'a> {
@@ -49,10 +74,59 @@ impl<'a> TriggerGraph<'a> {
             }
         }
 
+        let mut publications: BTreeMap<&'a Id, Vec<Producer<'a>>> = BTreeMap::new();
+
+        for (operation, declaration) in &model.operations {
+            for (effect, declared) in &declaration.effects {
+                if let Effect::Publication(publication) = declared {
+                    publications
+                        .entry(&publication.topic)
+                        .or_default()
+                        .push(Producer {
+                            site: ProducerSite::Operation { operation },
+                            effect,
+                            publication,
+                        });
+                }
+            }
+        }
+
+        for (machine, declaration) in &model.state_machines {
+            for (transition, declared) in &declaration.transitions {
+                for (effect, side_effect) in &declared.side_effects {
+                    if let TransitionSideEffect::Publication(publication) = side_effect {
+                        publications
+                            .entry(&publication.topic)
+                            .or_default()
+                            .push(Producer {
+                                site: ProducerSite::Transition {
+                                    machine,
+                                    transition,
+                                },
+                                effect,
+                                publication,
+                            });
+                    }
+                }
+            }
+        }
+
         Self {
             model,
             subscriptions,
+            publications,
         }
+    }
+
+    /// The modeled producers of `schema` on `topic`, in model order.
+    pub fn producers(&self, topic: &Id, schema: &Id) -> Vec<Producer<'a>> {
+        self.publications
+            .get(topic)
+            .into_iter()
+            .flatten()
+            .filter(|producer| &producer.publication.schema == schema)
+            .copied()
+            .collect()
     }
 
     /// The modeled consumers of `schema` published to `topic`, in
