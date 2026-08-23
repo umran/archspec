@@ -338,7 +338,7 @@ function FlowBody({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowId:
 // ---------------------------------------------------------------------------
 
 function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
-  const { obligations, overlay, selection, select } = useApp();
+  const { obligations, selection, select } = useApp();
   const reqs = op.requirements;
 
   const rows: { prop: RequirementKind; i: number; declares: ReactNode }[] = [];
@@ -381,11 +381,9 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       <Table.Body>
         {rows.map((row) => {
           const key = `req:${row.prop}:${row.i}`;
-          const obs = overlay
-            ? (obligations.get(id) ?? []).filter(
+          const obs = (obligations.get(id) ?? []).filter(
                 (ob) => ob.subject.kind === "operation" && ob.subject.requirement === row.i &&
-                  propertyMatchesRequirement(ob.property, row.prop))
-            : [];
+                  propertyMatchesRequirement(ob.property, row.prop));
           const status = obs.length ? worstStatus(obs) : null;
           return (
             <Table.Row

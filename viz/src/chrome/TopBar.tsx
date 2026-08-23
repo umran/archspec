@@ -2,7 +2,6 @@ import { Badge } from "@cloudflare/kumo/components/badge";
 import { Breadcrumbs } from "@cloudflare/kumo/components/breadcrumbs";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Input } from "@cloudflare/kumo/components/input";
-import { Switch } from "@cloudflare/kumo/components/switch";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
 
@@ -15,9 +14,8 @@ import { useApp } from "../state/AppState";
  *  so its edges line up with the page headers below it. */
 export function TopBar() {
   const app = useApp();
-  const { data, model, report, route, search, overlay, obligationsOpen, theme } = app;
+  const { data, model, report, route, search, obligationsOpen, theme } = app;
   const counts = report ? statusCounts(report.obligations) : null;
-  const machines = Object.keys(model.state_machines);
   const tally = counts
     ? (["disproven", "unknown", "proven"] as const)
         .filter((s) => counts[s])
@@ -59,16 +57,6 @@ export function TopBar() {
               </>
             )}
           </Breadcrumbs>
-          {route.view === "system" && machines.length > 0 && (
-            <span className="flex items-center gap-1.5 text-xs text-kumo-subtle">
-              machines:
-              {machines.map((m) => (
-                <Button key={m} variant="ghost" size="xs" onClick={() => app.navigateTo(hashes.machine(m))}>
-                  {shortId(m)}
-                </Button>
-              ))}
-            </span>
-          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-3">
@@ -86,14 +74,6 @@ export function TopBar() {
           )}
           {report && (
             <>
-              <span title="Colour operations, transitions and steps by their proof status">
-                <Switch
-                  size="sm"
-                  label="Verdicts"
-                  checked={overlay}
-                  onCheckedChange={(checked) => app.setOverlay(checked)}
-                />
-              </span>
               <Button
                 variant={obligationsOpen ? "primary" : "secondary"}
                 size="sm"

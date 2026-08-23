@@ -92,11 +92,11 @@ requirements, obligations, …) with key/value grids, typed badges, and
 clickable ids that open the referenced entity in place.
 
 **Top bar.** Model name and revision, breadcrumbs for the current
-page, and — when a report is loaded — a "Verdicts" switch that turns
-the proof-status colouring on or off across every view, and an
-"Obligations" button carrying the report's tally that opens the
-obligations panel. The bar shares the pages' content column, so its
-edges line up with the page headers beneath it.
+page, the id filter on the system view, and — when a report is loaded
+— an "Obligations" button carrying the report's tally that opens the
+obligations panel. Proof-status colouring is always on when a report
+is loaded. The bar shares the pages' content column, so its edges
+line up with the page headers beneath it.
 
 **Notes.** Model-wide warnings the checker raises that belong to no
 single obligation — today, a subscription that admits duplicate

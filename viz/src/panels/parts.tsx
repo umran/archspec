@@ -157,9 +157,8 @@ export function StatusBadge({ status }: { status: Status }) {
 
 /** Compact per-status counts for the obligations anchored to an entity. */
 export function StatusChips({ obKey }: { obKey: string }) {
-  const { overlay } = useApp();
   const obs = useObligationsAt(obKey);
-  if (!overlay || !obs.length) return null;
+  if (!obs.length) return null;
   const counts = statusCounts(obs);
   return (
     <span className="inline-flex items-center gap-1">

@@ -22,7 +22,7 @@ function edgeShortLabel(e: Edge): string {
 }
 
 export function SystemView() {
-  const { graph, report, overlay, selection, search } = useApp();
+  const { graph, report, selection, search } = useApp();
   const layout = useMemo(() => layoutSystem(graph), [graph]);
 
   const q = search.trim().toLowerCase();
@@ -55,7 +55,7 @@ export function SystemView() {
       {graph.externals.length > 0 && <LegendLine color="var(--arch-edge-external)" label="external effect" />}
       {graph.client && <LegendLine color="var(--arch-edge-client)" label="client request" />}
       <LegendLine color="var(--arch-text-subtle)" label="declared, unexecuted" dashed />
-      {report && overlay && (
+      {report && (
         <>
           <LegendChip color="var(--arch-proven)" label="proven" />
           <LegendChip color="var(--arch-disproven)" label="disproven" />

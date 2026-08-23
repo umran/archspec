@@ -1,13 +1,12 @@
 import { statusChipText, statusCounts, worstStatus } from "../lib/obligations";
-import { useApp, useObligationsAt } from "../state/AppState";
+import { useObligationsAt } from "../state/AppState";
 
 /** A dashed ring around a node, colored by its worst obligation status. */
 export function StatusRing({
   x, y, w, h, rx, obKey,
 }: { x: number; y: number; w: number; h: number; rx: number; obKey: string }) {
-  const { overlay } = useApp();
   const obs = useObligationsAt(obKey);
-  if (!overlay || !obs.length) return null;
+  if (!obs.length) return null;
   return (
     <rect
       className={`arch-status-ring ${worstStatus(obs)}`}
@@ -22,9 +21,8 @@ export function StatusRing({
 
 /** A small count chip at a node's top-right corner. */
 export function StatusChip({ x, y, obKey }: { x: number; y: number; obKey: string }) {
-  const { overlay } = useApp();
   const obs = useObligationsAt(obKey);
-  if (!overlay || !obs.length) return null;
+  if (!obs.length) return null;
   const text = statusChipText(statusCounts(obs));
   const w = text.length * 6.4 + 12;
   const color = `var(--arch-${worstStatus(obs)})`;

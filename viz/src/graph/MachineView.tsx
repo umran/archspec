@@ -66,7 +66,7 @@ function SideEffectItem({ effectId, effect }: { effectId: Id; effect: Transition
 }
 
 export function MachineView({ id, highlight }: { id: string; highlight: string | null }) {
-  const { model, graph, selection, obligations, overlay, select, navigateTo } = useApp();
+  const { model, graph, selection, obligations, select, navigateTo } = useApp();
   const machine = model.state_machines[id];
   const layout = useMemo(() => (machine ? layoutMachine(machine) : null), [machine]);
 
@@ -147,7 +147,7 @@ export function MachineView({ id, highlight }: { id: string; highlight: string |
                   {layout.edges.map((edge) => {
                     const key = `t:${edge.transition}`;
                     const active = selection === key || highlight === edge.transition;
-                    const obs = overlay ? (obligations.get(`${id}/${edge.transition}`) ?? []) : [];
+                    const obs = obligations.get(`${id}/${edge.transition}`) ?? [];
                     const status = obs.length ? worstStatus(obs) : null;
                     const stroke = active ? "var(--arch-accent)" : status ? `var(--arch-${status})` : undefined;
                     return (
