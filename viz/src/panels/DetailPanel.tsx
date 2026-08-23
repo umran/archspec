@@ -5,7 +5,11 @@ import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
-import { effectDef, effectSummary, flowContaining, intentExecutors } from "../lib/index";
+import {
+  artifactRetention, commitGuarantee, delivery, externalIdempotency, isolation, laneConcurrency,
+  messageIdentity, requestIdentity, responseSource, routing, topicOrdering,
+} from "../lib/explain";
+import { effectDef, effectSummary, establishingTransaction, flowContaining, intentExecutors } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { concurrencyText } from "../lib/text";
@@ -14,8 +18,8 @@ import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
 import type { Id, IdempotencyKeyPropagation, RequirementKind } from "../types/model";
 import { ObligationCard } from "./ObligationCard";
 import {
-  DerivationView, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink, PredicateView,
-  RefText, Section, StatusChips, Tag, TypeView,
+  DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink,
+  PredicateView, RefText, Section, StatusChips, Tag, TypeView,
 } from "./parts";
 
 /** Chrome shared by every detail: kind label, close button, title block. */
@@ -288,7 +292,9 @@ function TopicDetail({ id }: { id: Id }) {
   const pubs = graph.edges.filter((e): e is Extract<Edge, { kind: "publish" }> => e.kind === "publish" && e.to === id);
   const subs = graph.edges.filter((e): e is Extract<Edge, { kind: "subscribe" }> => e.kind === "subscribe" && e.from === id);
   return (
-    <Frame kind="topic" title={id} subtitle={<span>topic · ordering <Tag>{topic.ordering.kind}</Tag> · identity <Tag>{topic.message_identity.kind}</Tag></span>}>
+    <Frame kind="topic" title={id} subtitle={<span>topic</span>}>
+      <FactNote fact={topicOrdering(topic.ordering)} />
+      <FactNote fact={messageIdentity(topic.message_identity)} />
       <Section title="message schemas" count={topic.messages.length}>
         <List items={topic.messages.map((s) => <IdLink key={s} id={s} />)} />
       </Section>
@@ -452,24 +458,18 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
   if (input.kind === "request") {
     return (
       <Frame kind="input" title={id} subtitle={<span>request input of <IdLink id={opId} /></span>}>
-        <KeyValue rows={[
-          ["schema", <IdLink key="s" id={input.schema} />],
-          ["identity", input.identity.kind === "keyed"
-            ? <Mono key="i">{input.identity.fields.map(pathText).join(", ")}</Mono>
-            : <Tag key="i" variant="warning">unspecified</Tag>],
-        ]} />
+        <KeyValue rows={[["schema", <IdLink key="s" id={input.schema} />]]} />
+        <FactNote fact={requestIdentity(input.identity)} />
       </Frame>
     );
   }
   const schemas = input.messages.kind === "all" ? null : input.messages.schemas;
   return (
     <Frame kind="input" title={id} subtitle={<span>subscription of <IdLink id={opId} /></span>}>
-      <KeyValue rows={[
-        ["topic", <IdLink key="t" id={input.topic} />],
-        ["delivery", <Tag key="d">{input.delivery}</Tag>],
-        ["routing", <Tag key="r">{input.dispatch.routing}</Tag>],
-        ["lane concurrency", concurrencyText(input.dispatch.lane_concurrency)],
-      ]} />
+      <KeyValue rows={[["topic", <IdLink key="t" id={input.topic} />]]} />
+      <FactNote fact={delivery(input.delivery)} />
+      <FactNote fact={routing(input.dispatch.routing)} />
+      <FactNote fact={laneConcurrency(input.dispatch.lane_concurrency)} />
       <Section title="consumed messages">
         {schemas ? <List items={schemas.map((s) => <IdLink key={s} id={s} />)} /> : <Tag>all topic messages</Tag>}
       </Section>
@@ -502,10 +502,12 @@ function EffectDetail({ id }: { id: Id }) {
       )}
       {e.kind === "external" && (
         <>
-          <KeyValue rows={[["kind", <Tag key="k" variant="warning">external</Tag>], ["name", <Mono key="n">{e.name}</Mono>], ["idempotency", <Tag key="i">{e.idempotency.kind}</Tag>]]} />
-          {e.idempotency.kind === "deduplicated_by" && (
-            <Section title="deduplication key"><KeyComponents value={e.idempotency.key} /></Section>
-          )}
+          <KeyValue rows={[["kind", <Tag key="k" variant="warning">external</Tag>], ["name", <Mono key="n">{e.name}</Mono>]]} />
+          <FactNote fact={externalIdempotency(e.idempotency)}>
+            {e.idempotency.kind === "deduplicated_by" && (
+              <span className="text-xs text-kumo-subtle">by <KeyComponents value={e.idempotency.key} /></span>
+            )}
+          </FactNote>
         </>
       )}
       {executors.length > 0 && (
@@ -522,34 +524,56 @@ function IntentDetail({ opId, id }: { opId: Id; id: Id }) {
   const intent = model.operations[opId].effect_intents[id];
   const owner = index.get(intent.effect);
   const viaTransition = owner && owner.kind === "effect" && owner.machine !== undefined;
+  const txId = establishingTransaction(model, model.operations[opId], id);
   return (
     <Frame kind="effect intent" title={id} subtitle={<span>intent of <IdLink id={opId} /></span>}
       description={viaTransition ? <>The effect is owned by transition <IdLink id={owner.transition!} />; a successful transition implicitly establishes this intent.</> : undefined}>
-      <KeyValue rows={[["effect", <IdLink key="e" id={intent.effect} />], ["resolves to", effectSummary(model, index, intent.effect)]]} />
+      <KeyValue rows={[
+        ["effect", <IdLink key="e" id={intent.effect} />],
+        ["resolves to", effectSummary(model, index, intent.effect)],
+        ["established by", txId ? <IdLink key="t" id={txId} /> : <Muted key="t">no transaction establishes it</Muted>],
+      ]} />
+      {txId && <FactNote fact={artifactRetention(model.operations[opId].transactions[txId].idempotency)} />}
     </Frame>
   );
 }
 
 function ResultDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
-  const r = model.operations[opId].invocation_results[id];
+  const op = model.operations[opId];
+  const r = op.invocation_results[id];
+  const txId = establishingTransaction(model, op, id);
   return (
     <Frame kind="invocation result" title={id} subtitle={<span>logical artifact of <IdLink id={opId} /></span>}>
-      <KeyValue rows={[["schema", <IdLink key="s" id={r.schema} />]]} />
+      <KeyValue rows={[
+        ["schema", <IdLink key="s" id={r.schema} />],
+        ["established by", txId ? <IdLink key="t" id={txId} /> : <Muted key="t">no transaction establishes it</Muted>],
+      ]} />
+      {txId && <FactNote fact={artifactRetention(op.transactions[txId].idempotency)} />}
     </Frame>
   );
 }
 
 function ResponseDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
-  const r = model.operations[opId].responses[id];
+  const op = model.operations[opId];
+  const r = op.responses[id];
+  const result = r.source.kind === "invocation_result" ? r.source.result : null;
+  const txId = result ? establishingTransaction(model, op, result) : null;
   return (
     <Frame kind="response" title={id} subtitle={<span>response of <IdLink id={opId} /></span>}>
       <KeyValue rows={[
         ["request", <IdLink key="r" id={r.request} />],
         ["schema", <IdLink key="s" id={r.schema} />],
-        ["source", r.source.kind === "invocation_result" ? <IdLink key="src" id={r.source.result} /> : <Tag key="src" variant="warning">unspecified</Tag>],
       ]} />
+      <FactNote fact={responseSource(result)}>
+        {result && <span className="text-xs text-kumo-subtle">from <IdLink id={result} /></span>}
+      </FactNote>
+      {txId && (
+        <FactNote fact={artifactRetention(op.transactions[txId].idempotency)}>
+          <span className="text-xs text-kumo-subtle">the result is established by <IdLink id={txId} /></span>
+        </FactNote>
+      )}
     </Frame>
   );
 }
@@ -561,18 +585,19 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
     <Frame kind="transaction" title={id} subtitle={<span>transaction of <IdLink id={opId} /></span>}>
       <KeyValue rows={[
         ["data model", tx.data_model ? <IdLink key="d" id={tx.data_model} /> : <Muted key="d">none (framework artifacts only)</Muted>],
-        ["isolation", <Tag key="i">{tx.isolation}</Tag>],
-        ["idempotency", <Tag key="k" variant={tx.idempotency.kind === "deduplicated_by" ? "success" : "warning"}>{tx.idempotency.kind}</Tag>],
       ]} />
-      {tx.idempotency.kind === "deduplicated_by" && (
-        <Section title="commit key"><KeyComponents value={tx.idempotency.key} /></Section>
-      )}
+      <FactNote fact={commitGuarantee(tx.idempotency)}>
+        {tx.idempotency.kind === "deduplicated_by" && (
+          <span className="text-xs text-kumo-subtle">by <KeyComponents value={tx.idempotency.key} /></span>
+        )}
+      </FactNote>
+      <FactNote fact={isolation(tx.isolation)} />
       <Section title="steps" count={tx.steps.length}>
         <List items={tx.steps.map((s, i) => (
           <button key={i} type="button" className="flex w-full cursor-pointer items-center gap-2 text-left hover:underline"
             onClick={() => openDetail(id, { txStep: { op: opId, tx: id, index: i } })}>
             <Tag>{i + 1}</Tag>
-            <span className="text-sm">{s.kind}</span>
+            <span className="text-sm">{s.kind.replace(/_/g, " ")}</span>
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
             {(s.kind === "read" || s.kind === "write" || s.kind === "delete" || s.kind === "lock") && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
             {s.kind === "insert" && <Mono className="text-kumo-subtle">{shortId(s.object)}</Mono>}
