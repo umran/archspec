@@ -94,7 +94,9 @@ clickable ids that open the referenced entity in place.
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded
 — an "Obligations" button carrying the report's tally that opens the
-obligations panel. Proof-status colouring is always on when a report
+obligations panel. It names the model, not the tool: the document
+title already reads `<model> · archspec`, and a host embedding the
+views has a name of its own in its chrome. Proof-status colouring is always on when a report
 is loaded. The bar shares the pages' content column, so its edges
 line up with the page headers beneath it. As the bar narrows it gives
 width away in order of what it costs the reader: the breadcrumbs go
