@@ -45,6 +45,9 @@ interface AppState {
   search: string;
   obligationsOpen: boolean;
   theme: Theme;
+  /** False when a host owns the colour mode, so the app offers no
+   *  control of its own. */
+  themeControllable: boolean;
   fitRequest: number;
 
   /** Selects a graph element and, when given, shows its detail. */
@@ -70,7 +73,26 @@ function initialTheme(): Theme {
   return stored === "light" ? "light" : "dark";
 }
 
-export function AppStateProvider({ data, children }: { data: PageData; children: ReactNode }) {
+export interface AppStateProviderProps {
+  data: PageData;
+
+  /**
+   * Colour mode, when a host owns it.
+   *
+   * The self-contained page `archspec-viz` writes has no host, so the
+   * app manages the mode itself: it restores the stored choice, sets
+   * `data-mode` on the document, and offers a toggle. Embedded in an
+   * application that has a colour mode of its own, that would be a
+   * second, competing control — so passing `theme` hands ownership over:
+   * the app reads the mode from the host, touches neither the document
+   * nor storage, and shows no toggle.
+   */
+  theme?: Theme;
+
+  children: ReactNode;
+}
+
+export function AppStateProvider({ data, theme: hostTheme, children }: AppStateProviderProps) {
   const route = useRoute();
   const key = routeKey(route);
   const implied = impliedSubject(route);
@@ -83,8 +105,13 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
   const [expandedTx, setExpandedTx] = useState<ReadonlySet<string>>(() => new Set());
   const [search, setSearch] = useState("");
   const [obligationsOpen, setObligationsOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [ownTheme, setOwnTheme] = useState<Theme>(initialTheme);
   const [fitRequest, setFitRequest] = useState(0);
+
+  // A host that supplies the mode owns it entirely; `setTheme` is inert
+  // and the toggle is not offered, so nothing can drive the two apart.
+  const themeControllable = hostTheme === undefined;
+  const theme = hostTheme ?? ownTheme;
 
   const pendingSelection = useRef<string | null>(null);
 
@@ -102,16 +129,27 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
     }
   }, [key, implied]);
 
+  // The document belongs to whoever owns the mode: a host that supplies
+  // one has already dressed the page, and writing `data-mode` or the
+  // stored choice from here would fight it.
   useEffect(() => {
+    if (!themeControllable) return;
     const root = document.documentElement;
-    if (theme === "dark") root.setAttribute("data-mode", "dark");
+    if (ownTheme === "dark") root.setAttribute("data-mode", "dark");
     else root.removeAttribute("data-mode");
-    window.localStorage.setItem(THEME_KEY, theme);
-  }, [theme]);
+    window.localStorage.setItem(THEME_KEY, ownTheme);
+  }, [ownTheme, themeControllable]);
 
   useEffect(() => {
     document.title = `${data.title} · archspec`;
   }, [data.title]);
+
+  const setTheme = useCallback(
+    (next: Theme) => {
+      if (themeControllable) setOwnTheme(next);
+    },
+    [themeControllable],
+  );
 
   const select = useCallback((next: string | null, target?: DetailTarget) => {
     setSelection(next);
@@ -201,6 +239,7 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
       search,
       obligationsOpen,
       theme,
+      themeControllable,
       fitRequest,
       select,
       openDetail,
@@ -215,8 +254,8 @@ export function AppStateProvider({ data, children }: { data: PageData; children:
     }),
     [
       data, index, obligations, route, selection, detail, expandedTx, search,
-      obligationsOpen, theme, fitRequest, select, openDetail, closeDetail, toggleTx,
-      requestFit, navigateTo, focusSubject,
+      obligationsOpen, theme, themeControllable, fitRequest, select, openDetail,
+      closeDetail, toggleTx, setTheme, requestFit, navigateTo, focusSubject,
     ],
   );
 
