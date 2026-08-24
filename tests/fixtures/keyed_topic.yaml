@@ -13,30 +13,15 @@ schemas:
         description: A lifecycle event associated with an order.
         completeness: complete
         fields:
-            order_id:
-                ty:
-                    kind: scalar
-                    value: uuid
-                optional: false
-
-            event_id:
-                ty:
-                    kind: scalar
-                    value: uuid
-                optional: false
-
-            event_type:
-                ty:
-                    kind: scalar
-                    value: string
-                optional: false
+            order_id: uuid
+            event_id: uuid
+            event_type: string
 
     OrderIdentity:
         kind: fragment
         source: OrderEvent
         mapping:
-            order_id:
-                - order_id
+            order_id: order_id
 
 data_models: {}
 
@@ -48,14 +33,13 @@ topics:
         ordering:
             kind: keyed
             mapping:
-                OrderEvent:
-                    - order_id
+                OrderEvent: order_id
 
         message_identity:
             kind: keyed
             mapping:
                 OrderEvent:
-                    - - event_id
+                    - event_id
 
 state_machines: {}
 

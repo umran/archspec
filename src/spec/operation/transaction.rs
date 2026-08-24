@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::value::{MapAccessDeserializer, StrDeserializer};
+use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::spec::{FieldPath, Id};
+use crate::spec::operation::value::opens_with_value_source_kind;
 
 use super::{Derivation, IdempotencyGuarantee, ValueRef};
 
@@ -156,19 +160,287 @@ pub enum SelectorPredicate {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a selector compares a field against.
+///
+/// The canonical form is the tagged map. The two alternatives are
+/// structurally disjoint, so each may also be written as itself: a
+/// reference is a map, a literal is a plain scalar.
+///
+/// ```yaml
+/// value:
+///   source: input:input.transfer_stock.request
+///   path: sku
+///
+/// value: pending
+/// ```
+///
+/// Inferring *this* discriminant is safe where inferring a
+/// `ValueSource`'s kind is not: nothing has to be resolved to tell a
+/// map from a scalar, whereas the five value sources are all ids and
+/// differ only in which namespace they name. §19 relies on a selector
+/// exposing its literals and references structurally, and the
+/// shorthand keeps that distinction visible rather than defaulting
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SelectorValue {
     Value(ValueRef),
     Literal(Literal),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    rename = "SelectorValue"
+)]
+enum SelectorValueLong {
+    Value(ValueRef),
+    Literal(Literal),
+}
+
+impl From<SelectorValueLong> for SelectorValue {
+    fn from(long: SelectorValueLong) -> Self {
+        match long {
+            SelectorValueLong::Value(value) => SelectorValue::Value(value),
+            SelectorValueLong::Literal(literal) => SelectorValue::Literal(literal),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SelectorValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SelectorValueVisitor)
+    }
+}
+
+struct SelectorValueVisitor;
+
+impl<'de> Visitor<'de> for SelectorValueVisitor {
+    type Value = SelectorValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "a selector value: a value reference with `source` and `path`, \
+             a literal scalar such as `pending`, `true`, or `3`, \
+             or a map with `kind` and `value`",
+        )
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let Some(key) = map.next_key::<String>()? else {
+            return Err(de::Error::custom(
+                "an empty map is neither a value reference nor a literal",
+            ));
+        };
+
+        // The key that opens the map says which form this is, and is
+        // replayed so the derived reader still sees a whole map.
+        match key.as_str() {
+            "source" | "path" => {
+                ValueRef::deserialize(MapAccessDeserializer::new(Replayed::new(key, map)))
+                    .map(SelectorValue::Value)
+            }
+            "kind" | "value" => {
+                SelectorValueLong::deserialize(MapAccessDeserializer::new(Replayed::new(key, map)))
+                    .map(SelectorValue::from)
+            }
+            other => Err(de::Error::custom(format!(
+                "unknown field `{other}`, expected `source` and `path` for a value reference, \
+                 or `kind` and `value`"
+            ))),
+        }
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        // A reference that lost its path would otherwise read as the
+        // string it spells, quietly turning a provenance-bearing
+        // comparison into a comparison with a constant.
+        if opens_with_value_source_kind(text) {
+            return Err(E::custom(format!(
+                "`{text}` reads as a string literal, but names a value source kind; \
+                 a value reference is a map with `source` and `path`"
+            )));
+        }
+
+        Ok(SelectorValue::Literal(Literal::String(text.to_string())))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(SelectorValue::Literal(Literal::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(SelectorValue::Literal(Literal::Int(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        i64::try_from(value)
+            .map(|value| SelectorValue::Literal(Literal::Int(value)))
+            .map_err(|_| E::custom(format!("`{value}` does not fit an int literal")))
+    }
+}
+
+/// A `MapAccess` that replays one already-read key before the rest of
+/// the map, so a peeked key can still be handed to a derived reader.
+struct Replayed<A> {
+    key: Option<String>,
+    rest: A,
+}
+
+impl<A> Replayed<A> {
+    fn new(key: String, rest: A) -> Self {
+        Replayed {
+            key: Some(key),
+            rest,
+        }
+    }
+}
+
+impl<'de, A> MapAccess<'de> for Replayed<A>
+where
+    A: MapAccess<'de>,
+{
+    type Error = A::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        match self.key.take() {
+            Some(key) => seed
+                .deserialize(StrDeserializer::<Self::Error>::new(&key))
+                .map(Some),
+            None => self.rest.next_key_seed(seed),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        self.rest.next_value_seed(seed)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        self.rest
+            .size_hint()
+            .map(|rest| rest + usize::from(self.key.is_some()))
+    }
+}
+
+/// A constant value.
+///
+/// The canonical form is the tagged map; a plain scalar carries the
+/// same thing, typed as YAML types it. A string that YAML would read
+/// as a bool or an int is written quoted, as it is anywhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Literal {
     String(String),
     Bool(bool),
     Int(i64),
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    rename = "Literal"
+)]
+enum LiteralLong {
+    String(String),
+    Bool(bool),
+    Int(i64),
+}
+
+impl From<LiteralLong> for Literal {
+    fn from(long: LiteralLong) -> Self {
+        match long {
+            LiteralLong::String(value) => Literal::String(value),
+            LiteralLong::Bool(value) => Literal::Bool(value),
+            LiteralLong::Int(value) => Literal::Int(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Literal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(LiteralVisitor)
+    }
+}
+
+struct LiteralVisitor;
+
+impl<'de> Visitor<'de> for LiteralVisitor {
+    type Value = Literal;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "a literal: a scalar such as `pending`, `true`, or `3`, \
+             or a map with `kind` and `value`",
+        )
+    }
+
+    fn visit_str<E>(self, text: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Literal::String(text.to_string()))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Literal::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Literal::Int(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        i64::try_from(value)
+            .map(Literal::Int)
+            .map_err(|_| E::custom(format!("`{value}` does not fit an int literal")))
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        LiteralLong::deserialize(MapAccessDeserializer::new(map)).map(Literal::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -53,6 +53,20 @@ Even these declarations describe guarantees, not necessarily observed runtime be
 
 Any proof produced by Archspec is conditional on the real implementation satisfying the declarations used by the proof. A proof based on `serializable`, deterministic provenance, or `deduplicated_by`, for example, is invalid if the concrete implementation does not actually provide those semantics.
 
+### 1.4 Canonical form and shorthand
+
+Every declaration has a canonical form. That is the form serialization emits and the form tooling reads; shorthands are accepted on input and are never a second representation of the model.
+
+A shorthand may compress a declaration only where it withholds no fact:
+
+- a **total two-valued claim** may become a marker, as `optional` does (§4);
+- a **re-spelling** of the same components may become a name, as a field path and a value source do (§4, §11);
+- a **discriminant the shape already carries** may be dropped, as a selector value's does (§19).
+
+A shorthand may never supply a value for a vocabulary carrying `unspecified`. §1.1 makes those declarations epistemic: a default would let silence be read as a fact, which is exactly what that section forbids.
+
+Where two readings of a shorthand could collide — a schema named for a scalar, a field name containing a dot, a literal string spelling a value source — the shorthand is refused or reserved, and the canonical form states the declaration instead.
+
 ---
 
 ## 2. Model, revision, and IDs
@@ -185,6 +199,32 @@ Declares a collection of values of the nested type.
 
 A list declaration does not itself imply uniqueness, sortedness, stable ordering across executions, bounded length, or set semantics.
 
+#### Surface syntax
+
+A field and its type may be declared in shorthand instead of the canonical map. The two forms mean exactly the same thing:
+
+```yaml
+fields:
+  order_id: uuid                # scalar, required
+  note: string?                 # scalar, optional
+  customer: schema.Customer     # schema reference
+  items: [schema.LineItem]      # list
+  tags: "[string]?"             # optional list
+```
+
+The type grammar is `type := scalar-name | schema-id | "[" type "]"`, with an optional trailing `?` on the field as a whole.
+
+- A name matching a scalar name is that scalar; every other name is a schema reference. A schema whose id collides with a scalar name, or ends in `?`, must be declared in the canonical map form.
+- `?` states optionality of the *field*, not of a type, so it may not appear inside one. `[string?]` is an error; an optional list is written `"[string]?"`.
+- A list shorthand holds exactly one element type.
+- The shorthand may also be used for `ty` alone inside the canonical map, as in `ty: [schema.Tag]` with `optional: true`.
+- A canonical schema with no prose may omit `description` rather than declaring an explicit null.
+
+Compressing `optional` into a suffix is a syntactic convention, not a semantic default. Optionality is a total two-valued shape claim with no epistemic `unspecified` member, so the shorthand withholds no fact the canonical form states. Vocabularies that *do* carry `unspecified` — ordering, delivery, dispatch, idempotency, derivation — acquire no defaults, and §1.1 continues to govern them: a declaration left out of those is not a negative guarantee, so it may not be inferred from silence.
+
+The shorthand is an authoring affordance. Serialization always emits the canonical map, so a serialized model remains a single explicit form for tooling.
+
+
 ### `FieldPath`
 
 A field path identifies a nested value relative to a schema.
@@ -192,6 +232,20 @@ A field path identifies a nested value relative to a schema.
 For example, `[customer, id]` means the `id` field nested under `customer`.
 
 A `FieldPath` has meaning only relative to the schema of its containing declaration or value source.
+
+#### Surface syntax
+
+The canonical form is the sequence of components. A dotted name says the same thing, and is how a path is rendered back to the author — diagnostics name `customer.id` — so the shorthand lets a path be written the way it will be read:
+
+```yaml
+path: customer.id
+
+path:
+  - customer
+  - id
+```
+
+A component containing a `.` must use the sequence form. A path with no components remains writable as an empty sequence, and remains a validation error: whether a path resolves is asked of the schema, not of the surface syntax.
 
 ---
 
@@ -726,6 +780,25 @@ A value reference consists of:
 - and a `FieldPath` relative to that source's schema.
 
 It identifies a logical value and is the main mechanism for linking keys, predicates, and deterministic provenance across the model.
+
+#### Surface syntax
+
+A value source may be written as a `kind:id` string instead of the tagged map, which with a dotted path puts a reference on two lines:
+
+```yaml
+- source: input:input.create_order.request
+  path: idempotency_key
+
+- source:
+    kind: input
+    id: input.create_order.request
+  path:
+    - idempotency_key
+```
+
+The kind is always written. It is never inferred from the id: the five sources index five separate namespaces, and inferring would let the meaning of a reference depend on what happens to resolve, silently choosing for an id declared in two of them.
+
+Neither shorthand withholds a fact the canonical form states — both are re-spellings with the canonical form still accepted — so §1.1 is not engaged. Serialization emits the canonical form, keeping one explicit shape for tooling.
 
 ### Reference scope
 
@@ -1385,6 +1458,24 @@ Requires the selected object's field to equal either:
 The equality is a logical predicate over modeled values.
 
 Because the selector explicitly exposes its literals and `ValueRef`s, selector provenance should be derived structurally rather than asserted with a separate `deterministic` flag.
+
+#### Surface syntax
+
+A selector value may be written as itself: a map is a value reference, and a plain scalar is a literal, typed as YAML types it.
+
+```yaml
+value:
+  source: input:input.transfer_stock.request
+  path: sku
+
+value: pending
+```
+
+Inferring this discriminant is safe where inferring a `ValueSource`'s kind is not. Telling a map from a scalar resolves nothing, whereas the five value sources are all ids and differ only in which namespace they name. The distinction this section relies on — a selector exposing its literals and references structurally — survives the shorthand rather than being defaulted by it.
+
+A string literal opening with a value source kind is refused in shorthand. `value: input:input.transfer_stock.request` is almost certainly a reference that lost its path, and reading it as the text it spells would quietly turn a provenance-bearing comparison into a comparison with a constant. A string that genuinely spells one is declared in the canonical form.
+
+A string that YAML would read as a bool or an int is quoted, as it is anywhere else.
 
 ### `and`
 
