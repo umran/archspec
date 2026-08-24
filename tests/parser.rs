@@ -6,9 +6,11 @@ use std::{
 use archspec::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Derivation, Effect, FlowStep, Id, IdempotencyGuarantee, Input,
-        LaneConcurrency, MessageIdentity, RequestIdentity, Schema, SchemaCompleteness,
-        ServiceKind, TopicOrdering, TransactionStep, TransitionSideEffect, ValueSource,
+        CompletionRequirement, Derivation, Effect, Field, FlowStep, Id, IdempotencyGuarantee,
+        Input, LaneConcurrency, Literal, MessageIdentity, RequestIdentity, ScalarType, Schema,
+        SelectorValue,
+        FieldPath, SchemaCompleteness, ServiceKind, TopicOrdering, TransactionStep,
+        TransitionSideEffect, TypeRef, ValueSource,
     },
 };
 
@@ -723,4 +725,551 @@ fn flash_checkout_parses_transition_effect_values() {
     };
 
     assert!(transition.effect_values.is_empty());
+}
+
+/// A one-schema model whose sole schema declares `fields`, so field
+/// surface syntax can be exercised without a fixture.
+fn field_source(fields: &str) -> String {
+    let mut source = String::from(
+        "revision: 1
+services: {}
+schemas:
+  Subject:
+    kind: canonical
+    completeness: complete
+    fields:
+",
+    );
+
+    for line in fields.lines() {
+        source.push_str("      ");
+        source.push_str(line);
+        source.push('\n');
+    }
+
+    source.push_str(
+        "data_models: {}
+topics: {}
+state_machines: {}
+operations: {}
+",
+    );
+
+    source
+}
+
+fn parse_field(declaration: &str) -> Field {
+    let source = field_source(declaration);
+
+    let model = yaml::parse(&source)
+        .unwrap_or_else(|error| panic!("`{declaration}` should parse: {error}"));
+
+    let Some(Schema::Canonical(subject)) = model.schemas.get(&Id("Subject".into())) else {
+        panic!("Subject should be a canonical schema");
+    };
+
+    subject
+        .fields
+        .values()
+        .next()
+        .cloned()
+        .expect("the schema should declare a field")
+}
+
+fn field_error(declaration: &str) -> String {
+    let source = field_source(declaration);
+
+    yaml::parse(&source)
+        .expect_err(&format!("`{declaration}` should not parse"))
+        .to_string()
+}
+
+#[test]
+fn a_shorthand_field_means_what_the_canonical_form_means() {
+    let shorthand = parse_field("order_id: uuid");
+
+    let canonical = parse_field(
+        "order_id:
+  ty:
+    kind: scalar
+    value: uuid
+  optional: false",
+    );
+
+    assert_eq!(shorthand, canonical);
+
+    assert_eq!(shorthand.ty, TypeRef::Scalar(ScalarType::Uuid));
+    assert!(!shorthand.optional);
+}
+
+#[test]
+fn a_trailing_question_mark_marks_a_field_optional() {
+    let field = parse_field("note: string?");
+
+    assert_eq!(field.ty, TypeRef::Scalar(ScalarType::String));
+    assert!(field.optional);
+}
+
+#[test]
+fn a_shorthand_name_that_is_not_a_scalar_is_a_schema_reference() {
+    let field = parse_field("customer: schema.Customer");
+
+    assert_eq!(field.ty, TypeRef::Schema(Id("schema.Customer".into())));
+    assert!(!field.optional);
+}
+
+#[test]
+fn a_schema_named_for_a_scalar_stays_reachable_through_the_canonical_form() {
+    // `uuid` reads as the scalar in shorthand, so the canonical form
+    // is the escape hatch rather than a special case in the grammar.
+    let field = parse_field(
+        "subject:
+  ty:
+    kind: schema
+    value: uuid
+  optional: false",
+    );
+
+    assert_eq!(field.ty, TypeRef::Schema(Id("uuid".into())));
+}
+
+#[test]
+fn a_one_element_sequence_is_a_list_type() {
+    let field = parse_field("tags: [string]");
+
+    assert_eq!(
+        field.ty,
+        TypeRef::List(Box::new(TypeRef::Scalar(ScalarType::String)))
+    );
+
+    assert!(!field.optional);
+
+    // Nesting works because the element is itself a type.
+    let field = parse_field("rows: [[string]]");
+
+    assert_eq!(
+        field.ty,
+        TypeRef::List(Box::new(TypeRef::List(Box::new(TypeRef::Scalar(
+            ScalarType::String
+        )))))
+    );
+
+    // An optional list needs the whole declaration quoted, because the
+    // marker belongs to the field rather than to the element type.
+    let field = parse_field("tags: \"[string]?\"");
+
+    assert_eq!(
+        field.ty,
+        TypeRef::List(Box::new(TypeRef::Scalar(ScalarType::String)))
+    );
+
+    assert!(field.optional);
+}
+
+#[test]
+fn shorthand_types_are_accepted_inside_the_canonical_form() {
+    let field = parse_field(
+        "note:
+  ty: string
+  optional: true",
+    );
+
+    assert_eq!(field.ty, TypeRef::Scalar(ScalarType::String));
+    assert!(field.optional);
+
+    let field = parse_field(
+        "tags:
+  ty: [schema.Tag]
+  optional: true",
+    );
+
+    assert_eq!(
+        field.ty,
+        TypeRef::List(Box::new(TypeRef::Schema(Id("schema.Tag".into()))))
+    );
+
+    assert!(field.optional);
+}
+
+#[test]
+fn a_type_may_not_carry_the_optional_marker() {
+    // Optionality is a claim about the field, not about the type, so
+    // the marker is rejected wherever a type alone is expected.
+    let message = field_error(
+        "note:
+  ty: string?
+  optional: true",
+    );
+
+    assert!(
+        message.contains("`?` marks a field optional"),
+        "error should explain where the marker belongs, got: {message}"
+    );
+
+    let message = field_error("tags: [string?]");
+
+    assert!(
+        message.contains("`?` marks a field optional"),
+        "error should reject an optional element type, got: {message}"
+    );
+}
+
+#[test]
+fn a_list_shorthand_holds_exactly_one_element_type() {
+    let message = field_error("tags: []");
+
+    assert!(
+        message.contains("exactly one element type"),
+        "error should reject an empty list shorthand, got: {message}"
+    );
+
+    let message = field_error("tags: [string, int]");
+
+    assert!(
+        message.contains("exactly one element type"),
+        "error should reject a multi-element list shorthand, got: {message}"
+    );
+}
+
+#[test]
+fn an_unterminated_list_shorthand_is_rejected() {
+    let message = field_error("tags: \"[string\"");
+
+    assert!(
+        message.contains("unterminated"),
+        "error should name the unterminated bracket, got: {message}"
+    );
+}
+
+#[test]
+fn a_canonical_schema_may_omit_its_description() {
+    let source = field_source("order_id: uuid");
+
+    let model = yaml::parse(&source).expect("a schema without a description should parse");
+
+    let Some(Schema::Canonical(subject)) = model.schemas.get(&Id("Subject".into())) else {
+        panic!("Subject should be a canonical schema");
+    };
+
+    assert_eq!(subject.description, None);
+}
+
+#[test]
+fn shorthand_fields_serialize_into_the_canonical_form() {
+    let source = field_source("note: string?");
+
+    let model = yaml::parse(&source).expect("shorthand model should parse");
+
+    let serialized = yaml::serialize(&model).expect("model should serialize");
+
+    // Serialization is the wire format tooling reads, so it stays
+    // explicit even when the source was written in shorthand.
+    assert!(
+        serialized.contains("kind: scalar"),
+        "serialized model should carry the tagged type, got:\n{serialized}"
+    );
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
+
+    assert_eq!(model, reparsed);
+}
+
+fn parse_path(declaration: &str) -> FieldPath {
+    serde_yaml::from_str(declaration)
+        .unwrap_or_else(|error| panic!("`{declaration}` should parse: {error}"))
+}
+
+fn path_error(declaration: &str) -> String {
+    serde_yaml::from_str::<FieldPath>(declaration)
+        .expect_err(&format!("`{declaration}` should not parse"))
+        .to_string()
+}
+
+fn parse_source(declaration: &str) -> ValueSource {
+    serde_yaml::from_str(declaration)
+        .unwrap_or_else(|error| panic!("`{declaration}` should parse: {error}"))
+}
+
+fn source_error(declaration: &str) -> String {
+    serde_yaml::from_str::<ValueSource>(declaration)
+        .expect_err(&format!("`{declaration}` should not parse"))
+        .to_string()
+}
+
+#[test]
+fn a_dotted_path_means_what_the_component_sequence_means() {
+    assert_eq!(parse_path("customer.id"), parse_path("[customer, id]"));
+
+    assert_eq!(
+        parse_path("customer.id").0,
+        vec!["customer".to_string(), "id".to_string()]
+    );
+
+    assert_eq!(parse_path("order_id").0, vec!["order_id".to_string()]);
+}
+
+#[test]
+fn a_dotted_path_has_no_empty_components() {
+    for declaration in ["customer..id", ".id", "customer.", "\"\""] {
+        let message = path_error(declaration);
+
+        assert!(
+            message.contains("field path"),
+            "error should name the offending path, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_path_naming_nothing_still_reaches_validation() {
+    // Whether a path resolves is validation's question, so an empty
+    // sequence parses here and fails there, exactly as before.
+    assert_eq!(parse_path("[]").0, Vec::<String>::new());
+}
+
+#[test]
+fn a_value_source_shorthand_means_what_the_tagged_map_means() {
+    let shorthand = parse_source("input:input.create_order.request");
+
+    let canonical = parse_source(
+        "kind: input
+id: input.create_order.request",
+    );
+
+    assert_eq!(shorthand, canonical);
+
+    assert_eq!(
+        shorthand,
+        ValueSource::Input(Id("input.create_order.request".into()))
+    );
+}
+
+#[test]
+fn every_value_source_kind_has_a_shorthand() {
+    assert_eq!(parse_source("input:x"), ValueSource::Input(Id("x".into())));
+
+    assert_eq!(parse_source("effect:x"), ValueSource::Effect(Id("x".into())));
+
+    assert_eq!(
+        parse_source("invocation_result:x"),
+        ValueSource::InvocationResult(Id("x".into()))
+    );
+
+    assert_eq!(
+        parse_source("state_machine_subject:x"),
+        ValueSource::StateMachineSubject(Id("x".into()))
+    );
+
+    assert_eq!(
+        parse_source("transaction_read:x"),
+        ValueSource::TransactionRead(Id("x".into()))
+    );
+}
+
+#[test]
+fn a_value_source_always_names_its_kind() {
+    // The kind is never inferred from the id: the five variants index
+    // five namespaces, and an id may be declared in more than one.
+    let message = source_error("input.create_order.request");
+
+    assert!(
+        message.contains("names its kind"),
+        "error should ask for the kind, got: {message}"
+    );
+
+    let message = source_error("topic:topic.order_events");
+
+    assert!(
+        message.contains("is not a value source kind"),
+        "error should reject an unknown kind, got: {message}"
+    );
+
+    let message = source_error("\"input:\"");
+
+    assert!(
+        message.contains("expected an id"),
+        "error should ask for the id, got: {message}"
+    );
+}
+
+#[test]
+fn shorthand_paths_and_sources_serialize_into_the_canonical_form() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let serialized = yaml::serialize(&model).expect("model should serialize");
+
+    // Tooling reads the serialized model, so it keeps the component
+    // sequence and the tagged source.
+    assert!(
+        serialized.contains("kind: input"),
+        "serialized model should carry tagged value sources"
+    );
+
+    assert!(
+        !serialized.contains("path: idempotency_key"),
+        "serialized model should carry path components as a sequence, not a dotted name"
+    );
+
+    assert!(
+        !serialized.contains("source: input:"),
+        "serialized model should carry the tagged source, not the shorthand"
+    );
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
+
+    assert_eq!(model, reparsed);
+}
+
+fn parse_selector_value(declaration: &str) -> SelectorValue {
+    serde_yaml::from_str(declaration)
+        .unwrap_or_else(|error| panic!("`{declaration}` should parse: {error}"))
+}
+
+fn selector_value_error(declaration: &str) -> String {
+    serde_yaml::from_str::<SelectorValue>(declaration)
+        .expect_err(&format!("`{declaration}` should not parse"))
+        .to_string()
+}
+
+#[test]
+fn a_selector_value_map_is_a_value_reference() {
+    let shorthand = parse_selector_value(
+        "source: input:input.create_order.request
+path: idempotency_key",
+    );
+
+    let canonical = parse_selector_value(
+        "kind: value
+value:
+  source:
+    kind: input
+    id: input.create_order.request
+  path:
+    - idempotency_key",
+    );
+
+    assert_eq!(shorthand, canonical);
+
+    let SelectorValue::Value(reference) = shorthand else {
+        panic!("a map with `source` should be a value reference");
+    };
+
+    assert_eq!(
+        reference.source,
+        ValueSource::Input(Id("input.create_order.request".into()))
+    );
+
+    assert_eq!(reference.path.0, vec!["idempotency_key".to_string()]);
+}
+
+#[test]
+fn a_selector_value_scalar_is_a_literal() {
+    assert_eq!(
+        parse_selector_value("pending"),
+        SelectorValue::Literal(Literal::String("pending".into()))
+    );
+
+    assert_eq!(
+        parse_selector_value("true"),
+        SelectorValue::Literal(Literal::Bool(true))
+    );
+
+    assert_eq!(
+        parse_selector_value("3"),
+        SelectorValue::Literal(Literal::Int(3))
+    );
+
+    // A string that YAML would read as another type is quoted, as it
+    // is anywhere else in the document.
+    assert_eq!(
+        parse_selector_value("\"true\""),
+        SelectorValue::Literal(Literal::String("true".into()))
+    );
+}
+
+#[test]
+fn a_selector_value_naming_a_value_source_kind_is_rejected() {
+    // A reference that lost its path would otherwise read as the
+    // string it spells, turning a provenance-bearing comparison into a
+    // comparison with a constant.
+    let message = selector_value_error("input:input.create_order.request");
+
+    assert!(
+        message.contains("reads as a string literal"),
+        "error should refuse the ambiguous literal, got: {message}"
+    );
+
+    // The canonical form still declares such a string deliberately.
+    assert_eq!(
+        parse_selector_value(
+            "kind: literal
+value:
+  kind: string
+  value: input:input.create_order.request"
+        ),
+        SelectorValue::Literal(Literal::String("input:input.create_order.request".into()))
+    );
+}
+
+#[test]
+fn selector_value_keys_may_come_in_either_order() {
+    assert_eq!(
+        parse_selector_value(
+            "path: idempotency_key
+source: input:input.create_order.request"
+        ),
+        parse_selector_value(
+            "source: input:input.create_order.request
+path: idempotency_key"
+        )
+    );
+
+    assert_eq!(
+        parse_selector_value(
+            "value: pending
+kind: literal"
+        ),
+        SelectorValue::Literal(Literal::String("pending".into()))
+    );
+}
+
+#[test]
+fn an_unknown_selector_value_key_is_rejected() {
+    let message = selector_value_error("reference: input:input.create_order.request");
+
+    assert!(
+        message.contains("unknown field `reference`"),
+        "error should name the unknown key, got: {message}"
+    );
+}
+
+#[test]
+fn a_literal_shorthand_works_inside_the_canonical_wrapper() {
+    assert_eq!(
+        parse_selector_value(
+            "kind: literal
+value: pending"
+        ),
+        SelectorValue::Literal(Literal::String("pending".into()))
+    );
+}
+
+#[test]
+fn shorthand_selector_values_serialize_into_the_canonical_form() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let serialized = yaml::serialize(&model).expect("model should serialize");
+
+    assert!(
+        serialized.contains("kind: value"),
+        "serialized model should carry the selector value tag"
+    );
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
+
+    assert_eq!(model, reparsed);
 }

@@ -10,17 +10,8 @@ schemas:
         description: An order accepted by checkout.
         completeness: complete
         fields:
-            order_id:
-                ty:
-                    kind: scalar
-                    value: uuid
-                optional: false
-
-            quantity:
-                ty:
-                    kind: scalar
-                    value: int
-                optional: false
+            order_id: uuid
+            quantity: int
 
 data_models: {}
 

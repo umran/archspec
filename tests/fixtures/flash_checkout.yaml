@@ -9,286 +9,105 @@ services:
 schemas:
   schema.CreateOrderRequest:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      idempotency_key:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      sku:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      quantity:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
-      amount:
-        ty:
-          kind: scalar
-          value: decimal
-        optional: false
+      idempotency_key: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
   schema.CreateOrderResponse:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      status:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
+      order_id: uuid
+      status: string
   schema.CancelOrderRequest:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
+      order_id: uuid
   schema.CancelOrderResponse:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      status:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
+      order_id: uuid
+      status: string
   schema.TransferStockRequest:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      source_warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      destination_warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      sku:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      quantity:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
+      source_warehouse_id: uuid
+      destination_warehouse_id: uuid
+      sku: string
+      quantity: int
   schema.TransferStockResponse:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      accepted:
-        ty:
-          kind: scalar
-          value: bool
-        optional: false
+      accepted: bool
   schema.OrderCreated:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      event_id:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      sku:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      quantity:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
-      amount:
-        ty:
-          kind: scalar
-          value: decimal
-        optional: false
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
   schema.InventoryReserved:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      event_id:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      sku:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      quantity:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
-      amount:
-        ty:
-          kind: scalar
-          value: decimal
-        optional: false
+      event_id: string
+      order_id: uuid
+      warehouse_id: uuid
+      sku: string
+      quantity: int
+      amount: decimal
   schema.PaymentCaptured:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      event_id:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      amount:
-        ty:
-          kind: scalar
-          value: decimal
-        optional: false
+      event_id: string
+      order_id: uuid
+      amount: decimal
   schema.OrderCancelled:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      event_id:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
+      event_id: string
+      order_id: uuid
   schema.OrderPaid:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      event_id:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
+      event_id: string
+      order_id: uuid
   schema.OrderRecord:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      order_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      status:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      amount:
-        ty:
-          kind: scalar
-          value: decimal
-        optional: false
+      order_id: uuid
+      status: string
+      amount: decimal
   schema.StockRecord:
     kind: canonical
-    description: null
     completeness: complete
     fields:
-      warehouse_id:
-        ty:
-          kind: scalar
-          value: uuid
-        optional: false
-      sku:
-        ty:
-          kind: scalar
-          value: string
-        optional: false
-      on_hand:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
-      reserved:
-        ty:
-          kind: scalar
-          value: int
-        optional: false
+      warehouse_id: uuid
+      sku: string
+      on_hand: int
+      reserved: int
 data_models:
   data.checkout:
     objects:
       object.order:
         schema: schema.OrderRecord
         identity:
-        - - order_id
+        - order_id
         requirements:
           history:
           - linearizable
@@ -297,8 +116,8 @@ data_models:
       object.stock:
         schema: schema.StockRecord
         identity:
-        - - warehouse_id
-        - - sku
+        - warehouse_id
+        - sku
         requirements:
           history:
           - linearizable
@@ -313,36 +132,30 @@ topics:
     ordering:
       kind: keyed
       mapping:
-        schema.InventoryReserved:
-        - order_id
-        schema.OrderCancelled:
-        - order_id
-        schema.OrderCreated:
-        - order_id
-        schema.OrderPaid:
-        - order_id
-        schema.PaymentCaptured:
-        - order_id
+        schema.InventoryReserved: order_id
+        schema.OrderCancelled: order_id
+        schema.OrderCreated: order_id
+        schema.OrderPaid: order_id
+        schema.PaymentCaptured: order_id
     message_identity:
       kind: keyed
       mapping:
         schema.InventoryReserved:
-        - - event_id
+        - event_id
         schema.OrderCancelled:
-        - - event_id
+        - event_id
         schema.OrderCreated:
-        - - event_id
+        - event_id
         schema.OrderPaid:
-        - - event_id
+        - event_id
         schema.PaymentCaptured:
-        - - event_id
+        - event_id
 state_machines:
   machine.order_lifecycle:
     subject:
       kind: object
       object: object.order
-      state:
-      - status
+      state: status
     states:
     - state.order.cancelled
     - state.order.paid
@@ -375,7 +188,7 @@ operations:
         identity:
           kind: keyed
           fields:
-          - - idempotency_key
+          - idempotency_key
     effects:
       effect.create_order.publish_created:
         kind: publication
@@ -384,18 +197,12 @@ operations:
         idempotency_key_propagation:
         - source:
             components:
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - idempotency_key
+            - source: input:input.create_order.request
+              path: idempotency_key
           target:
             components:
-            - source:
-                kind: effect
-                id: effect.create_order.publish_created
-              path:
-              - event_id
+            - source: effect:effect.create_order.publish_created
+              path: event_id
     effect_intents:
       intent.create_order.publish_created:
         effect: effect.create_order.publish_created
@@ -417,52 +224,34 @@ operations:
           kind: deduplicated_by
           key:
             components:
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - idempotency_key
+            - source: input:input.create_order.request
+              path: idempotency_key
         steps:
         - kind: insert
           object: object.order
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - order_id
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - amount
+            - source: input:input.create_order.request
+              path: order_id
+            - source: input:input.create_order.request
+              path: amount
         - kind: establish_effect_intent
           intent: intent.create_order.publish_created
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - order_id
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - idempotency_key
+            - source: input:input.create_order.request
+              path: order_id
+            - source: input:input.create_order.request
+              path: idempotency_key
         - kind: establish_invocation_result
           result: result.create_order
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.create_order.request
-              path:
-              - order_id
+            - source: input:input.create_order.request
+              path: order_id
     flows:
       flow.create_order.new:
         steps:
@@ -477,20 +266,14 @@ operations:
       idempotency:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.create_order.request
-            path:
-            - idempotency_key
+          - source: input:input.create_order.request
+            path: idempotency_key
         response: replay_consistent
       recoverability:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.create_order.request
-            path:
-            - idempotency_key
+          - source: input:input.create_order.request
+            path: idempotency_key
         completion: resumable
     execution:
       concurrency:
@@ -520,18 +303,12 @@ operations:
         idempotency_key_propagation:
         - source:
             components:
-            - source:
-                kind: input
-                id: input.reserve_inventory.created
-              path:
-              - event_id
+            - source: input:input.reserve_inventory.created
+              path: event_id
           target:
             components:
-            - source:
-                kind: effect
-                id: effect.reserve_inventory.publish_reserved
-              path:
-              - event_id
+            - source: effect:effect.reserve_inventory.publish_reserved
+              path: event_id
     effect_intents:
       intent.reserve_inventory.publish_reserved:
         effect: effect.reserve_inventory.publish_reserved
@@ -552,32 +329,20 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.reserve_inventory.created
-                    path:
-                    - warehouse_id
+                  source: input:input.reserve_inventory.created
+                  path: warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.reserve_inventory.created
-                    path:
-                    - sku
+                  source: input:input.reserve_inventory.created
+                  path: sku
           fields:
             kind: only
             fields:
-            - - on_hand
-            - - reserved
+            - on_hand
+            - reserved
         - kind: write
           target:
             object: object.stock
@@ -585,57 +350,33 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.reserve_inventory.created
-                    path:
-                    - warehouse_id
+                  source: input:input.reserve_inventory.created
+                  path: warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.reserve_inventory.created
-                    path:
-                    - sku
+                  source: input:input.reserve_inventory.created
+                  path: sku
           fields:
-          - - reserved
+          - reserved
           values:
             kind: deterministic
             from:
-            - source:
-                kind: transaction_read
-                id: read.reserve_inventory.stock
-              path:
-              - reserved
-            - source:
-                kind: input
-                id: input.reserve_inventory.created
-              path:
-              - quantity
+            - source: transaction_read:read.reserve_inventory.stock
+              path: reserved
+            - source: input:input.reserve_inventory.created
+              path: quantity
         - kind: establish_effect_intent
           intent: intent.reserve_inventory.publish_reserved
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.reserve_inventory.created
-              path:
-              - order_id
-            - source:
-                kind: input
-                id: input.reserve_inventory.created
-              path:
-              - event_id
+            - source: input:input.reserve_inventory.created
+              path: order_id
+            - source: input:input.reserve_inventory.created
+              path: event_id
     flows:
       flow.reserve_inventory:
         steps:
@@ -647,35 +388,23 @@ operations:
     requirements:
       serialization:
       - key:
-          source:
-            kind: input
-            id: input.reserve_inventory.created
-          path:
-          - order_id
+          source: input:input.reserve_inventory.created
+          path: order_id
       ordering:
       - key:
-          source:
-            kind: input
-            id: input.reserve_inventory.created
-          path:
-          - order_id
+          source: input:input.reserve_inventory.created
+          path: order_id
       idempotency:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.reserve_inventory.created
-            path:
-            - event_id
+          - source: input:input.reserve_inventory.created
+            path: event_id
         response: unspecified
       recoverability:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.reserve_inventory.created
-            path:
-            - event_id
+          - source: input:input.reserve_inventory.created
+            path: event_id
         completion: guaranteed
     execution:
       concurrency:
@@ -710,18 +439,12 @@ operations:
         idempotency_key_propagation:
         - source:
             components:
-            - source:
-                kind: input
-                id: input.charge_payment.reserved
-              path:
-              - event_id
+            - source: input:input.charge_payment.reserved
+              path: event_id
           target:
             components:
-            - source:
-                kind: effect
-                id: effect.charge_payment.publish_captured
-              path:
-              - event_id
+            - source: effect:effect.charge_payment.publish_captured
+              path: event_id
     effect_intents: {}
     invocation_results: {}
     responses: {}
@@ -738,45 +461,27 @@ operations:
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.charge_payment.reserved
-              path:
-              - event_id
-            - source:
-                kind: input
-                id: input.charge_payment.reserved
-              path:
-              - order_id
-            - source:
-                kind: input
-                id: input.charge_payment.reserved
-              path:
-              - amount
+            - source: input:input.charge_payment.reserved
+              path: event_id
+            - source: input:input.charge_payment.reserved
+              path: order_id
+            - source: input:input.charge_payment.reserved
+              path: amount
         response: null
     requirements:
       serialization:
       - key:
-          source:
-            kind: input
-            id: input.charge_payment.reserved
-          path:
-          - order_id
+          source: input:input.charge_payment.reserved
+          path: order_id
       ordering:
       - key:
-          source:
-            kind: input
-            id: input.charge_payment.reserved
-          path:
-          - order_id
+          source: input:input.charge_payment.reserved
+          path: order_id
       idempotency:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.charge_payment.reserved
-            path:
-            - event_id
+          - source: input:input.charge_payment.reserved
+            path: event_id
         response: unspecified
       recoverability: []
     execution:
@@ -815,11 +520,8 @@ operations:
           kind: deduplicated_by
           key:
             components:
-            - source:
-                kind: input
-                id: input.cancel_order.request
-              path:
-              - order_id
+            - source: input:input.cancel_order.request
+              path: order_id
         steps:
         - kind: transition
           machine: machine.order_lifecycle
@@ -828,27 +530,18 @@ operations:
             object: object.order
             predicate:
               kind: eq
-              field:
-              - order_id
+              field: order_id
               value:
-                kind: value
-                value:
-                  source:
-                    kind: input
-                    id: input.cancel_order.request
-                  path:
-                  - order_id
+                source: input:input.cancel_order.request
+                path: order_id
           effect_values: {}
         - kind: establish_effect_intent
           intent: intent.cancel_order.publish_cancelled
           values:
             kind: deterministic
             from:
-            - source:
-                kind: input
-                id: input.cancel_order.request
-              path:
-              - order_id
+            - source: input:input.cancel_order.request
+              path: order_id
     flows:
       flow.cancel_order:
         steps:
@@ -896,11 +589,8 @@ operations:
           kind: deduplicated_by
           key:
             components:
-            - source:
-                kind: input
-                id: input.apply_payment.captured
-              path:
-              - event_id
+            - source: input:input.apply_payment.captured
+              path: event_id
         steps:
         - kind: read
           result: read.apply_payment.order
@@ -908,20 +598,14 @@ operations:
             object: object.order
             predicate:
               kind: eq
-              field:
-              - order_id
+              field: order_id
               value:
-                kind: value
-                value:
-                  source:
-                    kind: input
-                    id: input.apply_payment.captured
-                  path:
-                  - order_id
+                source: input:input.apply_payment.captured
+                path: order_id
           fields:
             kind: only
             fields:
-            - - order_id
+            - order_id
         - kind: transition
           machine: machine.order_lifecycle
           transition: transition.order.mark_paid
@@ -929,30 +613,18 @@ operations:
             object: object.order
             predicate:
               kind: eq
-              field:
-              - order_id
+              field: order_id
               value:
-                kind: value
-                value:
-                  source:
-                    kind: input
-                    id: input.apply_payment.captured
-                  path:
-                  - order_id
+                source: input:input.apply_payment.captured
+                path: order_id
           effect_values:
             effect.order.paid:
               kind: deterministic
               from:
-              - source:
-                  kind: transaction_read
-                  id: read.apply_payment.order
-                path:
-                - order_id
-              - source:
-                  kind: input
-                  id: input.apply_payment.captured
-                path:
-                - event_id
+              - source: transaction_read:read.apply_payment.order
+                path: order_id
+              - source: input:input.apply_payment.captured
+                path: event_id
     flows:
       flow.apply_payment:
         steps:
@@ -964,35 +636,23 @@ operations:
     requirements:
       serialization:
       - key:
-          source:
-            kind: input
-            id: input.apply_payment.captured
-          path:
-          - order_id
+          source: input:input.apply_payment.captured
+          path: order_id
       ordering:
       - key:
-          source:
-            kind: input
-            id: input.apply_payment.captured
-          path:
-          - order_id
+          source: input:input.apply_payment.captured
+          path: order_id
       idempotency:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.apply_payment.captured
-            path:
-            - event_id
+          - source: input:input.apply_payment.captured
+            path: event_id
         response: unspecified
       recoverability:
       - key:
           components:
-          - source:
-              kind: input
-              id: input.apply_payment.captured
-            path:
-            - event_id
+          - source: input:input.apply_payment.captured
+            path: event_id
         completion: guaranteed
     execution:
       concurrency:
@@ -1035,27 +695,15 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - source_warehouse_id
+                  source: input:input.transfer_stock.request
+                  path: source_warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - sku
+                  source: input:input.transfer_stock.request
+                  path: sku
           mode: exclusive
           order:
             kind: unspecified
@@ -1066,27 +714,15 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - destination_warehouse_id
+                  source: input:input.transfer_stock.request
+                  path: destination_warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - sku
+                  source: input:input.transfer_stock.request
+                  path: sku
           mode: exclusive
           order:
             kind: unspecified
@@ -1098,31 +734,19 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - source_warehouse_id
+                  source: input:input.transfer_stock.request
+                  path: source_warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - sku
+                  source: input:input.transfer_stock.request
+                  path: sku
           fields:
             kind: only
             fields:
-            - - on_hand
+            - on_hand
         - kind: write
           target:
             object: object.stock
@@ -1130,42 +754,24 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - source_warehouse_id
+                  source: input:input.transfer_stock.request
+                  path: source_warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - sku
+                  source: input:input.transfer_stock.request
+                  path: sku
           fields:
-          - - on_hand
+          - on_hand
           values:
             kind: deterministic
             from:
-            - source:
-                kind: transaction_read
-                id: read.transfer_stock.source_stock
-              path:
-              - on_hand
-            - source:
-                kind: input
-                id: input.transfer_stock.request
-              path:
-              - quantity
+            - source: transaction_read:read.transfer_stock.source_stock
+              path: on_hand
+            - source: input:input.transfer_stock.request
+              path: quantity
         - kind: write
           target:
             object: object.stock
@@ -1173,29 +779,17 @@ operations:
               kind: and
               predicates:
               - kind: eq
-                field:
-                - warehouse_id
+                field: warehouse_id
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - destination_warehouse_id
+                  source: input:input.transfer_stock.request
+                  path: destination_warehouse_id
               - kind: eq
-                field:
-                - sku
+                field: sku
                 value:
-                  kind: value
-                  value:
-                    source:
-                      kind: input
-                      id: input.transfer_stock.request
-                    path:
-                    - sku
+                  source: input:input.transfer_stock.request
+                  path: sku
           fields:
-          - - on_hand
+          - on_hand
           values:
             kind: unspecified
     flows:
