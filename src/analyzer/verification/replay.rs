@@ -77,7 +77,7 @@ use crate::spec::{
 };
 
 use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
-use super::trigger::{EffectContract, effect_contract, returns_consistently};
+use super::trigger::{EffectContract, returns_consistently};
 use super::value_identity::canonical_value_path;
 
 /// Why a governing key cannot define a pre-execution equivalence
@@ -555,7 +555,7 @@ impl<'a> EffectSite<'a> {
 pub enum TracedStep<'a> {
     Transaction {
         location: StepLocation,
-        transaction: &'a Id,
+        transaction: &'a Transaction,
         before: PathContext,
         recovery: Result<Vec<StableRoot>, Vec<ReplayGap>>,
         natural: Result<(), Vec<ReplayGap>>,
@@ -625,6 +625,17 @@ impl<'a> PathTrace<'a> {
     }
 }
 
+/// The intent-binding producer facts the engine resolves an
+/// `ExecuteEffectIntent` against: the captured effect occurrence and
+/// its contract, walked out of the operation program — an explicit
+/// `EstablishEffectIntent` site, or a transition application binding a
+/// state-machine side effect.
+#[derive(Debug, Clone, Copy)]
+struct IntentSite<'a> {
+    effect: &'a Id,
+    contract: EffectContract<'a>,
+}
+
 /// The replay engine for one operation and governing key.
 pub struct ReplayAnalysis<'a> {
     model: &'a Model,
@@ -646,6 +657,9 @@ pub struct ReplayAnalysis<'a> {
     /// Whether the whole triggering payload is stable under a declared
     /// identity pinned by the key (§18 rule 3).
     payload: Result<(), PayloadIdentityGap>,
+
+    /// Each intent binding's producer facts, derived from the program.
+    intents: BTreeMap<&'a Id, IntentSite<'a>>,
 }
 
 impl<'a> ReplayAnalysis<'a> {
@@ -703,6 +717,53 @@ impl<'a> ReplayAnalysis<'a> {
             },
         };
 
+        // Resolve each intent binding to its producer site: an
+        // explicit establishment declares the captured contract
+        // inline; a transition application captures the state-machine
+        // side effect it names.
+        let mut intents: BTreeMap<&Id, IntentSite<'_>> = BTreeMap::new();
+
+        for (_, transaction) in operation.program.transactions() {
+            for inner in &transaction.steps {
+                match inner {
+                    TransactionStep::EstablishEffectIntent(establish) => {
+                        intents.insert(
+                            &establish.bind,
+                            IntentSite {
+                                effect: &establish.effect_id,
+                                contract: EffectContract::from(&establish.effect),
+                            },
+                        );
+                    }
+
+                    TransactionStep::Transition(transition) => {
+                        let declared = model
+                            .state_machines
+                            .get(&transition.machine)
+                            .and_then(|machine| machine.transitions.get(&transition.transition));
+
+                        for (effect_id, intent) in &transition.effect_intents {
+                            let Some(side_effect) = declared
+                                .and_then(|transition| transition.side_effects.get(effect_id))
+                            else {
+                                continue;
+                            };
+
+                            intents.insert(
+                                &intent.bind,
+                                IntentSite {
+                                    effect: effect_id,
+                                    contract: EffectContract::from(side_effect),
+                                },
+                            );
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+
         let mut analysis = Self {
             model,
             operation,
@@ -711,6 +772,7 @@ impl<'a> ReplayAnalysis<'a> {
             consistent,
             schemas,
             payload: Err(PayloadIdentityGap::NotDeclared),
+            intents,
         };
 
         analysis.payload = analysis.payload_stability(declaration);
@@ -1012,14 +1074,9 @@ impl<'a> ReplayAnalysis<'a> {
                     location,
                     transaction,
                 } => {
-                    let Some(body) = self.operation.transactions.get(transaction) else {
-                        continue;
-                    };
-
                     let before = context.clone();
 
-                    let (recovery, natural) =
-                        self.apply_transaction(&mut context, transaction, body);
+                    let (recovery, natural) = self.apply_transaction(&mut context, transaction);
 
                     steps.push(TracedStep::Transaction {
                         location: location.clone(),
@@ -1032,45 +1089,50 @@ impl<'a> ReplayAnalysis<'a> {
 
                 PathStep::ExecuteEffect {
                     location,
+                    effect_id,
                     effect,
                     values,
-                    result,
+                    bind,
                 } => {
-                    let contract = effect_contract(self.model, self.operation, effect);
+                    let contract = Some(EffectContract::from(*effect));
                     let instance = self.direct_instance(&context, values);
 
                     self.push_effect(
                         &mut context,
                         &mut steps,
                         location,
-                        EffectSite::Direct { effect, values },
+                        EffectSite::Direct {
+                            effect: effect_id,
+                            values,
+                        },
                         contract,
                         instance,
-                        *result,
+                        *bind,
                     );
                 }
 
                 PathStep::ExecuteEffectIntent {
                     location,
                     intent,
-                    result,
+                    bind,
                 } => {
-                    let Some(declaration) = self.operation.effect_intents.get(*intent) else {
+                    let Some(site) = self.intents.get(*intent).copied() else {
                         continue;
                     };
 
-                    let effect = &declaration.effect;
-                    let contract = effect_contract(self.model, self.operation, effect);
                     let instance = self.intent_instance(&context, intent);
 
                     self.push_effect(
                         &mut context,
                         &mut steps,
                         location,
-                        EffectSite::Intent { intent, effect },
-                        contract,
+                        EffectSite::Intent {
+                            intent,
+                            effect: site.effect,
+                        },
+                        Some(site.contract),
                         instance,
-                        *result,
+                        *bind,
                     );
                 }
 
@@ -1425,7 +1487,6 @@ impl<'a> ReplayAnalysis<'a> {
     pub(crate) fn apply_transaction(
         &self,
         context: &mut PathContext,
-        transaction: &Id,
         body: &Transaction,
     ) -> (
         Result<Vec<StableRoot>, Vec<ReplayGap>>,
@@ -1438,38 +1499,39 @@ impl<'a> ReplayAnalysis<'a> {
             match inner {
                 TransactionStep::EstablishTransactionOutput(establish) => {
                     let replay = self.artifact_replay(
-                        transaction,
+                        &body.id,
                         &recovery,
                         &natural,
                         &establish.values,
                         context,
                     );
 
-                    context.artifacts.insert(establish.output.clone(), replay);
+                    context.artifacts.insert(establish.bind.clone(), replay);
                 }
 
                 TransactionStep::EstablishEffectIntent(establish) => {
                     let replay = self.artifact_replay(
-                        transaction,
+                        &body.id,
                         &recovery,
                         &natural,
                         &establish.values,
                         context,
                     );
 
-                    context.artifacts.insert(establish.intent.clone(), replay);
+                    context.artifacts.insert(establish.bind.clone(), replay);
                 }
 
                 TransactionStep::Transition(transition) => {
-                    for (effect, values) in &transition.effect_values {
-                        let Some(intent) = self.transition_intent(effect) else {
-                            continue;
-                        };
+                    for intent in transition.effect_intents.values() {
+                        let replay = self.artifact_replay(
+                            &body.id,
+                            &recovery,
+                            &natural,
+                            &intent.values,
+                            context,
+                        );
 
-                        let replay =
-                            self.artifact_replay(transaction, &recovery, &natural, values, context);
-
-                        context.artifacts.insert(intent.clone(), replay);
+                        context.artifacts.insert(intent.bind.clone(), replay);
                     }
                 }
 
@@ -1478,17 +1540,6 @@ impl<'a> ReplayAnalysis<'a> {
         }
 
         (recovery, natural)
-    }
-
-    /// The operation-level intent naming a transition side effect —
-    /// the stable identity of the implicitly established artifact
-    /// (§22).
-    fn transition_intent(&self, effect: &Id) -> Option<&Id> {
-        self.operation
-            .effect_intents
-            .iter()
-            .find(|(_, intent)| &intent.effect == effect)
-            .map(|(id, _)| id)
     }
 
     /// Route B: keyed commit deduplication over a stable key (§17).

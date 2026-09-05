@@ -1,16 +1,13 @@
 pub mod effect;
-pub mod effect_intent;
 pub mod idempotency;
 pub mod input;
 pub mod program;
 pub mod result;
 pub mod state_machine;
 pub mod transaction;
-pub mod transaction_output;
 pub mod value;
 
 pub use effect::*;
-pub use effect_intent::*;
 pub use idempotency::*;
 pub use input::*;
 pub use program::*;
@@ -18,7 +15,6 @@ pub use result::*;
 use serde::{Deserialize, Serialize};
 pub use state_machine::*;
 pub use transaction::*;
-pub use transaction_output::*;
 pub use value::*;
 
 use std::collections::BTreeMap;
@@ -26,6 +22,13 @@ use std::num::NonZeroU32;
 
 use super::Id;
 
+/// An operation: its invocation sources, one explicit causal program,
+/// requirements, and execution facts.
+///
+/// Execution-local transactions, direct effects, transaction outputs,
+/// and effect intents are declared at the program or transaction site
+/// that executes or establishes them. They are not predeclared as
+/// operation-level capabilities or handles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operation {
@@ -34,24 +37,8 @@ pub struct Operation {
 
     pub inputs: BTreeMap<Id, Input>,
 
-    /// Logical effects available to this operation.
-    /// Declaration alone does not imply execution.
-    pub effects: BTreeMap<Id, Effect>,
-
-    /// Logical effect-intent artifacts available to this operation.
-    ///
-    /// An intent naming a transition-owned effect is the stable
-    /// identity of the intent that transition implicitly establishes.
-    pub effect_intents: BTreeMap<Id, EffectIntent>,
-
-    /// Typed values transactions of this operation may export into its
-    /// control.
-    pub transaction_outputs: BTreeMap<Id, TransactionOutput>,
-
-    /// Atomic units the program may execute.
-    pub transactions: BTreeMap<Id, Transaction>,
-
-    /// The operation's one explicit control structure.
+    /// The operation's one explicit control structure — the source of
+    /// truth for every operation-owned execution occurrence.
     pub program: OperationBlock,
 
     pub requirements: OperationRequirements,

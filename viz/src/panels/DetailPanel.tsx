@@ -10,8 +10,8 @@ import {
   routing, topicOrdering, transactionOutput,
 } from "../lib/explain";
 import {
-  effectDef, effectResultType, effectSummary, establishingTransaction, intentExecutors,
-  walkProgram, type LocatedStep,
+  effectDef, effectResultType, effectSummary, findTransaction, intentExecutors, operationEffects,
+  walkProgram, type IndexEntry, type LocatedStep,
 } from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { hashes } from "../lib/route";
@@ -133,8 +133,8 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "transition": return <TransitionDetail mId={entry.machine} id={id} />;
     case "input": return <InputDetail opId={entry.op} id={id} />;
     case "effect": return <EffectDetail id={id} />;
-    case "intent": return <IntentDetail opId={entry.op} id={id} />;
-    case "output": return <OutputDetail opId={entry.op} id={id} />;
+    case "intent": return <IntentDetail entry={entry} id={id} />;
+    case "output": return <OutputDetail entry={entry} id={id} />;
     case "binding": return <BindingDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "transaction": return <TransactionDetail opId={entry.op} id={id} />;
   }
@@ -161,14 +161,14 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
     const number = <span className="shrink-0"><Tag>{i + 1}</Tag></span>;
     switch (s.kind) {
       case "transaction": {
-        const n = model.operations[opId]?.transactions[s.transaction]?.steps.length;
+        const n = s.steps.length;
         return (
           <li key={i} className="flex items-start gap-2 text-xs">
             {number}
             <div className="min-w-0">
               <span className="text-kumo-subtle">transaction </span>
-              <IdLink id={s.transaction}>{shortId(s.transaction)}</IdLink>
-              {n !== undefined && <span className="ml-1.5 text-kumo-inactive">{n} step{n === 1 ? "" : "s"}</span>}
+              <IdLink id={s.id}>{shortId(s.id)}</IdLink>
+              <span className="ml-1.5 text-kumo-inactive">{n} step{n === 1 ? "" : "s"}</span>
             </div>
           </li>
         );
@@ -179,9 +179,9 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             {number}
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute effect </span>
-              <IdLink id={s.effect}>{shortId(s.effect)}</IdLink>
-              {s.result && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.result}>{shortId(s.result)}</IdLink></span>}
-              <div className="text-kumo-inactive">{effectSummary(model, index, s.effect)}</div>
+              <IdLink id={s.effect_id}>{shortId(s.effect_id)}</IdLink>
+              {s.bind && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.bind}>{shortId(s.bind)}</IdLink></span>}
+              <div className="text-kumo-inactive">{effectSummary(model, index, s.effect_id)}</div>
             </div>
           </li>
         );
@@ -192,7 +192,7 @@ function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: Operation
             <div className="min-w-0">
               <span className="text-kumo-subtle">execute intent </span>
               <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
-              {s.result && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.result}>{shortId(s.result)}</IdLink></span>}
+              {s.bind && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.bind}>{shortId(s.bind)}</IdLink></span>}
             </div>
           </li>
         );
@@ -261,7 +261,7 @@ function OperationDetail({ id }: { id: Id }) {
   const op = model.operations[id];
   const node = graph.operations.find((o) => o.id === id);
   const inputs = Object.entries(op.inputs);
-  const effects = Object.keys(op.effects);
+  const effects = operationEffects(op).map(([eid]) => eid);
   const reqs = op.requirements;
   const reqRows: ReactNode[] = [];
   reqs.serialization.forEach((r, i) => reqRows.push(
@@ -317,7 +317,7 @@ function OperationDetail({ id }: { id: Id }) {
         </Section>
       )}
       {effects.length > 0 && (
-        <Section title="declared effects" count={effects.length}>
+        <Section title="inline effects" count={effects.length}>
           <List items={effects.map((eid) => (
             <div key={eid}><IdLink id={eid} /><div className="text-xs text-kumo-subtle">{effectSummary(model, index, eid)}</div></div>
           ))} />
@@ -573,38 +573,33 @@ function EffectDetail({ id }: { id: Id }) {
   );
 }
 
-function IntentDetail({ opId, id }: { opId: Id; id: Id }) {
+function IntentDetail({ entry, id }: { entry: Extract<IndexEntry, { kind: "intent" }>; id: Id }) {
   const { model, index } = useApp();
-  const intent = model.operations[opId].effect_intents[id];
-  const owner = index.get(intent.effect);
-  const viaTransition = owner && owner.kind === "effect" && owner.machine !== undefined;
-  const txId = establishingTransaction(model, model.operations[opId], id);
+  const tx = findTransaction(model.operations[entry.op], entry.transaction);
   return (
-    <Frame kind="effect intent" title={id} subtitle={<span>intent of <IdLink id={opId} /></span>}
-      description={viaTransition ? <>The effect is owned by transition <IdLink id={owner.transition!} />; a successful transition implicitly establishes this intent.</> : undefined}>
+    <Frame kind="effect intent" title={id} subtitle={<span>intent binding of <IdLink id={entry.op} /></span>}
+      description={entry.via ? <>The effect is owned by transition <IdLink id={entry.via.transition} />; applying it establishes this bound intent.</> : undefined}>
       <KeyValue rows={[
-        ["effect", <IdLink key="e" id={intent.effect} />],
-        ["resolves to", effectSummary(model, index, intent.effect)],
-        ["established by", txId ? <IdLink key="t" id={txId} /> : <Muted key="t">no transaction establishes it</Muted>],
+        ["effect", <IdLink key="e" id={entry.effect} />],
+        ["resolves to", effectSummary(model, index, entry.effect)],
+        ["established by", <IdLink key="t" id={entry.transaction} />],
       ]} />
-      {txId && <FactNote fact={artifactRetention(model.operations[opId].transactions[txId].idempotency)} />}
+      {tx && <FactNote fact={artifactRetention(tx.idempotency)} />}
     </Frame>
   );
 }
 
-function OutputDetail({ opId, id }: { opId: Id; id: Id }) {
+function OutputDetail({ entry, id }: { entry: Extract<IndexEntry, { kind: "output" }>; id: Id }) {
   const { model } = useApp();
-  const op = model.operations[opId];
-  const output = op.transaction_outputs[id];
-  const txId = establishingTransaction(model, op, id);
+  const tx = findTransaction(model.operations[entry.op], entry.transaction);
   return (
-    <Frame kind="transaction output" title={id} subtitle={<span>typed export of <IdLink id={opId} /></span>}>
+    <Frame kind="transaction output" title={id} subtitle={<span>typed export of <IdLink id={entry.op} /></span>}>
       <KeyValue rows={[
-        ["schema", <IdLink key="s" id={output.schema} />],
-        ["established by", txId ? <IdLink key="t" id={txId} /> : <Muted key="t">no transaction establishes it</Muted>],
+        ["schema", <IdLink key="s" id={entry.schema} />],
+        ["established by", <IdLink key="t" id={entry.transaction} />],
       ]} />
       <FactNote fact={transactionOutput()} />
-      {txId && <FactNote fact={artifactRetention(op.transactions[txId].idempotency)} />}
+      {tx && <FactNote fact={artifactRetention(tx.idempotency)} />}
     </Frame>
   );
 }
@@ -683,16 +678,16 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
       );
     case "transaction":
       return (
-        <Frame kind="program step" title={`transaction · ${shortId(step.transaction)}`} subtitle={sub}>
-          <KeyValue rows={[["transaction", <IdLink key="t" id={step.transaction} />]]} />
+        <Frame kind="program step" title={`transaction · ${shortId(step.id)}`} subtitle={sub}>
+          <KeyValue rows={[["transaction", <IdLink key="t" id={step.id} />]]} />
         </Frame>
       );
     case "execute_effect":
       return (
-        <Frame kind="program step" title={`execute effect · ${shortId(step.effect)}`} subtitle={sub}>
+        <Frame kind="program step" title={`execute effect · ${shortId(step.effect_id)}`} subtitle={sub}>
           <KeyValue rows={[
-            ["effect", <IdLink key="e" id={step.effect} />],
-            ["binds", step.result ? <IdLink key="b" id={step.result} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+            ["effect", <IdLink key="e" id={step.effect_id} />],
+            ["binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — the result is ignored</Muted>],
           ]} />
           <Section title="instance provenance"><DerivationView value={step.values} /></Section>
         </Frame>
@@ -702,7 +697,7 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
         <Frame kind="program step" title={`execute intent · ${shortId(step.intent)}`} subtitle={sub}>
           <KeyValue rows={[
             ["intent", <IdLink key="i" id={step.intent} />],
-            ["binds", step.result ? <IdLink key="b" id={step.result} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+            ["binds", step.bind ? <IdLink key="b" id={step.bind} /> : <Muted key="b">nothing — the result is ignored</Muted>],
           ]} />
         </Frame>
       );
@@ -711,9 +706,10 @@ function StepDetail({ opId, location }: { opId: Id; location: string }) {
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model, openDetail } = useApp();
-  const tx = model.operations[opId].transactions[id];
+  const tx = findTransaction(model.operations[opId], id);
+  if (!tx) return <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>} />;
   return (
-    <Frame kind="transaction" title={id} subtitle={<span>transaction of <IdLink id={opId} /></span>}>
+    <Frame kind="transaction" title={id} subtitle={<span>inline transaction of <IdLink id={opId} /></span>}>
       <KeyValue rows={[
         ["data model", tx.data_model ? <IdLink key="d" id={tx.data_model} /> : <Muted key="d">none (framework artifacts only)</Muted>],
       ]} />
@@ -729,11 +725,12 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             onClick={() => openDetail(id, { txStep: { op: opId, tx: id, index: i } })}>
             <Tag>{i + 1}</Tag>
             <span className="text-sm">{s.kind.replace(/_/g, " ")}</span>
+            {s.kind === "read" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
-            {(s.kind === "read" || s.kind === "write" || s.kind === "delete" || s.kind === "lock") && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
+            {(s.kind === "write" || s.kind === "delete" || s.kind === "lock") && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
             {s.kind === "insert" && <Mono className="text-kumo-subtle">{shortId(s.object)}</Mono>}
-            {s.kind === "establish_transaction_output" && <Mono className="text-kumo-subtle">{shortId(s.output)}</Mono>}
-            {s.kind === "establish_effect_intent" && <Mono className="text-kumo-subtle">{shortId(s.intent)}</Mono>}
+            {s.kind === "establish_transaction_output" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
+            {s.kind === "establish_effect_intent" && <Mono className="text-kumo-subtle">{shortId(s.bind)}</Mono>}
           </button>
         ))} />
       </Section>
@@ -771,13 +768,14 @@ function RequirementDetail({ opId, prop, reqIndex }: { opId: Id; prop: Requireme
 }
 
 function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex: number }) {
-  const { model } = useApp();
-  const step = model.operations[opId].transactions[txId].steps[stepIndex];
+  const { model, index } = useApp();
+  const step = findTransaction(model.operations[opId], txId)?.steps[stepIndex];
   const sub = <span>step {stepIndex + 1} of <IdLink id={txId} /> in <IdLink id={opId} /></span>;
+  if (!step) return <Frame kind="transaction step" title={`step ${stepIndex + 1}`} subtitle={sub} />;
   switch (step.kind) {
     case "read":
       return (
-        <Frame kind="transaction step" title={`read · ${step.result}`} subtitle={sub}>
+        <Frame kind="transaction step" title={`read · ${step.bind}`} subtitle={sub}>
           <KeyValue rows={[["object", <IdLink key="o" id={step.target.object} />], ["predicate", <PredicateView key="p" predicate={step.target.predicate} />]]} />
           <Section title="fields read">
             {step.fields.kind === "all" ? <Tag>all fields</Tag> : <List items={step.fields.fields.map((f, i) => <Mono key={i}>{pathText(f)}</Mono>)} />}
@@ -815,10 +813,17 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
       return (
         <Frame kind="transaction step" title={`transition · ${shortId(step.transition)}`} subtitle={sub}>
           <KeyValue rows={[["machine", <IdLink key="m" id={step.machine} />], ["transition", <IdLink key="t" id={step.transition} />], ["subject", <IdLink key="s" id={step.subject.object} />], ["predicate", <PredicateView key="p" predicate={step.subject.predicate} />]]} />
-          {Object.keys(step.effect_values).length > 0 && (
-            <Section title="side-effect values">
-              {Object.entries(step.effect_values).map(([eid, d]) => (
-                <div key={eid} className="space-y-1"><IdLink id={eid} /><DerivationView value={d} /></div>
+          {Object.keys(step.effect_intents).length > 0 && (
+            <Section title="bound intents">
+              {Object.entries(step.effect_intents).map(([eid, intent]) => (
+                <div key={eid} className="space-y-1">
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <IdLink id={eid} />
+                    <span className="text-xs text-kumo-subtle">binds</span>
+                    <IdLink id={intent.bind} />
+                  </span>
+                  <DerivationView value={intent.values} />
+                </div>
               ))}
             </Section>
           )}
@@ -827,15 +832,22 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
       );
     case "establish_effect_intent":
       return (
-        <Frame kind="transaction step" title={`establish intent · ${shortId(step.intent)}`} subtitle={sub}>
-          <KeyValue rows={[["intent", <IdLink key="i" id={step.intent} />]]} />
+        <Frame kind="transaction step" title={`establish intent · ${shortId(step.bind)}`} subtitle={sub}>
+          <KeyValue rows={[
+            ["binds", <IdLink key="b" id={step.bind} />],
+            ["effect", <IdLink key="e" id={step.effect_id} />],
+            ["which is", effectSummary(model, index, step.effect_id)],
+          ]} />
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
         </Frame>
       );
     case "establish_transaction_output":
       return (
-        <Frame kind="transaction step" title={`establish output · ${shortId(step.output)}`} subtitle={sub}>
-          <KeyValue rows={[["output", <IdLink key="o" id={step.output} />]]} />
+        <Frame kind="transaction step" title={`establish output · ${shortId(step.bind)}`} subtitle={sub}>
+          <KeyValue rows={[
+            ["binds", <IdLink key="b" id={step.bind} />],
+            ["schema", <IdLink key="s" id={step.schema} />],
+          ]} />
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
         </Frame>
       );

@@ -8,11 +8,23 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::spec::operation::value::opens_with_value_source_kind;
 use crate::spec::{FieldPath, Id};
 
-use super::{Derivation, IdempotencyGuarantee, ValueRef};
+use super::{Derivation, Effect, IdempotencyGuarantee, ValueRef};
 
+/// One atomic transaction, declared and executed at the program step
+/// that carries it.
+///
+/// `id` is the stable logical identity of this inline declaration — the
+/// durable keyed-commit identity is conceptually
+/// `Commit(operation, id, key)` — used for keyed commit recovery,
+/// conformance, proof evidence, and diagnostics. It is not a reference
+/// to another declaration, and it must be unique within the operation:
+/// one inline transaction declaration is one transaction occurrence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
+    /// Stable identity of this inline transaction.
+    pub id: Id,
+
     /// None is permitted when the transaction performs no application
     /// DataObject access and only produces or consumes framework
     /// transaction artifacts.
@@ -24,8 +36,8 @@ pub struct Transaction {
     /// execution environment.
     ///
     /// This is independent of any transaction-output or effect-intent
-    /// declaration. `Unspecified` and `NotDeduplicated` leave the
-    /// analyzer free to prove natural replayability from the body.
+    /// binding. `Unspecified` and `NotDeduplicated` leave the analyzer
+    /// free to prove natural replayability from the body.
     pub idempotency: IdempotencyGuarantee,
 
     pub steps: Vec<TransactionStep>,
@@ -56,7 +68,9 @@ pub enum TransactionStep {
 
 impl TransactionStep {
     /// Every value reference the step evaluates: selector roots,
-    /// mutation and artifact derivations, and transition effect values.
+    /// mutation and artifact derivations, transition intent
+    /// derivations, and the declaration roots of an inline intent's
+    /// effect contract, which is evaluated at its establishment site.
     /// The transaction's commit key is not a step's and is judged
     /// separately.
     pub fn roots(&self) -> Vec<&ValueRef> {
@@ -80,28 +94,39 @@ impl TransactionStep {
             Self::Transition(transition) => {
                 let mut roots = transition.subject.predicate.roots();
 
-                for values in transition.effect_values.values() {
-                    roots.extend(values.roots());
+                for intent in transition.effect_intents.values() {
+                    roots.extend(intent.values.roots());
                 }
 
                 roots
             }
 
-            Self::EstablishEffectIntent(establish) => establish.values.roots(),
+            Self::EstablishEffectIntent(establish) => {
+                let mut roots = establish.effect.roots();
+
+                roots.extend(establish.values.roots());
+
+                roots
+            }
 
             Self::EstablishTransactionOutput(establish) => establish.values.roots(),
         }
     }
 }
 
+/// Observes selected fields of persistent objects, binding the
+/// observation for later steps of the same transaction.
+///
+/// The binding exists only after the read and only inside this
+/// transaction execution; it never becomes a transaction artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Read {
-    /// Transaction-local identity of this observation.
+    /// Transaction-local binding of this observation.
     ///
     /// Later steps in the same transaction may reference the observed
     /// values through `ValueSource::TransactionRead`.
-    pub result: Id,
+    pub bind: Id,
 
     pub target: ObjectSelector,
     pub fields: FieldSelection,
@@ -503,6 +528,13 @@ impl<'de> Visitor<'de> for LiteralVisitor {
     }
 }
 
+/// Applies a state-machine transition, supplying for each of the
+/// transition's declared side effects the concrete instance derivation
+/// and an operation-local intent binding.
+///
+/// A successful transaction atomically applies the state transition,
+/// constructs each side-effect instance, establishes each bound intent
+/// artifact, and commits state and artifacts together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateTransition {
@@ -512,21 +544,49 @@ pub struct StateTransition {
     /// Selects the concrete persistent machine instance.
     pub subject: ObjectSelector,
 
-    /// Provenance of each side-effect instance implicitly established
-    /// by applying the transition, keyed by side effect.
+    /// The intents this application establishes, keyed by the
+    /// state-machine transition side-effect ID.
     ///
     /// The keys must exactly match the transition's declared side
     /// effects; a transition without side effects uses an empty map.
     /// The derivations are evaluated in the enclosing transaction
     /// context at this step, so they may reference preceding
     /// transaction reads.
-    pub effect_values: BTreeMap<Id, Derivation>,
+    pub effect_intents: BTreeMap<Id, TransitionEffectIntent>,
 }
 
+/// One transition side effect's application facts: the concrete
+/// instance derivation and the operation-local binding under which the
+/// intent artifact is established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionEffectIntent {
+    /// Operation-local binding of the established intent artifact.
+    pub bind: Id,
+
+    /// Provenance of the intent's logical contents.
+    pub values: Derivation,
+}
+
+/// Declares an effect contract, constructs one concrete logical effect
+/// instance from `values`, and atomically establishes that captured
+/// instance as the `EffectIntent` artifact named by `bind`.
+///
+/// `effect_id` identifies the captured logical effect site itself; the
+/// intent binding is not the effect declaration. The contract's own
+/// value references are evaluated in the enclosing transaction context
+/// at this step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EstablishEffectIntent {
-    pub intent: Id,
+    /// Binding of the established `EffectIntent` artifact.
+    pub bind: Id,
+
+    /// Stable identity of the captured inline effect occurrence.
+    pub effect_id: Id,
+
+    /// The logical effect contract declared at this site.
+    pub effect: Effect,
 
     /// Provenance of the intent's logical contents.
     pub values: Derivation,
@@ -535,16 +595,22 @@ pub struct EstablishEffectIntent {
 /// Exports a typed value from the transaction into the enclosing
 /// operation's control.
 ///
-/// For `EstablishTransactionOutput(O, D)` the transaction constructs a
-/// value shaped by `O`'s schema, declares its provenance through `D`,
-/// establishes `O` atomically with its commit, and makes `O` available
-/// to the operation control that follows a successful execution or a
-/// commit recovery. It implies no response, no success or failure, no
-/// effect execution, no idempotency, and no storage.
+/// The binder declares in one place the artifact's binding, schema,
+/// producer transaction and step, and derivation: the transaction
+/// constructs a value shaped by `schema`, declares its provenance
+/// through `values`, establishes the artifact atomically with its
+/// commit, and makes `bind` available to the operation control that
+/// follows a successful execution or a commit recovery. It implies no
+/// response, no success or failure, no effect execution, no
+/// idempotency, and no storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EstablishTransactionOutput {
-    pub output: Id,
+    /// Binding of the exported artifact.
+    pub bind: Id,
+
+    /// Shape of the exported logical value.
+    pub schema: Id,
 
     /// Provenance of the output's logical contents.
     pub values: Derivation,

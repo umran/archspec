@@ -108,10 +108,7 @@ pub enum ValidationCode {
     TransactionReadFieldNotSelected,
 
     StateTransitionSubjectMismatch,
-    TransitionEffectValuesMismatch,
-    TransitionEffectIntentExplicitlyEstablished,
-    AmbiguousTransitionEffectIntent,
-    UnestablishableTransitionEffectIntent,
+    TransitionEffectIntentsMismatch,
 
     EmptyObjectIdentity,
 

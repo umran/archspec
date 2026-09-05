@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::spec::{Id, ResultVariant};
 
-use super::{Derivation, SelectorValue, ValueRef};
+use super::{Derivation, Effect, SelectorValue, Transaction, ValueRef};
 
 /// The one explicit control structure of an operation.
 ///
@@ -28,12 +28,12 @@ pub struct OperationBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationStep {
-    /// Executes, or resolves the prior keyed commit of, an
-    /// operation-owned transaction.
-    Transaction(RunTransaction),
+    /// Declares and executes one atomic transaction at this point of
+    /// the program, or resolves its prior keyed commit.
+    Transaction(Transaction),
 
-    /// Constructs one instance of an operation-owned effect and
-    /// executes it.
+    /// Declares one logical effect contract and one concrete execution
+    /// site: reaching the step constructs the instance and executes it.
     ExecuteEffect(ExecuteEffect),
 
     /// Executes an already-established effect instance.
@@ -55,16 +55,21 @@ pub enum OperationStep {
     Complete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunTransaction {
-    pub transaction: Id,
-}
-
+/// Declares one logical effect contract and one concrete execution
+/// site.
+///
+/// `effect_id` identifies the inline effect occurrence itself — for
+/// value lineage, conformance, diagnostics, and proof evidence. It is
+/// not a lookup into an operation-level effect registry, and it must
+/// be unique within the operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteEffect {
-    pub effect: Id,
+    /// Stable identity of this inline effect occurrence.
+    pub effect_id: Id,
+
+    /// The logical effect contract declared at this site.
+    pub effect: Effect,
 
     /// Provenance of the complete outgoing logical effect instance
     /// constructed and executed by this step.
@@ -78,7 +83,7 @@ pub struct ExecuteEffect {
     /// its own, a publication has none and cannot bind one. The bound
     /// id is an operation-local observation, not a transaction
     /// artifact.
-    pub result: Option<Id>,
+    pub bind: Option<Id>,
 }
 
 /// Executes an already-established effect instance; the values were
@@ -88,8 +93,13 @@ pub struct ExecuteEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteEffectIntent {
+    /// The definitely available intent binding whose captured instance
+    /// this step executes.
     pub intent: Id,
-    pub result: Option<Id>,
+
+    /// Binds the effect's synchronous result, allowed only when the
+    /// underlying effect contract is result-bearing.
+    pub bind: Option<Id>,
 }
 
 /// Explicit, exhaustive, mutually exclusive destructuring of a bound
@@ -354,5 +364,99 @@ impl OperationBlock {
     /// through `arm`; `parent` is the root for the program's own steps.
     pub fn location(parent: &StepLocation, arm: Option<Arm>, index: usize) -> StepLocation {
         parent.descend(arm, index)
+    }
+
+    /// Every inline transaction of the program with its location, in
+    /// program order. Derived from the program on demand; the program
+    /// remains the source of truth.
+    pub fn transactions(&self) -> Vec<(StepLocation, &Transaction)> {
+        self.steps_with_locations()
+            .into_iter()
+            .filter_map(|(location, step)| match step {
+                OperationStep::Transaction(transaction) => Some((location, transaction)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The inline transaction with the given stable ID, wherever it
+    /// sits in the program.
+    pub fn transaction(&self, id: &Id) -> Option<&Transaction> {
+        self.transactions()
+            .into_iter()
+            .find_map(|(_, transaction)| (&transaction.id == id).then_some(transaction))
+    }
+
+    /// Mutable access to the inline transaction with the given stable
+    /// ID.
+    pub fn transaction_mut(&mut self, id: &Id) -> Option<&mut Transaction> {
+        fn contains(block: &OperationBlock, id: &Id) -> bool {
+            block.transaction(id).is_some()
+        }
+
+        let position = self.steps.iter().position(|step| match step {
+            OperationStep::Transaction(transaction) => &transaction.id == id,
+            OperationStep::MatchResult(matched) => {
+                contains(&matched.ok, id) || contains(&matched.err, id)
+            }
+            OperationStep::Branch(branch) => {
+                contains(&branch.then, id)
+                    || branch
+                        .otherwise
+                        .as_ref()
+                        .is_some_and(|block| contains(block, id))
+            }
+            _ => false,
+        })?;
+
+        match &mut self.steps[position] {
+            OperationStep::Transaction(transaction) => Some(transaction),
+
+            OperationStep::MatchResult(matched) => {
+                if contains(&matched.ok, id) {
+                    matched.ok.transaction_mut(id)
+                } else {
+                    matched.err.transaction_mut(id)
+                }
+            }
+
+            OperationStep::Branch(branch) => {
+                if contains(&branch.then, id) {
+                    branch.then.transaction_mut(id)
+                } else {
+                    branch.otherwise.as_mut()?.transaction_mut(id)
+                }
+            }
+
+            _ => None,
+        }
+    }
+
+    /// Every operation-owned inline effect declaration of the program,
+    /// with its id: direct execution sites and intent establishment
+    /// sites, in program order. Transition-owned effects are not
+    /// operation declarations and are not listed.
+    pub fn effect_declarations(&self) -> Vec<(&Id, &Effect)> {
+        let mut out = Vec::new();
+
+        for (_, step) in self.steps_with_locations() {
+            match step {
+                OperationStep::ExecuteEffect(step) => {
+                    out.push((&step.effect_id, &step.effect));
+                }
+
+                OperationStep::Transaction(transaction) => {
+                    for inner in &transaction.steps {
+                        if let super::TransactionStep::EstablishEffectIntent(establish) = inner {
+                            out.push((&establish.effect_id, &establish.effect));
+                        }
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        out
     }
 }

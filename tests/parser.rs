@@ -8,9 +8,9 @@ use conseqa::{
     spec::{
         CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition, ErrorResultType,
         Field, FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, Literal,
-        MessageIdentity, OperationStep, RequestIdentity, ResultOutcome, ResultVariant, ScalarType,
-        Schema, SchemaCompleteness, SelectorValue, ServiceKind, TopicOrdering, TransactionStep,
-        TransitionSideEffect, TypeRef, ValueSource,
+        MessageIdentity, Model, OperationStep, RequestIdentity, ResultOutcome, ResultVariant,
+        ScalarType, Schema, SchemaCompleteness, SelectorValue, ServiceKind, TopicOrdering,
+        Transaction, TransactionStep, TransitionSideEffect, TypeRef, ValueSource,
     },
 };
 
@@ -26,6 +26,34 @@ fn read_fixture(name: &str) -> String {
 
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read fixture `{}`: {error}", path.display()))
+}
+
+/// The inline transaction of an operation's program, by its stable ID.
+fn transaction<'a>(model: &'a Model, operation: &str, transaction: &str) -> &'a Transaction {
+    model
+        .operations
+        .get(&Id(operation.to_owned()))
+        .unwrap_or_else(|| panic!("`{operation}` should exist"))
+        .program
+        .transaction(&Id(transaction.to_owned()))
+        .unwrap_or_else(|| {
+            panic!("`{operation}` should declare inline transaction `{transaction}`")
+        })
+}
+
+/// An operation-owned inline effect declaration, by its inline id.
+fn effect<'a>(model: &'a Model, operation: &str, effect: &str) -> &'a Effect {
+    let wanted = Id(effect.to_owned());
+
+    model
+        .operations
+        .get(&Id(operation.to_owned()))
+        .unwrap_or_else(|| panic!("`{operation}` should exist"))
+        .program
+        .effect_declarations()
+        .into_iter()
+        .find_map(|(id, declared)| (id == &wanted).then_some(declared))
+        .unwrap_or_else(|| panic!("`{operation}` should declare inline effect `{effect}`"))
 }
 
 #[test]
@@ -351,46 +379,34 @@ fn flash_checkout_parses_nested_semantics() {
 
     assert_eq!(concurrency.get(), 1);
 
-    // Effect + nested IdempotencyGuarantee.
-    let charge_payment = model
-        .operations
-        .get(&Id("operation.charge_payment".into()))
-        .expect("charge_payment should exist");
-
-    let effect = charge_payment
-        .effects
-        .get(&Id("effect.charge_payment.card".into()))
-        .expect("card charge effect should exist");
-
-    let Effect::External(effect) = effect else {
+    // Inline effect + nested IdempotencyGuarantee.
+    let Effect::External(card) = effect(
+        &model,
+        "operation.charge_payment",
+        "effect.charge_payment.card",
+    ) else {
         panic!("card charge should be an external effect");
     };
 
-    assert_eq!(effect.idempotency, IdempotencyGuarantee::NotDeduplicated);
+    assert_eq!(card.idempotency, IdempotencyGuarantee::NotDeduplicated);
 
     // TransactionStep + SelectorPredicate + SelectorValue +
-    // FieldSelection + LockOrder.
-    let transfer_stock = model
-        .operations
-        .get(&Id("operation.transfer_stock".into()))
-        .expect("transfer_stock should exist");
+    // FieldSelection + LockOrder, inside an inline transaction.
+    let transfer = transaction(&model, "operation.transfer_stock", "tx.transfer_stock");
 
-    let transaction = transfer_stock
-        .transactions
-        .get(&Id("tx.transfer_stock".into()))
-        .expect("transfer_stock transaction should exist");
+    assert_eq!(transfer.id, Id("tx.transfer_stock".into()));
 
-    assert_eq!(transaction.steps.len(), 5);
+    assert_eq!(transfer.steps.len(), 5);
 
-    assert!(matches!(&transaction.steps[0], TransactionStep::Lock(_)));
+    assert!(matches!(&transfer.steps[0], TransactionStep::Lock(_)));
 
-    assert!(matches!(&transaction.steps[1], TransactionStep::Lock(_)));
+    assert!(matches!(&transfer.steps[1], TransactionStep::Lock(_)));
 
-    assert!(matches!(&transaction.steps[2], TransactionStep::Read(_)));
+    assert!(matches!(&transfer.steps[2], TransactionStep::Read(_)));
 
-    assert!(matches!(&transaction.steps[3], TransactionStep::Write(_)));
+    assert!(matches!(&transfer.steps[3], TransactionStep::Write(_)));
 
-    assert!(matches!(&transaction.steps[4], TransactionStep::Write(_)));
+    assert!(matches!(&transfer.steps[4], TransactionStep::Write(_)));
 }
 
 #[test]
@@ -427,15 +443,9 @@ fn flash_checkout_parses_keyed_transaction_idempotency() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let transaction = model
-        .operations
-        .get(&Id("operation.create_order".into()))
-        .expect("create_order should exist")
-        .transactions
-        .get(&Id("tx.create_order.new".into()))
-        .expect("create_order transaction should exist");
+    let created = transaction(&model, "operation.create_order", "tx.create_order.new");
 
-    let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency else {
+    let IdempotencyGuarantee::DeduplicatedBy { key } = &created.idempotency else {
         panic!("create_order transaction should declare keyed commit deduplication");
     };
 
@@ -451,17 +461,15 @@ fn flash_checkout_parses_keyed_transaction_idempotency() {
         vec!["idempotency_key".to_string()]
     );
 
-    // The artifact carries no key of its own; durable identity comes
-    // from the committing transaction.
-    let output = model
-        .operations
-        .get(&Id("operation.create_order".into()))
-        .unwrap()
-        .transaction_outputs
-        .get(&Id("output.create_order".into()))
-        .expect("create_order output should exist");
+    // The output binder declares the artifact's binding, schema, and
+    // derivation at its production site; durable identity comes from
+    // the committing transaction.
+    let TransactionStep::EstablishTransactionOutput(establish) = &created.steps[2] else {
+        panic!("third step should establish the output");
+    };
 
-    assert_eq!(output.schema, Id("schema.CreateOrderResponse".into()));
+    assert_eq!(establish.bind, Id("output.create_order".into()));
+    assert_eq!(establish.schema, Id("schema.CreateOrderResponse".into()));
 }
 
 #[test]
@@ -470,21 +478,19 @@ fn flash_checkout_parses_transaction_read_provenance() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let transaction = model
-        .operations
-        .get(&Id("operation.reserve_inventory".into()))
-        .expect("reserve_inventory should exist")
-        .transactions
-        .get(&Id("tx.reserve_inventory".into()))
-        .expect("reserve_inventory transaction should exist");
+    let reserve = transaction(
+        &model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
 
-    let TransactionStep::Read(read) = &transaction.steps[0] else {
+    let TransactionStep::Read(read) = &reserve.steps[0] else {
         panic!("first step should be a read");
     };
 
-    assert_eq!(read.result, Id("read.reserve_inventory.stock".into()));
+    assert_eq!(read.bind, Id("read.reserve_inventory.stock".into()));
 
-    let TransactionStep::Write(write) = &transaction.steps[1] else {
+    let TransactionStep::Write(write) = &reserve.steps[1] else {
         panic!("second step should be a write");
     };
 
@@ -523,28 +529,24 @@ fn flash_checkout_parses_transition_side_effect_intent() {
 
     assert!(matches!(effect, TransitionSideEffect::Publication(_)));
 
-    // The operation names that implicitly established intent so a
-    // program step can execute it.
-    let apply_payment = model
-        .operations
-        .get(&Id("operation.apply_payment".into()))
-        .expect("apply_payment should exist");
+    // The application site binds the implicitly established intent so
+    // a program step can execute it.
+    let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let intent = apply_payment
+    let TransactionStep::Transition(applied) = &apply.steps[1] else {
+        panic!("second step should be the mark_paid transition");
+    };
+
+    let intent = applied
         .effect_intents
-        .get(&Id("intent.apply_payment.order_paid".into()))
-        .expect("apply_payment should declare the transition intent");
+        .get(&Id("effect.order.paid".into()))
+        .expect("the transition application should bind the side effect's intent");
 
-    assert_eq!(intent.effect, Id("effect.order.paid".into()));
+    assert_eq!(intent.bind, Id("intent.apply_payment.order_paid".into()));
 
     // The transaction establishes no intent explicitly.
-    let transaction = apply_payment
-        .transactions
-        .get(&Id("tx.apply_payment".into()))
-        .expect("apply_payment transaction should exist");
-
     assert!(
-        transaction
+        apply
             .steps
             .iter()
             .all(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)))
@@ -557,17 +559,11 @@ fn flash_checkout_parses_unspecified_derivation() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let transaction = model
-        .operations
-        .get(&Id("operation.transfer_stock".into()))
-        .expect("transfer_stock should exist")
-        .transactions
-        .get(&Id("tx.transfer_stock".into()))
-        .expect("transfer_stock transaction should exist");
+    let transfer = transaction(&model, "operation.transfer_stock", "tx.transfer_stock");
 
-    assert_eq!(transaction.idempotency, IdempotencyGuarantee::Unspecified);
+    assert_eq!(transfer.idempotency, IdempotencyGuarantee::Unspecified);
 
-    let TransactionStep::Write(write) = &transaction.steps[4] else {
+    let TransactionStep::Write(write) = &transfer.steps[4] else {
         panic!("fifth step should be the destination write");
     };
 
@@ -643,14 +639,16 @@ fn flash_checkout_parses_execute_effect_values_and_result_bindings() {
         .program;
 
     // Unknown provenance is declared explicitly, never omitted; the
-    // card charge binds the provider's result.
+    // card charge declares its contract inline and binds the
+    // provider's result.
     let OperationStep::ExecuteEffect(card) = &program.steps[0] else {
         panic!("first step should execute the card charge");
     };
 
-    assert_eq!(card.effect, Id("effect.charge_payment.card".into()));
+    assert_eq!(card.effect_id, Id("effect.charge_payment.card".into()));
+    assert!(matches!(card.effect, Effect::External(_)));
     assert_eq!(card.values, Derivation::Unspecified);
-    assert_eq!(card.result, Some(Id("result.charge_payment.card".into())));
+    assert_eq!(card.bind, Some(Id("result.charge_payment.card".into())));
 
     let OperationStep::MatchResult(matched) = &program.steps[1] else {
         panic!("second step should match the card result");
@@ -663,11 +661,13 @@ fn flash_checkout_parses_execute_effect_values_and_result_bindings() {
     };
 
     assert_eq!(
-        captured.effect,
+        captured.effect_id,
         Id("effect.charge_payment.publish_captured".into())
     );
 
-    assert_eq!(captured.result, None);
+    assert!(matches!(captured.effect, Effect::Publication(_)));
+
+    assert_eq!(captured.bind, None);
 
     let Derivation::Deterministic { from } = &captured.values else {
         panic!("publication values should declare deterministic provenance");
@@ -758,15 +758,12 @@ fn flash_checkout_parses_request_results_and_return_terminals() {
 
     // The output is established by the transaction; the return only
     // reads it.
-    let transaction = create_order
-        .transactions
-        .get(&Id("tx.create_order.new".into()))
-        .expect("create_order transaction should exist");
+    let created = transaction(&model, "operation.create_order", "tx.create_order.new");
 
     assert!(matches!(
-        &transaction.steps[2],
+        &created.steps[2],
         TransactionStep::EstablishTransactionOutput(establish)
-            if establish.output == Id("output.create_order".into())
+            if establish.bind == Id("output.create_order".into())
     ));
 }
 
@@ -776,13 +773,11 @@ fn external_effects_declare_their_result_contract() {
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let Some(Effect::External(card)) = model
-        .operations
-        .get(&Id("operation.charge_payment".into()))
-        .unwrap()
-        .effects
-        .get(&Id("effect.charge_payment.card".into()))
-    else {
+    let Effect::External(card) = effect(
+        &model,
+        "operation.charge_payment",
+        "effect.charge_payment.card",
+    ) else {
         panic!("card charge should be an external effect");
     };
 
@@ -797,26 +792,22 @@ fn external_effects_declare_their_result_contract() {
 
     let model = yaml::parse(&source).expect("video streaming fixture should parse");
 
-    let Some(Effect::External(push)) = model
-        .operations
-        .get(&Id("operation.notify_published".into()))
-        .unwrap()
-        .effects
-        .get(&Id("effect.notify_published.push".into()))
-    else {
+    let Effect::External(push) = effect(
+        &model,
+        "operation.notify_published",
+        "effect.notify_published.push",
+    ) else {
         panic!("push should be an external effect");
     };
 
     assert_eq!(push.result, None);
 
     // A declared disposition parses as part of the contract.
-    let Some(Effect::External(engine)) = model
-        .operations
-        .get(&Id("operation.transcode_video".into()))
-        .unwrap()
-        .effects
-        .get(&Id("effect.transcode_video.engine".into()))
-    else {
+    let Effect::External(engine) = effect(
+        &model,
+        "operation.transcode_video",
+        "effect.transcode_video.engine",
+    ) else {
         panic!("the engine should be an external effect");
     };
 
@@ -913,7 +904,12 @@ fn error_dispositions_serialize_into_the_canonical_form() {
 fn a_result_binding_may_be_omitted() {
     let step: OperationStep = serde_yaml::from_str(
         "kind: execute_effect
-effect: effect.x
+effect_id: effect.x
+effect:
+  kind: publication
+  topic: topic.x
+  schema: schema.X
+  idempotency_key_propagation: []
 values:
   kind: unspecified",
     )
@@ -923,7 +919,7 @@ values:
         panic!("expected an execute_effect step");
     };
 
-    assert_eq!(step.result, None);
+    assert_eq!(step.bind, None);
 
     let step: OperationStep = serde_yaml::from_str(
         "kind: execute_effect_intent
@@ -933,8 +929,106 @@ intent: intent.x",
 
     assert!(matches!(
         step,
-        OperationStep::ExecuteEffectIntent(step) if step.result.is_none()
+        OperationStep::ExecuteEffectIntent(step) if step.bind.is_none()
     ));
+}
+
+#[test]
+fn an_inline_transaction_step_carries_its_whole_declaration() {
+    let step: OperationStep = serde_yaml::from_str(
+        "kind: transaction
+id: tx.x
+data_model: null
+isolation: unspecified
+idempotency:
+  kind: unspecified
+steps: []",
+    )
+    .expect("an inline transaction should parse");
+
+    let OperationStep::Transaction(transaction) = step else {
+        panic!("expected an inline transaction step");
+    };
+
+    assert_eq!(transaction.id, Id("tx.x".into()));
+    assert_eq!(transaction.data_model, None);
+    assert!(transaction.steps.is_empty());
+
+    // The old reference form is gone: a step that names a transaction
+    // without declaring it does not parse.
+    serde_yaml::from_str::<OperationStep>(
+        "kind: transaction
+transaction: tx.x",
+    )
+    .expect_err("a transaction reference should be rejected");
+}
+
+/// A minimal operation body, with `extra` spliced in at operation
+/// level.
+fn operation_source(extra: &str) -> String {
+    let mut source = String::from(
+        "revision: 1
+services:
+  service.a:
+    kind: backend
+schemas: {}
+data_models: {}
+topics: {}
+state_machines: {}
+operations:
+  operation.a:
+    service: service.a
+    description: null
+    inputs: {}
+",
+    );
+
+    for line in extra.lines() {
+        source.push_str("    ");
+        source.push_str(line);
+        source.push('\n');
+    }
+
+    source.push_str(
+        "    program:
+      steps:
+      - kind: complete
+    requirements:
+      serialization: []
+      ordering: []
+      idempotency: []
+      recoverability: []
+    execution:
+      concurrency:
+        kind: unspecified
+",
+    );
+
+    source
+}
+
+#[test]
+fn the_removed_operation_registries_are_rejected() {
+    // An operation without any of the four registries parses.
+    yaml::parse(&operation_source("")).expect("a registry-free operation should parse");
+
+    // Each retired registry field is rejected rather than ignored.
+    for retired in [
+        "effects: {}",
+        "effect_intents: {}",
+        "transaction_outputs: {}",
+        "transactions: {}",
+    ] {
+        let error = yaml::parse(&operation_source(retired))
+            .expect_err(&format!("`{retired}` should be rejected"));
+
+        let field = retired.split(':').next().unwrap();
+
+        assert!(
+            error.to_string().contains(field),
+            "error should name the retired field `{field}`, got: {error}"
+        );
+    }
 }
 
 #[test]
@@ -986,32 +1080,29 @@ condition:
 }
 
 #[test]
-fn flash_checkout_parses_transition_effect_values() {
+fn flash_checkout_parses_transition_effect_intents() {
     let source = read_fixture("flash_checkout.yaml");
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let transaction = model
-        .operations
-        .get(&Id("operation.apply_payment".into()))
-        .expect("apply_payment should exist")
-        .transactions
-        .get(&Id("tx.apply_payment".into()))
-        .expect("apply_payment transaction should exist");
+    let apply = transaction(&model, "operation.apply_payment", "tx.apply_payment");
 
-    let TransactionStep::Transition(transition) = &transaction.steps[1] else {
+    let TransactionStep::Transition(transition) = &apply.steps[1] else {
         panic!("second step should be the mark_paid transition");
     };
 
-    assert_eq!(transition.effect_values.len(), 1);
+    assert_eq!(transition.effect_intents.len(), 1);
 
-    let values = transition
-        .effect_values
+    let intent = transition
+        .effect_intents
         .get(&Id("effect.order.paid".into()))
-        .expect("the mark_paid side effect should have a derivation");
+        .expect("the mark_paid side effect should have an intent binding");
 
-    let Derivation::Deterministic { from } = values else {
-        panic!("transition effect values should declare deterministic provenance");
+    // Each side effect receives exactly one bind and one derivation.
+    assert_eq!(intent.bind, Id("intent.apply_payment.order_paid".into()));
+
+    let Derivation::Deterministic { from } = &intent.values else {
+        panic!("transition intent values should declare deterministic provenance");
     };
 
     // The derivation is evaluated in the transaction context, so it may
@@ -1024,19 +1115,13 @@ fn flash_checkout_parses_transition_effect_values() {
     assert_eq!(from[0].path.0, vec!["order_id".to_string()]);
 
     // A transition without side effects declares an explicit empty map.
-    let transaction = model
-        .operations
-        .get(&Id("operation.cancel_order".into()))
-        .expect("cancel_order should exist")
-        .transactions
-        .get(&Id("tx.cancel_order".into()))
-        .expect("cancel_order transaction should exist");
+    let cancel = transaction(&model, "operation.cancel_order", "tx.cancel_order");
 
-    let TransactionStep::Transition(transition) = &transaction.steps[0] else {
+    let TransactionStep::Transition(transition) = &cancel.steps[0] else {
         panic!("first step should be the cancel transition");
     };
 
-    assert!(transition.effect_values.is_empty());
+    assert!(transition.effect_intents.is_empty());
 }
 
 /// A one-schema model whose sole schema declares `fields`, so field
