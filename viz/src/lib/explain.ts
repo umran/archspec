@@ -3,7 +3,7 @@
 // duplicates, and proofs. The DSL's enum names are precise but opaque;
 // these are what they mean (ARCHSPEC_DSL_SEMANTICS.md §8, §9, §13, §17).
 
-import type { Concurrency, IdempotencyGuarantee, Input, Topic } from "../types/model";
+import type { Concurrency, IdempotencyGuarantee, Input, ResultType, Topic } from "../types/model";
 import { pathText } from "./ids";
 
 export type Tone = "success" | "warning" | "neutral" | "info";
@@ -262,21 +262,69 @@ export function externalIdempotency(guarantee: IdempotencyGuarantee): Explanatio
   }
 }
 
-/** Where a response's value comes from, and what that means for replay. */
-export function responseSource(result: string | null): Explanation {
+/** A request input's declared `Result<Ok, Err>` contract. */
+export function requestResult(): Explanation {
+  return {
+    label: "returns Result<ok, err>",
+    tone: "info",
+    summary:
+      "A request through this input completes with exactly one of two typed outcomes: an ok " +
+      "payload or an err payload. Err is a logical outcome the boundary returned — a declined " +
+      "card, a rejected request — not a crash, a timeout, or a lost connection.",
+  };
+}
+
+/** What an external boundary's result says, and what it does not. */
+export function externalResult(result: ResultType | null): Explanation {
   if (result) {
     return {
-      label: "resolved from a stored result",
+      label: "returns a result",
       tone: "info",
       summary:
-        "Every attempt resolves the response from the named invocation result. Retries observe " +
-        "the same response only if each of them recovers or reconstructs that result " +
-        "identically — see the result's retention.",
+        "The boundary returns Result<ok, err>, and the program may branch on it. No declared fact " +
+        "says a repeated execution returns the same outcome, so a decision on this result is not " +
+        "established to replay.",
     };
   }
   return {
-    label: "response source unspecified",
-    tone: "warning",
-    summary: "No fact says what the response is computed from, so replay consistency cannot be established.",
+    label: "no synchronous result",
+    tone: "neutral",
+    summary: "The boundary returns nothing the program can observe; executing it binds no result.",
+  };
+}
+
+/** A request effect's result, inherited from the input it targets. */
+export function inheritedResult(): Explanation {
+  return {
+    label: "inherits the target's result",
+    tone: "info",
+    summary:
+      "The request yields the Result<ok, err> its target input declares. Repeated payload-equal " +
+      "requests observe the same outcome exactly when the target proves its result " +
+      "replay-consistent for that input.",
+  };
+}
+
+/** A transaction output: data a transaction exports into the program. */
+export function transactionOutput(): Explanation {
+  return {
+    label: "exported by a transaction",
+    tone: "info",
+    summary:
+      "A typed value the transaction establishes atomically with its commit and exposes to the " +
+      "steps that follow. It is data, not work: an effect intent is the artifact for that. A " +
+      "transaction read never leaves its transaction; this is the only way an observation does.",
+  };
+}
+
+/** A result binding: an operation-local observation of an effect's outcome. */
+export function resultBinding(): Explanation {
+  return {
+    label: "operation-local observation",
+    tone: "neutral",
+    summary:
+      "The bound result is available to the steps after the binding; its ok payload only inside " +
+      "the ok arm of a match on it, its err payload only inside the err arm. It is not a " +
+      "transaction artifact and is not durable: a retry re-executes the effect and observes afresh.",
   };
 }

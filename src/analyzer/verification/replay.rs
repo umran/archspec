@@ -1,11 +1,13 @@
 //! The replay engine: root stability, natural transaction
-//! replayability, and artifact replay availability (§17, §18).
+//! replayability, artifact replay availability, and — over the
+//! operation program — effect-result and decision replay (§16, §17,
+//! §18).
 //!
 //! Everything here is judged relative to a **governing key** — the
 //! `IdempotencyKey` of the obligation under proof — and the attempt
-//! population it defines (§12). The three judgments form one
-//! simultaneous induction, computed in a single forward pass over a
-//! flow: every rule consumes either roots or facts established at
+//! population it defines (§12). The judgments form one simultaneous
+//! induction, computed in a single forward pass over one path of the
+//! program: every rule consumes either roots or facts established at
 //! earlier steps, and transaction-read dependence, the only
 //! backward-looking observation, is excluded outright.
 //!
@@ -15,8 +17,9 @@
 //! class that evaluate it obtain equal logical values. The §18 rules:
 //! stability is definitional (governing-key components), declared (a
 //! request or message identity pinned by the key), or derived
-//! (recovered or reconstructed artifacts, congruence). Everything
-//! else is a recorded gap, never an assumption.
+//! (recovered or reconstructed artifacts, replay-consistent effect
+//! results, congruence). Everything else is a recorded gap, never an
+//! assumption.
 //!
 //! ## Natural replayability
 //!
@@ -44,17 +47,31 @@
 //! transaction is naturally replayable and the artifact's derivation
 //! is replay-deterministic. Otherwise the artifact is unavailable,
 //! with the gaps of both routes recorded.
+//!
+//! ## Effect results and decisions
+//!
+//! A bound effect result is replay-stable when the outgoing instance
+//! is class-fixed and the contract returns one result for it: a
+//! request whose target proves its result replay-consistent for the
+//! targeted input. Stable outgoing values do not by themselves prove a
+//! stable returned result (§31), and no declared fact makes an
+//! external boundary's result replay-consistent, so an external result
+//! is never stable in V1. A decision replays — every attempt in a class
+//! takes the same arm — when the matched result is stable, or the
+//! branch condition is deterministic over stable roots (§30).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Derivation, FieldPath, FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input,
-    InvocationFlow, MessageIdentity, MessageSelector, Model, Operation, RequestIdentity,
-    SelectorPredicate, SelectorValue, Transaction, TransactionStep, ValueRef, ValueSource,
+    Derivation, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
+    MessageSelector, Model, Operation, RequestIdentity, StepLocation, Transaction, TransactionStep,
+    ValueRef, ValueSource,
 };
 
+use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
+use super::trigger::{EffectContract, effect_contract, returns_consistently};
 use super::value_identity::canonical_value_path;
 
 /// Why a governing key cannot define a pre-execution equivalence
@@ -66,8 +83,8 @@ pub enum GoverningKeyDefect {
     /// nothing is replay-stable relative to it.
     Empty,
 
-    /// A component is sourced from mutable state or from an artifact
-    /// the invocation itself produces.
+    /// A component is sourced from mutable state, from an artifact the
+    /// invocation itself produces, or from an observation it makes.
     ComponentNotFromInput { source: ValueSource },
 
     /// Components name more than one input; no single triggering
@@ -98,6 +115,11 @@ pub enum StabilityRule {
     /// A reference into an artifact reconstructed by natural replay of
     /// the named transaction.
     ReconstructedArtifact { transaction: Id },
+
+    /// A reference into a bound effect result that every attempt in
+    /// the class observes equally: the instance is class-fixed and the
+    /// target returns one result for it.
+    ReplayConsistentResult { result: Id, effect: Id },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +127,13 @@ pub enum StabilityRule {
 pub struct StableRoot {
     pub root: ValueRef,
     pub rule: StabilityRule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnstableRoot {
+    pub root: ValueRef,
+    pub gap: StabilityGap,
 }
 
 /// Why no V1 rule establishes a root as replay-stable. Epistemic
@@ -133,12 +162,29 @@ pub enum StabilityGap {
     TransactionReadRoot { read: Id },
 
     /// The referenced artifact is established, but replay-available
-    /// through neither route.
-    ArtifactUnavailable { artifact: Id },
+    /// through neither route; both routes' gaps are recorded.
+    ArtifactUnavailable {
+        artifact: Id,
+        transaction: Id,
+        recovery: Vec<ReplayGap>,
+        reconstruction: Vec<ReplayGap>,
+    },
 
     /// The referenced artifact is not established before this point
-    /// of the flow.
+    /// of the path.
     ArtifactNotInContext { artifact: Id },
+
+    /// The referenced result binding is not bound before this point
+    /// of the path.
+    ResultNotInContext { result: Id },
+
+    /// The referenced result is bound, but same-class attempts are not
+    /// established to observe the same result.
+    ResultUnstable {
+        result: Id,
+        effect: Id,
+        gap: Box<ResultGap>,
+    },
 }
 
 /// Why the declared identities do not make the triggering payload
@@ -210,7 +256,10 @@ pub enum ArtifactReplay {
     /// Route B: recovered from the single `Commit(T,K)` of the
     /// establishing transaction, whose key is stable through the
     /// cited rules.
-    Recovered { transaction: Id, key: Vec<StableRoot> },
+    Recovered {
+        transaction: Id,
+        key: Vec<StableRoot>,
+    },
 
     /// Route A: reconstructed by natural replay, with the artifact's
     /// derivation replay-deterministic over the cited roots.
@@ -241,12 +290,270 @@ impl ArtifactReplay {
     }
 }
 
+/// Why every attempt constructs the same logical effect instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InstanceStability {
+    /// A direct execution whose derivation is replay-deterministic
+    /// over the cited roots.
+    ReplayDeterministic { roots: Vec<StableRoot> },
+
+    /// An intent whose values were fixed at establishment and are
+    /// recovered or reconstructed on every attempt.
+    EstablishedIntent { intent: Id, replay: ArtifactReplay },
+}
+
+/// Why an effect instance is not class-fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InstanceGap {
+    /// A direct execution declares no instance provenance.
+    DerivationUnspecified,
+
+    /// A direct execution's instance derivation depends on unstable
+    /// roots.
+    RootsUnstable { roots: Vec<UnstableRoot> },
+
+    /// The executed intent is established by no earlier step of the
+    /// path.
+    IntentNotEstablished { intent: Id },
+
+    /// The executed intent is replay-available through neither route.
+    IntentNotReplayAvailable {
+        intent: Id,
+        transaction: Id,
+        recovery: Vec<ReplayGap>,
+        reconstruction: Vec<ReplayGap>,
+    },
+}
+
+/// Whether same-class attempts observe one result from a bound effect
+/// execution, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultReplay {
+    Stable {
+        effect: Id,
+        rule: ResultStabilityRule,
+    },
+
+    Unstable {
+        effect: Id,
+        gap: ResultGap,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultStabilityRule {
+    /// The request instance is class-fixed, so every attempt sends a
+    /// payload-equal request into one class of the target's
+    /// replay-consistent result requirement, which is proven: the
+    /// target returns the same variant and a replay-equivalent payload
+    /// to each of them (§32).
+    ReplayConsistentTarget {
+        operation: Id,
+        input: Id,
+        requirement: usize,
+        instance: InstanceStability,
+    },
+}
+
+/// Why a bound result is not established to be observed equally by
+/// every attempt in the class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultGap {
+    /// The outgoing instance is not class-fixed, so attempts may ask
+    /// different questions.
+    InstanceNotClassFixed { gap: InstanceGap },
+
+    /// The request effect's schema is not the targeted input's, so
+    /// payload equality does not transfer.
+    RequestSchemaMismatch { expected: Id, actual: Id },
+
+    /// The target declares no replay-consistent result requirement
+    /// keyed from the targeted input.
+    TargetResultNotDeclared { operation: Id, input: Id },
+
+    /// The target declares such a requirement, but it is not proven in
+    /// this analysis.
+    TargetResultUnproven { operation: Id, input: Id },
+
+    /// No declared fact makes an external boundary's returned result
+    /// replay-consistent (§31).
+    ExternalResultUndeclared,
+
+    /// The effect contract yields no synchronous result.
+    NoResultContract,
+}
+
+/// What a path has made available so far: every established artifact
+/// with its replay route, and every bound result with its replay
+/// judgment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathContext {
+    pub artifacts: BTreeMap<Id, ArtifactReplay>,
+    pub results: BTreeMap<Id, ResultReplay>,
+}
+
+/// Why every attempt in the class takes the same arm of a decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionRule {
+    /// The matched result is replay-stable, so the variant is fixed
+    /// across the class.
+    StableResult {
+        result: Id,
+        effect: Id,
+        rule: ResultStabilityRule,
+    },
+
+    /// The condition is a deterministic function of replay-stable
+    /// roots.
+    StableCondition { roots: Vec<StableRoot> },
+}
+
+/// Why a retry is not established to take the same arm (§30).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DecisionGap {
+    /// The condition declares no fact about how the decision is made.
+    ConditionUnspecified,
+
+    /// The condition depends on roots that are not replay-stable.
+    ConditionRootsUnstable { roots: Vec<UnstableRoot> },
+
+    /// The matched result is bound by no earlier step of the path.
+    ResultNotInContext { result: Id },
+
+    /// The matched result is not established to be observed equally
+    /// by every attempt.
+    ResultUnstable {
+        result: Id,
+        effect: Id,
+        gap: ResultGap,
+    },
+}
+
+/// A decision a proof cites: the arm taken and why every attempt
+/// takes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionReplay {
+    pub decision: DecisionTaken,
+    pub rule: DecisionRule,
+}
+
+/// One effect-executing site on a path.
+#[derive(Debug, Clone)]
+pub enum EffectSite<'a> {
+    Direct {
+        effect: &'a Id,
+        values: &'a Derivation,
+    },
+
+    Intent {
+        intent: &'a Id,
+        effect: &'a Id,
+    },
+}
+
+impl<'a> EffectSite<'a> {
+    pub fn effect(&self) -> &'a Id {
+        match self {
+            Self::Direct { effect, .. } | Self::Intent { effect, .. } => effect,
+        }
+    }
+}
+
+/// One step of a path, judged by the replay engine in the context the
+/// path had built before it.
+#[derive(Debug, Clone)]
+pub enum TracedStep<'a> {
+    Transaction {
+        location: StepLocation,
+        transaction: &'a Id,
+        before: PathContext,
+        recovery: Result<Vec<StableRoot>, Vec<ReplayGap>>,
+        natural: Result<(), Vec<ReplayGap>>,
+    },
+
+    Effect {
+        location: StepLocation,
+        site: EffectSite<'a>,
+        contract: Option<EffectContract<'a>>,
+        before: PathContext,
+        instance: Result<InstanceStability, InstanceGap>,
+        result: Option<(&'a Id, ResultReplay)>,
+    },
+
+    Decision {
+        location: StepLocation,
+        taken: DecisionTaken,
+        replay: Result<DecisionRule, DecisionGap>,
+    },
+}
+
+/// A path walked to its end.
+#[derive(Debug, Clone)]
+pub struct PathTrace<'a> {
+    pub steps: Vec<TracedStep<'a>>,
+    pub terminal: Terminal<'a>,
+
+    /// The context at the terminal.
+    pub end: PathContext,
+}
+
+impl<'a> PathTrace<'a> {
+    /// Every decision on the path a retry is not established to take
+    /// again.
+    pub fn unstable_decisions(&self) -> Vec<(&DecisionTaken, &DecisionGap)> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                TracedStep::Decision {
+                    taken,
+                    replay: Err(gap),
+                    ..
+                } => Some((taken, gap)),
+
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every decision on the path with the fact that fixes its arm.
+    pub fn stable_decisions(&self) -> Vec<DecisionReplay> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                TracedStep::Decision {
+                    taken,
+                    replay: Ok(rule),
+                    ..
+                } => Some(DecisionReplay {
+                    decision: taken.clone(),
+                    rule: rule.clone(),
+                }),
+
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// The replay engine for one operation and governing key.
 pub struct ReplayAnalysis<'a> {
     model: &'a Model,
     operation: &'a Operation,
     input: &'a Id,
     key: &'a IdempotencyKey,
+
+    /// The `(operation, input)` pairs whose replay-consistent result
+    /// requirement is proven — or, during the result-replay fixpoint,
+    /// assumed — so a request into one of them observes one result.
+    consistent: &'a BTreeSet<(Id, Id)>,
 
     /// Payload schemas of the triggering input: the request schema, or
     /// the subscription's admitted message schemas. `None` when the
@@ -266,6 +573,7 @@ impl<'a> ReplayAnalysis<'a> {
         model: &'a Model,
         operation: &'a Operation,
         key: &'a IdempotencyKey,
+        consistent: &'a BTreeSet<(Id, Id)>,
     ) -> Result<Self, GoverningKeyDefect> {
         let mut input: Option<&Id> = None;
 
@@ -318,6 +626,7 @@ impl<'a> ReplayAnalysis<'a> {
             operation,
             input,
             key,
+            consistent,
             schemas,
             payload: Err(PayloadIdentityGap::NotDeclared),
         };
@@ -329,6 +638,11 @@ impl<'a> ReplayAnalysis<'a> {
 
     pub fn input(&self) -> &Id {
         self.input
+    }
+
+    /// The operation under analysis.
+    pub fn operation(&self) -> &'a Operation {
+        self.operation
     }
 
     /// Whether the whole triggering payload is identity-pinned by the
@@ -465,11 +779,11 @@ impl<'a> ReplayAnalysis<'a> {
         }
     }
 
-    /// The §18 root-stability judgment, resolved against the artifact
-    /// context accumulated so far.
+    /// The §18 root-stability judgment, resolved against the context
+    /// the path has built so far.
     pub fn root_stability(
         &self,
-        context: &BTreeMap<Id, ArtifactReplay>,
+        context: &PathContext,
         root: &ValueRef,
     ) -> Result<StableRoot, StabilityGap> {
         let rule = match &root.source {
@@ -500,17 +814,24 @@ impl<'a> ReplayAnalysis<'a> {
                 effect: effect.clone(),
             }),
 
-            ValueSource::TransactionRead(read) => Err(StabilityGap::TransactionReadRoot {
-                read: read.clone(),
-            }),
+            ValueSource::TransactionRead(read) => {
+                Err(StabilityGap::TransactionReadRoot { read: read.clone() })
+            }
 
-            ValueSource::InvocationResult(artifact) => match context.get(artifact) {
+            ValueSource::TransactionOutput(artifact) => match context.artifacts.get(artifact) {
                 None => Err(StabilityGap::ArtifactNotInContext {
                     artifact: artifact.clone(),
                 }),
 
-                Some(ArtifactReplay::Unavailable { .. }) => Err(StabilityGap::ArtifactUnavailable {
+                Some(ArtifactReplay::Unavailable {
+                    transaction,
+                    recovery,
+                    reconstruction,
+                }) => Err(StabilityGap::ArtifactUnavailable {
                     artifact: artifact.clone(),
+                    transaction: transaction.clone(),
+                    recovery: recovery.clone(),
+                    reconstruction: reconstruction.clone(),
                 }),
 
                 Some(ArtifactReplay::Recovered { transaction, .. }) => {
@@ -525,6 +846,29 @@ impl<'a> ReplayAnalysis<'a> {
                     })
                 }
             },
+
+            ValueSource::EffectResultOk(result) | ValueSource::EffectResultErr(result) => {
+                match context.results.get(result) {
+                    None => Err(StabilityGap::ResultNotInContext {
+                        result: result.clone(),
+                    }),
+
+                    Some(ResultReplay::Unstable { effect, gap }) => {
+                        Err(StabilityGap::ResultUnstable {
+                            result: result.clone(),
+                            effect: effect.clone(),
+                            gap: Box::new(gap.clone()),
+                        })
+                    }
+
+                    Some(ResultReplay::Stable { effect, .. }) => {
+                        Ok(StabilityRule::ReplayConsistentResult {
+                            result: result.clone(),
+                            effect: effect.clone(),
+                        })
+                    }
+                }
+            }
         }?;
 
         Ok(StableRoot {
@@ -533,27 +877,354 @@ impl<'a> ReplayAnalysis<'a> {
         })
     }
 
-    /// Walks a flow in step order, producing the artifact context at
-    /// its end: every established artifact with its replay route.
-    ///
-    /// An artifact established more than once resolves to its latest
-    /// establishment, matching flow order.
-    pub fn flow_artifacts(&self, flow: &InvocationFlow) -> BTreeMap<Id, ArtifactReplay> {
-        let mut context: BTreeMap<Id, ArtifactReplay> = BTreeMap::new();
+    /// Stability of every root of a derivation, split into the stable
+    /// and the unstable.
+    pub fn roots_stability(
+        &self,
+        context: &PathContext,
+        roots: &[&ValueRef],
+    ) -> (Vec<StableRoot>, Vec<UnstableRoot>) {
+        let mut stable = Vec::new();
+        let mut unstable = Vec::new();
 
-        for step in &flow.steps {
-            let FlowStep::Transaction { transaction } = step else {
-                continue;
-            };
+        for root in roots {
+            match self.root_stability(context, root) {
+                Ok(root) => stable.push(root),
 
-            let Some(body) = self.operation.transactions.get(transaction) else {
-                continue;
-            };
-
-            let _ = self.apply_transaction(&mut context, transaction, body);
+                Err(gap) => unstable.push(UnstableRoot {
+                    root: (*root).clone(),
+                    gap,
+                }),
+            }
         }
 
-        context
+        (stable, unstable)
+    }
+
+    /// Walks a path in step order, judging every step in the context
+    /// the path had built before it.
+    pub fn trace(&self, path: &Path<'a>) -> PathTrace<'a> {
+        let mut context = PathContext::default();
+        let mut steps = Vec::new();
+
+        for step in &path.steps {
+            match step {
+                PathStep::Transaction {
+                    location,
+                    transaction,
+                } => {
+                    let Some(body) = self.operation.transactions.get(transaction) else {
+                        continue;
+                    };
+
+                    let before = context.clone();
+
+                    let (recovery, natural) =
+                        self.apply_transaction(&mut context, transaction, body);
+
+                    steps.push(TracedStep::Transaction {
+                        location: location.clone(),
+                        transaction,
+                        before,
+                        recovery,
+                        natural,
+                    });
+                }
+
+                PathStep::ExecuteEffect {
+                    location,
+                    effect,
+                    values,
+                    result,
+                } => {
+                    let contract = effect_contract(self.model, self.operation, effect);
+                    let instance = self.direct_instance(&context, values);
+
+                    self.push_effect(
+                        &mut context,
+                        &mut steps,
+                        location,
+                        EffectSite::Direct { effect, values },
+                        contract,
+                        instance,
+                        *result,
+                    );
+                }
+
+                PathStep::ExecuteEffectIntent {
+                    location,
+                    intent,
+                    result,
+                } => {
+                    let Some(declaration) = self.operation.effect_intents.get(*intent) else {
+                        continue;
+                    };
+
+                    let effect = &declaration.effect;
+                    let contract = effect_contract(self.model, self.operation, effect);
+                    let instance = self.intent_instance(&context, intent);
+
+                    self.push_effect(
+                        &mut context,
+                        &mut steps,
+                        location,
+                        EffectSite::Intent { intent, effect },
+                        contract,
+                        instance,
+                        *result,
+                    );
+                }
+
+                PathStep::Decision { location, decision } => {
+                    let (taken, replay) = self.decision_replay(&context, location, decision);
+
+                    steps.push(TracedStep::Decision {
+                        location: location.clone(),
+                        taken,
+                        replay,
+                    });
+                }
+            }
+        }
+
+        PathTrace {
+            steps,
+            terminal: path.terminal.clone(),
+            end: context,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_effect(
+        &self,
+        context: &mut PathContext,
+        steps: &mut Vec<TracedStep<'a>>,
+        location: &StepLocation,
+        site: EffectSite<'a>,
+        contract: Option<EffectContract<'a>>,
+        instance: Result<InstanceStability, InstanceGap>,
+        result: Option<&'a Id>,
+    ) {
+        let before = context.clone();
+
+        let result = result.map(|binding| {
+            let replay = self.result_replay(site.effect(), contract, &instance);
+
+            context.results.insert(binding.clone(), replay.clone());
+
+            (binding, replay)
+        });
+
+        steps.push(TracedStep::Effect {
+            location: location.clone(),
+            site,
+            contract,
+            before,
+            instance,
+            result,
+        });
+    }
+
+    /// A direct execution's instance: class-fixed iff its derivation is
+    /// replay-deterministic.
+    fn direct_instance(
+        &self,
+        context: &PathContext,
+        values: &Derivation,
+    ) -> Result<InstanceStability, InstanceGap> {
+        match values {
+            Derivation::Unspecified => Err(InstanceGap::DerivationUnspecified),
+
+            Derivation::Deterministic { from } => {
+                let roots: Vec<&ValueRef> = from.iter().collect();
+
+                let (stable, unstable) = self.roots_stability(context, &roots);
+
+                if unstable.is_empty() {
+                    Ok(InstanceStability::ReplayDeterministic { roots: stable })
+                } else {
+                    Err(InstanceGap::RootsUnstable { roots: unstable })
+                }
+            }
+        }
+    }
+
+    /// An intent execution's instance: class-fixed iff the intent is
+    /// replay-available; its values were fixed at establishment.
+    fn intent_instance(
+        &self,
+        context: &PathContext,
+        intent: &Id,
+    ) -> Result<InstanceStability, InstanceGap> {
+        match context.artifacts.get(intent) {
+            None => Err(InstanceGap::IntentNotEstablished {
+                intent: intent.clone(),
+            }),
+
+            Some(ArtifactReplay::Unavailable {
+                transaction,
+                recovery,
+                reconstruction,
+            }) => Err(InstanceGap::IntentNotReplayAvailable {
+                intent: intent.clone(),
+                transaction: transaction.clone(),
+                recovery: recovery.clone(),
+                reconstruction: reconstruction.clone(),
+            }),
+
+            Some(replay) => Ok(InstanceStability::EstablishedIntent {
+                intent: intent.clone(),
+                replay: replay.clone(),
+            }),
+        }
+    }
+
+    /// Whether same-class attempts observe one result from an effect
+    /// execution: the instance must be class-fixed, and the contract
+    /// must return one result for it — which only a request into a
+    /// target proving its result replay-consistent establishes (§31,
+    /// §32).
+    fn result_replay(
+        &self,
+        effect: &Id,
+        contract: Option<EffectContract<'_>>,
+        instance: &Result<InstanceStability, InstanceGap>,
+    ) -> ResultReplay {
+        let unstable = |gap| ResultReplay::Unstable {
+            effect: effect.clone(),
+            gap,
+        };
+
+        let request = match contract {
+            None | Some(EffectContract::Publication(_)) => {
+                return unstable(ResultGap::NoResultContract);
+            }
+
+            Some(EffectContract::External(_)) => {
+                return unstable(ResultGap::ExternalResultUndeclared);
+            }
+
+            Some(EffectContract::Request(request)) => request,
+        };
+
+        let instance = match instance {
+            Ok(instance) => instance.clone(),
+
+            Err(gap) => {
+                return unstable(ResultGap::InstanceNotClassFixed { gap: gap.clone() });
+            }
+        };
+
+        let operation = &request.target.operation;
+        let input = &request.target.input;
+
+        let target = self
+            .model
+            .operations
+            .get(operation)
+            .and_then(|target| target.inputs.get(input).map(|declared| (target, declared)));
+
+        let Some((target, Input::Request(declared))) = target else {
+            return unstable(ResultGap::TargetResultNotDeclared {
+                operation: operation.clone(),
+                input: input.clone(),
+            });
+        };
+
+        if declared.schema != request.schema {
+            return unstable(ResultGap::RequestSchemaMismatch {
+                expected: declared.schema.clone(),
+                actual: request.schema.clone(),
+            });
+        }
+
+        let Some(requirement) = returns_consistently(target, input) else {
+            return unstable(ResultGap::TargetResultNotDeclared {
+                operation: operation.clone(),
+                input: input.clone(),
+            });
+        };
+
+        if !self
+            .consistent
+            .contains(&(operation.clone(), input.clone()))
+        {
+            return unstable(ResultGap::TargetResultUnproven {
+                operation: operation.clone(),
+                input: input.clone(),
+            });
+        }
+
+        ResultReplay::Stable {
+            effect: effect.clone(),
+            rule: ResultStabilityRule::ReplayConsistentTarget {
+                operation: operation.clone(),
+                input: input.clone(),
+                requirement,
+                instance,
+            },
+        }
+    }
+
+    /// Whether every attempt in the class takes the same arm (§30).
+    fn decision_replay(
+        &self,
+        context: &PathContext,
+        location: &StepLocation,
+        decision: &Decision<'_>,
+    ) -> (DecisionTaken, Result<DecisionRule, DecisionGap>) {
+        match decision {
+            Decision::Match { result, arm } => {
+                let taken = DecisionTaken::Match {
+                    location: location.clone(),
+                    result: (*result).clone(),
+                    arm: *arm,
+                };
+
+                let replay = match context.results.get(*result) {
+                    None => Err(DecisionGap::ResultNotInContext {
+                        result: (*result).clone(),
+                    }),
+
+                    Some(ResultReplay::Unstable { effect, gap }) => {
+                        Err(DecisionGap::ResultUnstable {
+                            result: (*result).clone(),
+                            effect: effect.clone(),
+                            gap: gap.clone(),
+                        })
+                    }
+
+                    Some(ResultReplay::Stable { effect, rule }) => Ok(DecisionRule::StableResult {
+                        result: (*result).clone(),
+                        effect: effect.clone(),
+                        rule: rule.clone(),
+                    }),
+                };
+
+                (taken, replay)
+            }
+
+            Decision::Branch { condition, arm } => {
+                let taken = DecisionTaken::Branch {
+                    location: location.clone(),
+                    arm: *arm,
+                };
+
+                if !condition.is_deterministic() {
+                    return (taken, Err(DecisionGap::ConditionUnspecified));
+                }
+
+                let (stable, unstable) = self.roots_stability(context, &condition.roots());
+
+                let replay = if unstable.is_empty() {
+                    Ok(DecisionRule::StableCondition { roots: stable })
+                } else {
+                    Err(DecisionGap::ConditionRootsUnstable { roots: unstable })
+                };
+
+                (taken, replay)
+            }
+        }
     }
 
     /// Judges one transaction's replay routes and folds the artifacts
@@ -567,7 +1238,7 @@ impl<'a> ReplayAnalysis<'a> {
     #[allow(clippy::type_complexity)]
     pub(crate) fn apply_transaction(
         &self,
-        context: &mut BTreeMap<Id, ArtifactReplay>,
+        context: &mut PathContext,
         transaction: &Id,
         body: &Transaction,
     ) -> (
@@ -579,7 +1250,7 @@ impl<'a> ReplayAnalysis<'a> {
 
         for inner in &body.steps {
             match inner {
-                TransactionStep::EstablishInvocationResult(establish) => {
+                TransactionStep::EstablishTransactionOutput(establish) => {
                     let replay = self.artifact_replay(
                         transaction,
                         &recovery,
@@ -588,7 +1259,7 @@ impl<'a> ReplayAnalysis<'a> {
                         context,
                     );
 
-                    context.insert(establish.result.clone(), replay);
+                    context.artifacts.insert(establish.output.clone(), replay);
                 }
 
                 TransactionStep::EstablishEffectIntent(establish) => {
@@ -600,7 +1271,7 @@ impl<'a> ReplayAnalysis<'a> {
                         context,
                     );
 
-                    context.insert(establish.intent.clone(), replay);
+                    context.artifacts.insert(establish.intent.clone(), replay);
                 }
 
                 TransactionStep::Transition(transition) => {
@@ -612,7 +1283,7 @@ impl<'a> ReplayAnalysis<'a> {
                         let replay =
                             self.artifact_replay(transaction, &recovery, &natural, values, context);
 
-                        context.insert(intent.clone(), replay);
+                        context.artifacts.insert(intent.clone(), replay);
                     }
                 }
 
@@ -637,7 +1308,7 @@ impl<'a> ReplayAnalysis<'a> {
     /// Route B: keyed commit deduplication over a stable key (§17).
     fn recovery_route(
         &self,
-        context: &BTreeMap<Id, ArtifactReplay>,
+        context: &PathContext,
         transaction: &Transaction,
     ) -> Result<Vec<StableRoot>, Vec<ReplayGap>> {
         let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency else {
@@ -658,14 +1329,18 @@ impl<'a> ReplayAnalysis<'a> {
             }
         }
 
-        if gaps.is_empty() { Ok(roots) } else { Err(gaps) }
+        if gaps.is_empty() {
+            Ok(roots)
+        } else {
+            Err(gaps)
+        }
     }
 
     /// Route A precondition: the V1 natural-replay judgment over the
     /// transaction body.
     fn natural_route(
         &self,
-        context: &BTreeMap<Id, ArtifactReplay>,
+        context: &PathContext,
         transaction: &Transaction,
     ) -> Result<(), Vec<ReplayGap>> {
         let mut gaps = Vec::new();
@@ -685,7 +1360,7 @@ impl<'a> ReplayAnalysis<'a> {
                 TransactionStep::Delete(_) => push(&mut gaps, ReplayGap::ContainsDelete),
 
                 TransactionStep::Write(write) => {
-                    for root in predicate_roots(&write.target.predicate) {
+                    for root in write.target.predicate.roots() {
                         if let Err(gap) = self.root_stability(context, root) {
                             push(
                                 &mut gaps,
@@ -721,7 +1396,7 @@ impl<'a> ReplayAnalysis<'a> {
                 TransactionStep::Read(_)
                 | TransactionStep::Lock(_)
                 | TransactionStep::EstablishEffectIntent(_)
-                | TransactionStep::EstablishInvocationResult(_) => {}
+                | TransactionStep::EstablishTransactionOutput(_) => {}
             }
         }
 
@@ -737,7 +1412,7 @@ impl<'a> ReplayAnalysis<'a> {
         recovery: &Result<Vec<StableRoot>, Vec<ReplayGap>>,
         natural: &Result<(), Vec<ReplayGap>>,
         derivation: &Derivation,
-        context: &BTreeMap<Id, ArtifactReplay>,
+        context: &PathContext,
     ) -> ArtifactReplay {
         if let Ok(key) = recovery {
             return ArtifactReplay::Recovered {
@@ -760,10 +1435,12 @@ impl<'a> ReplayAnalysis<'a> {
                     match self.root_stability(context, root) {
                         Ok(root) => roots.push(root),
 
-                        Err(gap) => reconstruction.push(ReplayGap::ArtifactDerivationRootUnstable {
-                            root: root.clone(),
-                            gap,
-                        }),
+                        Err(gap) => {
+                            reconstruction.push(ReplayGap::ArtifactDerivationRootUnstable {
+                                root: root.clone(),
+                                gap,
+                            })
+                        }
                     }
                 }
             }
@@ -780,23 +1457,6 @@ impl<'a> ReplayAnalysis<'a> {
                 recovery: recovery.clone().err().unwrap_or_default(),
                 reconstruction,
             }
-        }
-    }
-}
-
-/// Every `ValueRef` a selector predicate constrains against. Literals
-/// are trivially stable and contribute nothing.
-pub(crate) fn predicate_roots(predicate: &SelectorPredicate) -> Vec<&ValueRef> {
-    match predicate {
-        SelectorPredicate::All => Vec::new(),
-
-        SelectorPredicate::Eq { value, .. } => match value {
-            SelectorValue::Value(root) => vec![root],
-            SelectorValue::Literal(_) => Vec::new(),
-        },
-
-        SelectorPredicate::And { predicates } => {
-            predicates.iter().flat_map(predicate_roots).collect()
         }
     }
 }

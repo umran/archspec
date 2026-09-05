@@ -103,7 +103,9 @@ pub enum SerializationVerdict {
     /// The declared facts do not establish the requirement. This is
     /// epistemic: it records which facts are missing or insufficient,
     /// not that a violation occurs (§1.2).
-    Unproven { obstacles: Vec<SerializationObstacle> },
+    Unproven {
+        obstacles: Vec<SerializationObstacle>,
+    },
 }
 
 /// A successful serialization argument and the facts it consumed.
@@ -616,4 +618,3 @@ impl SerializationObstacle {
         }
     }
 }
-

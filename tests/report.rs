@@ -33,12 +33,13 @@ fn scaffold_enumerates_requirement_obligations() {
     let model = load_flash_checkout();
     let report = report::scaffold(&model);
 
-    assert_eq!(report.format, 1);
+    assert_eq!(report.format, report::FORMAT);
+    assert_eq!(report.format, 2);
     assert_eq!(report.model_revision, Some(1));
 
-    // 3 serialization + 3 ordering + 4 idempotency + 1 response replay
-    // + 3 recoverability + 2 object history.
-    assert_eq!(report.obligations.len(), 16);
+    // 3 serialization + 3 ordering + 4 idempotency + 1 result replay
+    // + 3 recoverability.
+    assert_eq!(report.obligations.len(), 14);
 
     assert!(
         report
@@ -47,20 +48,13 @@ fn scaffold_enumerates_requirement_obligations() {
             .all(|obligation| obligation.status == Status::Unknown)
     );
 
-    assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| matches!(obligation.property, Property::ResponseReplay))
-    );
-
     assert_eq!(
         report
             .obligations
             .iter()
-            .filter(|obligation| matches!(obligation.property, Property::ObjectHistory))
+            .filter(|obligation| matches!(obligation.property, Property::ResultReplay))
             .count(),
-        2,
+        1
     );
 }
 
@@ -80,7 +74,7 @@ fn obligations_carry_real_verdicts() {
 
     let report = report::obligations(&model, &verification::verify(&model));
 
-    assert_eq!(report.obligations.len(), 16);
+    assert_eq!(report.obligations.len(), 14);
 
     let count = |status: Status| {
         report
@@ -90,16 +84,17 @@ fn obligations_carry_real_verdicts() {
             .count()
     };
 
-    // 3 serialization + apply_payment idempotency + create_order
-    // response replay + create_order/apply_payment recoverability.
-    // create_order's idempotency is unknown through its cascade:
-    // reserve_inventory consumes OrderCreated and is itself unproven.
+    // 3 serialization + 3 ordering + apply_payment idempotency +
+    // create_order result replay + create_order/apply_payment
+    // recoverability. create_order's idempotency is unknown through its
+    // cascade: reserve_inventory consumes OrderCreated and is itself
+    // unproven.
     assert_eq!(count(Status::Proven), 10);
-    assert_eq!(count(Status::Unknown), 6);
+    assert_eq!(count(Status::Unknown), 4);
     assert_eq!(count(Status::Disproven), 0);
 
     // Proven obligations state the facts their proofs rely on;
-    // unproven verified ones carry the checker's evidence.
+    // unproven ones carry the checker's evidence.
     for obligation in &report.obligations {
         match obligation.status {
             Status::Proven => assert!(
@@ -118,24 +113,8 @@ fn obligations_carry_real_verdicts() {
         }
     }
 
-    // The unverified family says why it is unknown.
-    assert!(
-        report
-            .obligations
-            .iter()
-            .filter(|obligation| matches!(
-                obligation.property,
-                Property::ObjectHistory
-            ))
-            .all(|obligation| {
-                obligation
-                    .evidence
-                    .iter()
-                    .any(|evidence| evidence.message.contains("No V1 verifier"))
-            })
-    );
-
-    // The card-charge gap surfaces on charge_payment's idempotency.
+    // The card-charge gap surfaces on charge_payment's idempotency,
+    // next to the branch on the provider's result.
     let charge = report
         .obligations
         .iter()
@@ -150,6 +129,26 @@ fn obligations_carry_real_verdicts() {
             .iter()
             .any(|evidence| evidence.message.contains("not_deduplicated"))
     );
+
+    assert!(
+        charge
+            .evidence
+            .iter()
+            .any(|evidence| evidence.message.contains("not established to replay"))
+    );
+
+    // The result-replay proof names the path facts it rests on.
+    let created = report
+        .obligations
+        .iter()
+        .find(|obligation| obligation.id == "oblig.operation.create_order.result_replay.0")
+        .expect("create_order result replay obligation exists");
+
+    assert_eq!(created.status, Status::Proven);
+
+    assert!(created.assumptions.iter().any(|assumption| {
+        assumption.contains("recovered from tx.create_order.new's keyed commit")
+    }));
 }
 
 #[test]

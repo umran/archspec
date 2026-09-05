@@ -26,8 +26,8 @@ pub struct ValueRef {
 ///   id: input.create_order.request
 /// ```
 ///
-/// The kind is never inferred from the id. The five variants index
-/// five separate namespaces, and inferring would let the meaning of a
+/// The kind is never inferred from the id. The seven variants index
+/// separate namespaces, and inferring would let the meaning of a
 /// declaration depend on what happens to resolve — silently choosing
 /// for an id declared in two of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -38,9 +38,12 @@ pub enum ValueSource {
     /// A field in the payload of a Publication or Request effect.
     Effect(Id),
 
-    /// A field in a logical invocation result available to the
-    /// current invocation.
-    InvocationResult(Id),
+    /// A field of a transaction output: a typed value a transaction
+    /// exported into the enclosing operation's control.
+    ///
+    /// Valid only where the output is definitely established or
+    /// recovered by every path reaching the reference.
+    TransactionOutput(Id),
 
     /// A field on the persistent object governed by a state machine.
     StateMachineSubject(Id),
@@ -51,6 +54,45 @@ pub enum ValueSource {
     /// Transaction-read results are transaction-local. They do not
     /// become durable cross-transaction artifacts.
     TransactionRead(Id),
+
+    /// A field of the `Ok` payload of a bound effect result, available
+    /// only inside the `ok` arm of a `match_result` on that binding.
+    ///
+    /// An operation-local observation: not a transaction artifact, and
+    /// not inherently durable.
+    EffectResultOk(Id),
+
+    /// A field of the `Err` payload of a bound effect result, available
+    /// only inside the `err` arm of a `match_result` on that binding.
+    EffectResultErr(Id),
+}
+
+impl ValueSource {
+    /// The declaration the source names.
+    pub fn id(&self) -> &Id {
+        match self {
+            Self::Input(id)
+            | Self::Effect(id)
+            | Self::TransactionOutput(id)
+            | Self::StateMachineSubject(id)
+            | Self::TransactionRead(id)
+            | Self::EffectResultOk(id)
+            | Self::EffectResultErr(id) => id,
+        }
+    }
+
+    /// The shorthand kind name, as written before the colon.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Input(_) => "input",
+            Self::Effect(_) => "effect",
+            Self::TransactionOutput(_) => "transaction_output",
+            Self::StateMachineSubject(_) => "state_machine_subject",
+            Self::TransactionRead(_) => "transaction_read",
+            Self::EffectResultOk(_) => "effect_result_ok",
+            Self::EffectResultErr(_) => "effect_result_err",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -63,9 +105,11 @@ pub enum ValueSource {
 enum ValueSourceLong {
     Input(Id),
     Effect(Id),
-    InvocationResult(Id),
+    TransactionOutput(Id),
     StateMachineSubject(Id),
     TransactionRead(Id),
+    EffectResultOk(Id),
+    EffectResultErr(Id),
 }
 
 impl From<ValueSourceLong> for ValueSource {
@@ -73,16 +117,33 @@ impl From<ValueSourceLong> for ValueSource {
         match long {
             ValueSourceLong::Input(id) => ValueSource::Input(id),
             ValueSourceLong::Effect(id) => ValueSource::Effect(id),
-            ValueSourceLong::InvocationResult(id) => ValueSource::InvocationResult(id),
+            ValueSourceLong::TransactionOutput(id) => ValueSource::TransactionOutput(id),
             ValueSourceLong::StateMachineSubject(id) => ValueSource::StateMachineSubject(id),
             ValueSourceLong::TransactionRead(id) => ValueSource::TransactionRead(id),
+            ValueSourceLong::EffectResultOk(id) => ValueSource::EffectResultOk(id),
+            ValueSourceLong::EffectResultErr(id) => ValueSource::EffectResultErr(id),
         }
     }
 }
 
 /// The shorthand names, in declaration order, for an error to list.
-const VALUE_SOURCE_KINDS: &str = "`input`, `effect`, `invocation_result`, \
-                                  `state_machine_subject`, `transaction_read`";
+const VALUE_SOURCE_KINDS: &str = "`input`, `effect`, `transaction_output`, \
+                                  `state_machine_subject`, `transaction_read`, \
+                                  `effect_result_ok`, `effect_result_err`";
+
+/// The value source a shorthand kind name denotes, if it is one.
+fn value_source_from_kind(kind: &str, id: Id) -> Option<ValueSource> {
+    Some(match kind {
+        "input" => ValueSource::Input(id),
+        "effect" => ValueSource::Effect(id),
+        "transaction_output" => ValueSource::TransactionOutput(id),
+        "state_machine_subject" => ValueSource::StateMachineSubject(id),
+        "transaction_read" => ValueSource::TransactionRead(id),
+        "effect_result_ok" => ValueSource::EffectResultOk(id),
+        "effect_result_err" => ValueSource::EffectResultErr(id),
+        _ => return None,
+    })
+}
 
 /// Whether a shorthand string opens with a value source kind.
 ///
@@ -90,12 +151,8 @@ const VALUE_SOURCE_KINDS: &str = "`input`, `effect`, `invocation_result`, \
 /// what is almost certainly a value reference missing its path,
 /// rather than read it as the text it happens to spell.
 pub(crate) fn opens_with_value_source_kind(text: &str) -> bool {
-    text.split_once(':').is_some_and(|(kind, _)| {
-        matches!(
-            kind.trim(),
-            "input" | "effect" | "invocation_result" | "state_machine_subject" | "transaction_read"
-        )
-    })
+    text.split_once(':')
+        .is_some_and(|(kind, _)| value_source_from_kind(kind.trim(), Id(String::new())).is_some())
 }
 
 impl<'de> Deserialize<'de> for ValueSource {
@@ -134,20 +191,17 @@ impl<'de> Visitor<'de> for ValueSourceVisitor {
         let id = Id(id.trim().to_string());
 
         if id.0.is_empty() {
-            return Err(E::custom(format!("`{text}`: expected an id after `{kind}:`")));
+            return Err(E::custom(format!(
+                "`{text}`: expected an id after `{kind}:`"
+            )));
         }
 
-        Ok(match kind.trim() {
-            "input" => ValueSource::Input(id),
-            "effect" => ValueSource::Effect(id),
-            "invocation_result" => ValueSource::InvocationResult(id),
-            "state_machine_subject" => ValueSource::StateMachineSubject(id),
-            "transaction_read" => ValueSource::TransactionRead(id),
-            other => {
-                return Err(E::custom(format!(
-                    "`{other}` is not a value source kind; expected one of {VALUE_SOURCE_KINDS}"
-                )));
-            }
+        let kind = kind.trim();
+
+        value_source_from_kind(kind, id).ok_or_else(|| {
+            E::custom(format!(
+                "`{kind}` is not a value source kind; expected one of {VALUE_SOURCE_KINDS}"
+            ))
         })
     }
 
@@ -176,4 +230,14 @@ pub enum Derivation {
     /// retries; replay stability of the provenance roots is
     /// established separately.
     Deterministic { from: Vec<ValueRef> },
+}
+
+impl Derivation {
+    /// The declared roots; none for an unspecified derivation.
+    pub fn roots(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::Unspecified => Vec::new(),
+            Self::Deterministic { from } => from.iter().collect(),
+        }
+    }
 }

@@ -5,6 +5,8 @@
 **Date:** 2026-08-19  
 **Scope:** Proposed revision to operation transaction, flow, invocation-result, effect-intent, and value-provenance semantics.
 
+**Terminology note (2026-09-04).** `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` (implemented 2026-09-04, see its §48) replaced the operation-execution surface this draft was written against. Read its retired terms as follows: an *invocation flow* is a *path of the operation program* — `Operation.program` is one structured, acyclic block, and a path takes one arm at each `match_result` or `branch` and ends at a terminal; `FlowStep` is `OperationStep`; `InvocationResult`, `EstablishInvocationResult`, and `ValueSource::invocation_result` are `TransactionOutput`, `EstablishTransactionOutput`, and `transaction_output`, with every artifact rule here (§3.3, §7, §12, §14–§16, §23) applying to transaction outputs verbatim; a `Response` / `ResponseSource` / `flow.response` is the `return` terminal constructing the `RequestInput.result` contract (`Result<Ok, Err>`), and a flow with no response is a path ending at `complete`; *response replay* (§18) is *result replay*; `ObjectHistoryRequirement::linearizable` is removed and deferred (V3 §3). The V1 analyses this draft specifies — natural replay (§22), artifact replay (§23), operation idempotency (§24) — carry over unchanged **per admitted path** (a path ending at `complete` or at `return` for the triggering input), with each decision judged where it is taken. Sections §18, §21, and the flow shapes in §25 and §28 are superseded and annotated in place; the remainder stands.
+
 This draft is intentionally narrower than a complete rewrite of the Archspec semantic contract. It records the model reached during the transaction/idempotency discussion and is intended to be reconciled into the main semantics document after implementation details are finalized.
 
 ---
@@ -439,6 +441,8 @@ The DSL records the provenance now so a future solver can perform this stronger 
 
 # 12. InvocationResult Semantics
 
+*(Since 2026-09-04 this artifact is `TransactionOutput` — a typed value a transaction deliberately exports to the enclosing operation program, with no response meaning of its own (V3 §7–§9). Every rule in this section applies to it unchanged.)*
+
 `InvocationResult` is a logical result artifact produced by transaction execution.
 
 It SHALL remain semantically separate from transaction idempotency.
@@ -592,7 +596,7 @@ ExecuteEffectIntent E
 
 After `T` commits, a retry cannot naturally replay `T` to reproduce `E`, because the transition has already changed the subject state. Without durable transaction replay, the subsequent `ExecuteEffectIntent E` has no recoverable artifact to consume.
 
-Accordingly, **V1 SHALL require every transaction containing a `Transition` to declare explicit durable keyed idempotency using `DeduplicatedBy(K)`.** The successful keyed commit SHALL retain transition-produced effect intents and any other transaction artifacts. A later encounter with the same `T(K)` resolves the prior commit, restores those artifacts, and does not execute the transition body again.
+Accordingly, **V1 SHALL require every transaction containing a `Transition` to declare explicit durable keyed idempotency using `DeduplicatedBy(K)`.** The successful keyed commit SHALL retain transition-produced effect intents and any other transaction artifacts. A later encounter with the same `T(K)` resolves the prior commit, restores those artifacts, and does not execute the transition body again. *(Superseded 2026-09-05 by `CONSEQO_REVISION_V3_AMENDMENT_A_TRANSITION_DEDUP_RELAXATION.md`: the natural route remains unavailable, but the keyed guarantee is no longer structurally required — an unkeyed transition transaction is valid, and the obligations over it settle unproven where no recovery fact exists.)*
 
 This rule provides crash recovery for flows that continue after a transition transaction, including flows whose next step executes an effect intent or consumes an invocation result established by the transition transaction.
 
@@ -600,7 +604,7 @@ This rule provides crash recovery for flows that continue after a transition tra
 
 # 14. Cross-Transaction Artifact Visibility
 
-Invocation flows are ordered compositions of transactions and effect executions.
+Invocation flows are ordered compositions of transactions and effect executions. *(Since 2026-09-04 the composition is the operation program, and "subsequent steps" means the steps on every path that the transaction dominates: availability is a forward definite-availability fact, intersected at joins — V3 §28.)*
 
 A logical transaction artifact established by a successful transaction SHALL remain available to subsequent flow steps in the same invocation.
 
@@ -701,6 +705,8 @@ This does not remove the need for durable effect-execution state where an archit
 
 # 18. Response Replay
 
+*(Superseded 2026-09-04 by V3 §14–§16 and §33. `Response` and `ResponseSource` are removed; a request invocation terminates at a `return` that constructs the `RequestInput.result` contract from an ordinary derivation, and the requirement is `result: replay_consistent`. The two routes below survive as the ways a `transaction_output` the terminal derives from becomes replay-stable — reconstruction (R5) or recovery (R4) — to which the implemented checker adds that every decision on the returning path must replay, so a class reaches one terminal and hence one variant. The section is kept as the rationale.)*
+
 `ResponseSource::InvocationResult` SHALL mean:
 
 > The response is obtained from the logical `InvocationResult` available to the current invocation.
@@ -749,6 +755,8 @@ Cross-transaction availability should be governed by the artifact-availability r
 
 # 21. Flow Semantics
 
+*(Superseded 2026-09-04 by V3 §22–§23. `Operation.flows` and `FlowStep` are replaced by one `Operation.program` of `OperationStep`s — the three step kinds below, plus `match_result`, `branch`, `return`, and `complete`; `execute_effect` and `execute_effect_intent` may bind a synchronous result. What this section says about `ExecuteEffect.values` and about `ExecuteEffectIntent` declaring no derivation remains true, and no recovery wrapper was introduced.)*
+
 The existing small flow vocabulary SHOULD remain, with direct execution declaring instance provenance:
 
 ```rust
@@ -789,7 +797,7 @@ If required provenance is unspecified, natural replayability is `Unknown`.
 
 If mutation target/value or artifact provenance reaches a `TransactionRead`, V1 returns `Unknown` for the natural proof route. This includes self-modifying dependencies where a transaction reads state that it later changes; deterministic computation from the read does not make the retry deterministic because the retry may observe the state produced by the first execution.
 
-If the transaction contains any `Transition`, the V1 natural route is unavailable. Such a transaction MUST use `DeduplicatedBy(K)` so that the successful commit and its artifacts can be recovered without re-executing the transition.
+If the transaction contains any `Transition`, the V1 natural route is unavailable. Such a transaction MUST use `DeduplicatedBy(K)` so that the successful commit and its artifacts can be recovered without re-executing the transition. *(Superseded 2026-09-05 by `CONSEQO_REVISION_V3_AMENDMENT_A_TRANSITION_DEDUP_RELAXATION.md`: the natural route remains unavailable, but the keyed guarantee is no longer structurally required — an unkeyed transition transaction is valid, and the obligations over it settle unproven where no recovery fact exists.)*
 
 ## 22.2 Explicit route
 
@@ -838,13 +846,14 @@ An operation-level idempotency requirement is not satisfied merely because:
 - a transaction contains an `Insert`;
 - an effect is retryable.
 
-The solver must compose the relevant proofs across the admitted invocation flow.
+The solver must compose the relevant proofs across the admitted invocation flow — since 2026-09-04, across each admitted path of the operation program, judging every decision on the path where it is taken (V3 §30, §48.2).
 
 At minimum it may need to reason about:
 
 - transaction replayability / durable commit recovery;
 - artifact replay availability;
-- response replay consistency;
+- response (now result) replay consistency;
+- decision replay — whether a retry takes the same arm at each `match_result` and `branch`;
 - effect execution idempotency;
 - idempotency-key propagation;
 - ordering/serialization requirements where relevant.
@@ -854,6 +863,8 @@ At minimum it may need to reason about:
 # 25. Candidate Structural Diff
 
 The following is a **draft shape**, not a mandate to implement these exact field names before review.
+
+*(Annotated 2026-09-04. As implemented and then revised by V3: `EstablishInvocationResult { result, values }` is `EstablishTransactionOutput { output, values }`; `InvocationResult { schema }` is `TransactionOutput { schema }`; `ValueSource::InvocationResult(Id)` is `ValueSource::TransactionOutput(Id)`, and the enum gained `EffectResultOk(Id)` / `EffectResultErr(Id)`; the `FlowStep` enum at the end of this section is superseded by `OperationStep` (V3 §23), whose `ExecuteEffect` and `ExecuteEffectIntent` carry `result: Option<Id>`. The transaction, derivation, read, write, insert, effect-intent, and state-transition shapes are as implemented.)*
 
 ```rust
 pub struct Transaction {
@@ -1126,8 +1137,8 @@ The semantic direction is coherent, but the following should be explicitly resol
 6. **Effect execution completion state**  
    Keep intent reconstruction separate from durable tracking of effect execution/completion, and decide what minimum execution-state semantics V1 requires.
 
-7. **Alternative flow applicability** — *Open; V1 stance adopted 2026-08-21.*  
-   Formalize how candidate flows whose required transaction/artifact preconditions cannot be satisfied are treated by the analyzer. This remains unresolved: `ARCHSPEC_FLOW_RESUMPTION_DRAFT.md` adopts same-flow continuation as a sufficient recoverability route that neither uses nor forbids alternative-flow continuations, so a future resolution may add routes but cannot invalidate V1 proofs.
+7. **Alternative flow applicability** — *Open; V1 stance adopted 2026-08-21, restated per path 2026-09-04.*  
+   Formalize how candidate flows whose required transaction/artifact preconditions cannot be satisfied are treated by the analyzer. This remains unresolved: `ARCHSPEC_FLOW_RESUMPTION_DRAFT.md` adopts same-flow continuation as a sufficient recoverability route that neither uses nor forbids alternative-flow continuations, so a future resolution may add routes but cannot invalidate V1 proofs. Since the operation-execution revision (V3 §48.2) the stance applies **per path of the operation program**: recoverability is established by same-path continuation for every admitted path, a decision a retry may take differently is no obstacle to progress (each arm is its own path and is analyzed on its own), and the question of which *other* paths a resumed attempt may follow after a partial execution is exactly as open as before.
 
 8. **Locking expressivity** — *Open; earmarked for implementation 2026-08-21.*  
    A `Lock` is one selector, a mode, and an acquisition order within that selector (§21). That surface cannot state the facts a deadlock argument needs, and the gaps are these:
@@ -1152,7 +1163,13 @@ The semantic direction is coherent, but the following should be explicitly resol
    4. *Admit* concurrency: two transactions can overlap unless a declared fact says otherwise — `bounded(1)` on an operation, a proven serialization requirement for same-key invocations, lane concurrency. The serialization verdicts already compute most of this.
    5. *Decide.* The union of the admitted transactions' acquisition orders over conflicting classes is acyclic: **proven**, citing the global order it found. A cycle whose every edge is a declared fact, whose transactions are admitted concurrently, and whose classes may overlap: **disproven**, with a counterexample trace in the report's existing `counterexample` shape — "T1 holds A, requests B; T2 holds B, requests A" — the checker's first disproven verdict, consistent with §1.2 because it is built from declarations, not from their absence. Anything else — an `unspecified` order on a multi-instance class, an unspecified concurrency bound, overlap that cannot be decided — is **unknown**, with the lock steps it hinges on as evidence.
 
-   To settle alongside: whether deadlock freedom is declared (a `DataModel.requirements.deadlock_freedom`, on the `ObjectHistoryRequirement` precedent, keeping the rule that requirements are obligations) or standing; a `data_model` subject kind for the report; the viz rendering of a disproven obligation with its trace; and the wait-policy assumption of question 8. Until question 8 lands, the analysis is implementable but would return unknown for nearly every real model, the transfer pattern included — which is still the honest answer.
+   To settle alongside: whether deadlock freedom is declared (a `DataModel.requirements.deadlock_freedom`, on the `ObjectHistoryRequirement` precedent — since removed, V3 §3, so the precedent is now historical — keeping the rule that requirements are obligations) or standing; a `data_model` subject kind for the report; the viz rendering of a disproven obligation with its trace; and the wait-policy assumption of question 8. Until question 8 lands, the analysis is implementable but would return unknown for nearly every real model, the transfer pattern included — which is still the honest answer.
+
+10. **Input-specific path admission** — *Open; V1 stance adopted 2026-09-04 (V3 §46.5, §48.1).*  
+    An operation may declare several inputs, and its one program does not say which input an invocation entered through. V1 relates a path to an input only through its terminal: a path is *admitted* for triggering input `i` iff it ends at `complete` or at `return` for `i` — the direct generalization of the retired admitted-flow rule (a flow with no response, or with `i`'s response). This is sufficient for the fixtures but weaker than the model knows: a `complete`-terminated path is admitted for every input, including a request input whose invocations then return nothing; a program with two request inputs cannot state that a step is reachable only through one of them, so both populations are analyzed over it; and a `return` for another input excludes a path without saying what an `i`-invocation does instead. An explicit entry concept — a per-input entry block, an `entry` step naming the inputs that may reach the steps it dominates, or a validation rule that every request input has at least one `return` — would let validation reject a program that returns nothing for a request input, let each population analyze only the steps it can reach, and give path admission a declared rather than inferred basis. It was deliberately not guessed at (V3 §46.5); any resolution refines admission and so can only remove paths from an analysis, never add work to a proven one.
+
+11. **External effect result replay** — *Open; exposed 2026-09-04 (V3 §31, §48.2, §48.6).*  
+    An `ExternalEffect` may declare a `result: Result<Ok, Err>` contract and a program may bind and match on it, but no declared fact makes an external boundary's returned result replay-consistent, so a decision on an external result is never established to replay, and a value derived from `effect_result_ok` / `effect_result_err` of one is never replay-stable. Every program branching on a provider's answer is therefore unproven for idempotency and result replay (`charge_payment` in flash checkout, `transcode_video` in video streaming), however the boundary actually behaves. `deduplicated_by { key }` is insufficient and must not be read as implying it: that guarantee collapses the *work* of same-key executions and says nothing about what each execution is *answered* with — a boundary may legitimately answer a duplicate with a distinct "already processed" error, a different variant from the original `Ok`. A guarantee that discharges the gap would have to state, at the boundary and as a separate declaration, that executions sharing the deduplication key (or a class-fixed instance) are answered with the same result variant and a replay-equivalent payload — the external counterpart of a target operation's proven `result: replay_consistent`, and like it an implementation guarantee every proof using it is conditional on (§1.3 of the main document). Whether it should be scoped to key equality alone, as `deduplicated_by` is, or to instance equality, and whether a partial guarantee (same variant, unspecified payload) is worth a vocabulary of its own, are the design questions.
 
 These questions do not require introducing recovery-specific flow steps.
 
@@ -1172,6 +1189,6 @@ The intended model can be summarized as follows:
 
 > Naturally replayable transactions may reconstruct replay-deterministic artifacts. Transactions containing state transitions are not naturally replayable in V1 and must declare explicit durable keyed idempotency. Explicitly keyed transactions commit at most once and durably retain the exact artifacts of the successful logical commit for recovery on later encounters.
 
-> Invocation flows remain simple ordered sequences of transaction and effect-execution steps. Recovery is not represented as a separate flow action.
+> Invocation flows remain simple ordered sequences of transaction and effect-execution steps. Recovery is not represented as a separate flow action. *(Superseded 2026-09-04: an operation has one structured, acyclic program with explicit `match_result` / `branch` decisions and `return` / `complete` terminals — V3 §22 — and each of its paths is such a sequence. Recovery is still not a step.)*
 
 > Durable result memoization must never be used to conceal a later inconsistent non-idempotent transaction execution. If neither natural replayability nor explicit keyed commit deduplication can establish a coherent replay path, the analyzer reports the relevant requirement as unproven.

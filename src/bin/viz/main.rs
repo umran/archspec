@@ -3,8 +3,8 @@
 //!
 //! The output is a single file with no external requests: system graph
 //! (services, operations, topics, externals; publications,
-//! subscriptions, and requests routing via topics), per-operation flow
-//! drill-down (flows → steps → transactions → transitions), and
+//! subscriptions, and requests routing via topics), per-operation
+//! program drill-down (steps → transactions → transitions), and
 //! interactive state-machine graphs. The model checker's obligation
 //! report (`archspec::analyzer::report`) can be overlaid — computed
 //! in-process with `--verify`, or loaded with `--report` — to mark
@@ -76,13 +76,11 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), String> {
-    let source = std::fs::read_to_string(&args.model).map_err(|error| {
-        format!("cannot read {}: {error}", args.model.display())
-    })?;
+    let source = std::fs::read_to_string(&args.model)
+        .map_err(|error| format!("cannot read {}: {error}", args.model.display()))?;
 
-    let model = archspec::parser::yaml::parse(&source).map_err(|error| {
-        format!("cannot parse {}: {error}", args.model.display())
-    })?;
+    let model = archspec::parser::yaml::parse(&source)
+        .map_err(|error| format!("cannot parse {}: {error}", args.model.display()))?;
 
     if args.validate {
         for error in archspec::analyzer::validate(&model) {
@@ -112,29 +110,26 @@ fn run(args: &Args) -> Result<(), String> {
         ))
     } else {
         match &args.report {
-        Some(path) => {
-            let raw = std::fs::read_to_string(path).map_err(|error| {
-                format!("cannot read {}: {error}", path.display())
-            })?;
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
 
-            let parsed: report::ProverReport = serde_json::from_str(&raw)
-                .map_err(|error| {
-                    format!("cannot parse {}: {error}", path.display())
-                })?;
+                let parsed: report::ProverReport = serde_json::from_str(&raw)
+                    .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
 
-            if let Some(revision) = parsed.model_revision
-                && revision != model.revision.0
-            {
-                eprintln!(
-                    "warning: report was produced against model \
+                if let Some(revision) = parsed.model_revision
+                    && revision != model.revision.0
+                {
+                    eprintln!(
+                        "warning: report was produced against model \
                      revision {revision}, but the model is revision {}",
-                    model.revision.0
-                );
-            }
+                        model.revision.0
+                    );
+                }
 
-            Some(parsed)
-        }
-        None => None,
+                Some(parsed)
+            }
+            None => None,
         }
     };
 
@@ -274,10 +269,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     }))
 }
 
-fn expect_value(
-    flag: &str,
-    argv: &mut impl Iterator<Item = String>,
-) -> Result<String, String> {
+fn expect_value(flag: &str, argv: &mut impl Iterator<Item = String>) -> Result<String, String> {
     argv.next()
         .ok_or_else(|| format!("{flag} requires a value"))
 }

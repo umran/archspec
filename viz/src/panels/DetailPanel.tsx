@@ -1,4 +1,3 @@
-import { Badge } from "@cloudflare/kumo/components/badge";
 import { Button } from "@cloudflare/kumo/components/button";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, XIcon } from "@phosphor-icons/react";
@@ -6,20 +5,24 @@ import type { ReactNode } from "react";
 
 import { pathText, shortId } from "../lib/ids";
 import {
-  artifactRetention, commitGuarantee, delivery, externalIdempotency, isolation, laneConcurrency,
-  messageIdentity, requestIdentity, responseSource, routing, topicOrdering,
+  artifactRetention, commitGuarantee, delivery, externalIdempotency, externalResult, inheritedResult,
+  isolation, laneConcurrency, messageIdentity, requestIdentity, requestResult, resultBinding,
+  routing, topicOrdering, transactionOutput,
 } from "../lib/explain";
-import { effectDef, effectSummary, establishingTransaction, flowContaining, intentExecutors } from "../lib/index";
+import {
+  effectDef, effectResultType, effectSummary, establishingTransaction, intentExecutors,
+  walkProgram, type LocatedStep,
+} from "../lib/index";
 import { propertyMatchesRequirement } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { concurrencyText } from "../lib/text";
+import { concurrencyText, conditionText } from "../lib/text";
 import { useApp, useObligationsAt, type DetailTarget } from "../state/AppState";
 import { CLIENT_NODE_ID, EXTERNAL_PREFIX, type Edge } from "../types/graph";
-import type { Id, IdempotencyKeyPropagation, RequirementKind } from "../types/model";
+import type { Id, IdempotencyKeyPropagation, OperationBlock, RequirementKind, ResultType } from "../types/model";
 import { ObligationCard } from "./ObligationCard";
 import {
   DerivationView, FactNote, IdLink, KeyComponents, KeyValue, List, Mono, Muted, NavLink,
-  PredicateView, RefText, Section, StatusChips, Tag, TypeView,
+  PredicateView, RefText, Section, Tag, TypeView,
 } from "./parts";
 
 /** Chrome shared by every detail: kind label, close button, title block. */
@@ -78,6 +81,19 @@ function Propagation({ items }: { items: IdempotencyKeyPropagation[] }) {
   );
 }
 
+/** A Result<ok, err> contract as two schema links. */
+function ResultContract({ result }: { result: ResultType }) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <Mono className="text-kumo-subtle">Result&lt;</Mono>
+      <IdLink id={result.ok}>{shortId(result.ok)}</IdLink>
+      <Mono className="text-kumo-subtle">,</Mono>
+      <IdLink id={result.err}>{shortId(result.err)}</IdLink>
+      <Mono className="text-kumo-subtle">&gt;</Mono>
+    </span>
+  );
+}
+
 export function DetailPanel() {
   const { detail } = useApp();
   if (!detail) return null;
@@ -90,6 +106,7 @@ function Dispatch({ target }: { target: DetailTarget }) {
 
   if (ctx.req) return <RequirementDetail opId={id} prop={ctx.req.prop} reqIndex={ctx.req.index} />;
   if (ctx.txStep) return <TxStepDetail opId={ctx.txStep.op} txId={ctx.txStep.tx} stepIndex={ctx.txStep.index} />;
+  if (ctx.step) return <StepDetail opId={ctx.step.op} location={ctx.step.location} />;
   if (ctx.edge) {
     const edge = graph.edges.find((e) => e.id === id);
     if (edge) return <EdgeDetail edge={edge} />;
@@ -113,10 +130,9 @@ function Dispatch({ target }: { target: DetailTarget }) {
     case "input": return <InputDetail opId={entry.op} id={id} />;
     case "effect": return <EffectDetail id={id} />;
     case "intent": return <IntentDetail opId={entry.op} id={id} />;
-    case "result": return <ResultDetail opId={entry.op} id={id} />;
-    case "response": return <ResponseDetail opId={entry.op} id={id} />;
+    case "output": return <OutputDetail opId={entry.op} id={id} />;
+    case "binding": return <BindingDetail opId={entry.op} effectId={entry.effect} location={entry.location} id={id} />;
     case "transaction": return <TransactionDetail opId={entry.op} id={id} />;
-    case "flow": return <FlowDetail opId={entry.op} id={id} />;
   }
 }
 
@@ -133,72 +149,107 @@ function ServiceDetail({ id }: { id: Id }) {
   );
 }
 
-function FlowSummary({ opId, flowId }: { opId: Id; flowId: Id }) {
-  const { model, index, navigateTo } = useApp();
-  const op = model.operations[opId];
-  const flow = op.flows[flowId];
-  const effectKind = (effectId: Id) => effectDef(model, index, effectId)?.effect.kind ?? null;
-  const kindBadge = (kind: string | null) =>
-    kind ? <Badge variant={kind === "publication" ? "purple" : kind === "request" ? "orange" : "warning"}>{kind}</Badge> : null;
-  return (
-    <div className="space-y-1.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
-      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
-        <button
-          type="button"
-          className="inline-flex min-w-0 cursor-pointer items-center gap-1.5 text-left font-mono text-[12px] text-kumo-link hover:underline"
-          title="Open this flow in the operation view"
-          onClick={() => navigateTo(hashes.op(opId, flowId), `flow:${flowId}`)}
-        >
-          <span className="break-all">{shortId(flowId)}</span>
-          <ArrowSquareOutIcon size={12} className="shrink-0" />
-        </button>
-        <StatusChips obKey={`${opId}/${flowId}`} />
-      </div>
-      {/* Each step is a fixed number column beside a text column, so a
-          long name wraps within its column instead of under the number. */}
-      <ol className="space-y-1.5">
-        {flow.steps.map((s, i) => {
-          const [kind, badge, target, note] =
-            s.kind === "transaction"
-              ? [
-                  "transaction",
-                  null,
-                  s.transaction,
-                  (() => {
-                    const n = op.transactions[s.transaction]?.steps.length;
-                    return n === undefined ? "? steps" : `${n} step${n === 1 ? "" : "s"}`;
-                  })(),
-                ]
-              : s.kind === "execute_effect"
-                ? ["execute effect", kindBadge(effectKind(s.effect)), s.effect, null]
-                : [
-                    "execute intent",
-                    kindBadge(op.effect_intents[s.intent] ? effectKind(op.effect_intents[s.intent].effect) : null),
-                    s.intent,
-                    null,
-                  ];
-          return (
-            <li key={i} className="flex items-start gap-2 text-xs">
-              <span className="shrink-0"><Tag>{i + 1}</Tag></span>
-              <div className="min-w-0 flex-1 space-y-0.5">
-                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
-                  <span className="text-kumo-subtle">{kind}</span>
-                  {badge}
-                </div>
-                <div className="min-w-0">
-                  <IdLink id={target}>{shortId(target)}</IdLink>
-                  {note && <span className="ml-1.5 text-kumo-inactive">{note}</span>}
-                </div>
+/** One block of the program as a nested ordered list. Each step is one
+ *  row: kind label, principal id, and arms indented beneath decisions. */
+function ProgramSummary({ opId, block, depth = 0 }: { opId: Id; block: OperationBlock; depth?: number }) {
+  const { model, index } = useApp();
+  const rows: ReactNode[] = block.steps.map((s, i) => {
+    const number = <span className="shrink-0"><Tag>{i + 1}</Tag></span>;
+    switch (s.kind) {
+      case "transaction": {
+        const n = model.operations[opId]?.transactions[s.transaction]?.steps.length;
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">transaction </span>
+              <IdLink id={s.transaction}>{shortId(s.transaction)}</IdLink>
+              {n !== undefined && <span className="ml-1.5 text-kumo-inactive">{n} step{n === 1 ? "" : "s"}</span>}
+            </div>
+          </li>
+        );
+      }
+      case "execute_effect":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">execute effect </span>
+              <IdLink id={s.effect}>{shortId(s.effect)}</IdLink>
+              {s.result && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.result}>{shortId(s.result)}</IdLink></span>}
+              <div className="text-kumo-inactive">{effectSummary(model, index, s.effect)}</div>
+            </div>
+          </li>
+        );
+      case "execute_effect_intent":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">execute intent </span>
+              <IdLink id={s.intent}>{shortId(s.intent)}</IdLink>
+              {s.result && <span className="ml-1.5 text-kumo-inactive">binds <IdLink id={s.result}>{shortId(s.result)}</IdLink></span>}
+            </div>
+          </li>
+        );
+      case "match_result":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0 flex-1">
+              <span className="text-kumo-subtle">match </span>
+              <IdLink id={s.result}>{shortId(s.result)}</IdLink>
+              <div className="mt-1 space-y-1 border-l border-kumo-hairline pl-2">
+                <div><Tag variant="success">ok</Tag></div>
+                <ProgramSummary opId={opId} block={s.ok} depth={depth + 1} />
+                <div><Tag variant="warning">err</Tag></div>
+                <ProgramSummary opId={opId} block={s.err} depth={depth + 1} />
               </div>
-            </li>
-          );
-        })}
-      </ol>
-      <div className="text-xs text-kumo-subtle">
-        terminal response: {flow.response ? <IdLink id={flow.response}>{shortId(flow.response)}</IdLink> : "none"}
-      </div>
-    </div>
-  );
+            </div>
+          </li>
+        );
+      case "branch":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0 flex-1">
+              <span className="text-kumo-subtle">branch on </span>
+              <Mono className="text-kumo-subtle">{conditionText(s.condition)}</Mono>
+              <div className="mt-1 space-y-1 border-l border-kumo-hairline pl-2">
+                <div><Tag>then</Tag></div>
+                <ProgramSummary opId={opId} block={s.then} depth={depth + 1} />
+                <div><Tag>otherwise</Tag></div>
+                {s.otherwise
+                  ? <ProgramSummary opId={opId} block={s.otherwise} depth={depth + 1} />
+                  : <Muted>falls through</Muted>}
+              </div>
+            </div>
+          </li>
+        );
+      case "return":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <div className="min-w-0">
+              <span className="text-kumo-subtle">return </span>
+              <Tag variant={s.outcome.kind === "ok" ? "success" : "warning"}>{s.outcome.kind}</Tag>
+              <span className="ml-1.5 text-kumo-subtle">for <IdLink id={s.request}>{shortId(s.request)}</IdLink></span>
+            </div>
+          </li>
+        );
+      case "complete":
+        return (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            {number}
+            <span className="text-kumo-subtle">complete</span>
+          </li>
+        );
+    }
+  });
+
+  if (!rows.length) return <Muted>empty</Muted>;
+
+  return <ol className="space-y-1.5">{rows}</ol>;
 }
 
 function OperationDetail({ id }: { id: Id }) {
@@ -207,7 +258,6 @@ function OperationDetail({ id }: { id: Id }) {
   const node = graph.operations.find((o) => o.id === id);
   const inputs = Object.entries(op.inputs);
   const effects = Object.keys(op.effects);
-  const flows = Object.keys(op.flows);
   const reqs = op.requirements;
   const reqRows: ReactNode[] = [];
   reqs.serialization.forEach((r, i) => reqRows.push(
@@ -216,7 +266,7 @@ function OperationDetail({ id }: { id: Id }) {
     <div key={`o${i}`} className="flex flex-wrap items-center gap-1.5"><Tag variant="purple">ordering</Tag><RefText value={r.key} /></div>));
   reqs.idempotency.forEach((r, i) => reqRows.push(
     <div key={`i${i}`} className="flex flex-wrap items-center gap-1.5">
-      <Tag variant="orange">idempotency</Tag>{r.response === "replay_consistent" && <Tag variant="info">replay_consistent</Tag>}
+      <Tag variant="orange">idempotency</Tag>{r.result === "replay_consistent" && <Tag variant="info">replay_consistent</Tag>}
       <KeyComponents value={r.key} />
     </div>));
   reqs.recoverability.forEach((r, i) => reqRows.push(
@@ -247,13 +297,11 @@ function OperationDetail({ id }: { id: Id }) {
       <Section title="execution">
         <KeyValue rows={[["concurrency", concurrencyText(op.execution.concurrency)]]} />
       </Section>
-      {flows.length > 0 && (
-        <Section title="flows" count={flows.length}>
-          {flows.map((flowId) => (
-            <FlowSummary key={flowId} opId={id} flowId={flowId} />
-          ))}
-        </Section>
-      )}
+      <Section title="program" count={walkProgram(op.program).length}>
+        <div className="rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-2.5">
+          <ProgramSummary opId={id} block={op.program} />
+        </div>
+      </Section>
       {inputs.length > 0 && (
         <Section title="inputs" count={inputs.length}>
           <List items={inputs.map(([iid, input]) => (
@@ -368,11 +416,6 @@ function ObjectDetail({ dmId, id }: { dmId: Id; id: Id }) {
   return (
     <Frame kind="data object" title={id} subtitle={<span>persistent object in <IdLink id={dmId} /></span>}>
       <KeyValue rows={[["schema", <IdLink key="s" id={obj.schema} />], ["identity", <Mono key="i">{obj.identity.map(pathText).join(", ")}</Mono>]]} />
-      {obj.requirements.history.length > 0 && (
-        <Section title="history requirements">
-          <div className="flex gap-1.5">{obj.requirements.history.map((h) => <Tag key={h} variant="info">{h}</Tag>)}</div>
-        </Section>
-      )}
       <Obligations obKey={`${dmId}/${id}`} />
     </Frame>
   );
@@ -438,13 +481,9 @@ function TransitionDetail({ mId, id }: { mId: Id; id: Id }) {
       )}
       {refs.length > 0 && (
         <Section title="taken by transactions" count={refs.length}>
-          <List items={refs.map((r, i) => {
-            const owner = model.operations[r.operation];
-            const flow = owner ? flowContaining(owner, r.transaction) : null;
-            return (
-              <span key={i}><IdLink id={r.transaction} /> step {r.step + 1} in <NavLink hash={hashes.op(r.operation, flow)} selection={`tx:${r.transaction}`}>{shortId(r.operation)}</NavLink></span>
-            );
-          })} />
+          <List items={refs.map((r, i) => (
+            <span key={i}><IdLink id={r.transaction} /> step {r.step + 1} in <NavLink hash={hashes.op(r.operation)} selection={`tx:${r.transaction}`}>{shortId(r.operation)}</NavLink></span>
+          ))} />
         </Section>
       )}
       <Obligations obKey={`${mId}/${id}`} />
@@ -458,8 +497,12 @@ function InputDetail({ opId, id }: { opId: Id; id: Id }) {
   if (input.kind === "request") {
     return (
       <Frame kind="input" title={id} subtitle={<span>request input of <IdLink id={opId} /></span>}>
-        <KeyValue rows={[["schema", <IdLink key="s" id={input.schema} />]]} />
+        <KeyValue rows={[
+          ["schema", <IdLink key="s" id={input.schema} />],
+          ["result", <ResultContract key="r" result={input.result} />],
+        ]} />
         <FactNote fact={requestIdentity(input.identity)} />
+        <FactNote fact={requestResult()} />
       </Frame>
     );
   }
@@ -486,6 +529,7 @@ function EffectDetail({ id }: { id: Id }) {
     ? <span>declared by <IdLink id={def.owner.op} /></span>
     : <span>owned by transition <IdLink id={def.owner.transition!} /> of <IdLink id={def.owner.machine!} /></span>;
   const executors = intentExecutors(model, id);
+  const inherited = e.kind === "request" ? effectResultType(model, index, id) : null;
   return (
     <Frame kind="effect" title={id} subtitle={owner}>
       {e.kind === "publication" && (
@@ -497,6 +541,9 @@ function EffectDetail({ id }: { id: Id }) {
       {e.kind === "request" && (
         <>
           <KeyValue rows={[["kind", <Tag key="k" variant="orange">request</Tag>], ["operation", <IdLink key="o" id={e.target.operation} />], ["input", <IdLink key="i" id={e.target.input} />], ["schema", <IdLink key="s" id={e.schema} />], ["retry", <Tag key="r">{e.retry}</Tag>]]} />
+          <FactNote fact={inheritedResult()}>
+            {inherited && <ResultContract result={inherited} />}
+          </FactNote>
           <Propagation items={e.idempotency_key_propagation} />
         </>
       )}
@@ -507,6 +554,9 @@ function EffectDetail({ id }: { id: Id }) {
             {e.idempotency.kind === "deduplicated_by" && (
               <span className="text-xs text-kumo-subtle">by <KeyComponents value={e.idempotency.key} /></span>
             )}
+          </FactNote>
+          <FactNote fact={externalResult(e.result)}>
+            {e.result && <ResultContract result={e.result} />}
           </FactNote>
         </>
       )}
@@ -538,44 +588,121 @@ function IntentDetail({ opId, id }: { opId: Id; id: Id }) {
   );
 }
 
-function ResultDetail({ opId, id }: { opId: Id; id: Id }) {
+function OutputDetail({ opId, id }: { opId: Id; id: Id }) {
   const { model } = useApp();
   const op = model.operations[opId];
-  const r = op.invocation_results[id];
+  const output = op.transaction_outputs[id];
   const txId = establishingTransaction(model, op, id);
   return (
-    <Frame kind="invocation result" title={id} subtitle={<span>logical artifact of <IdLink id={opId} /></span>}>
+    <Frame kind="transaction output" title={id} subtitle={<span>typed export of <IdLink id={opId} /></span>}>
       <KeyValue rows={[
-        ["schema", <IdLink key="s" id={r.schema} />],
+        ["schema", <IdLink key="s" id={output.schema} />],
         ["established by", txId ? <IdLink key="t" id={txId} /> : <Muted key="t">no transaction establishes it</Muted>],
       ]} />
+      <FactNote fact={transactionOutput()} />
       {txId && <FactNote fact={artifactRetention(op.transactions[txId].idempotency)} />}
     </Frame>
   );
 }
 
-function ResponseDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model } = useApp();
-  const op = model.operations[opId];
-  const r = op.responses[id];
-  const result = r.source.kind === "invocation_result" ? r.source.result : null;
-  const txId = result ? establishingTransaction(model, op, result) : null;
+function BindingDetail({ opId, effectId, location, id }: { opId: Id; effectId: Id; location: string; id: Id }) {
+  const { model, index } = useApp();
+  const contract = effectResultType(model, index, effectId);
   return (
-    <Frame kind="response" title={id} subtitle={<span>response of <IdLink id={opId} /></span>}>
+    <Frame kind="effect result" title={id} subtitle={<span>result binding in <IdLink id={opId} /></span>}>
       <KeyValue rows={[
-        ["request", <IdLink key="r" id={r.request} />],
-        ["schema", <IdLink key="s" id={r.schema} />],
+        ["observes", <IdLink key="e" id={effectId} />],
+        ["which is", effectSummary(model, index, effectId)],
+        ["bound at step", <Mono key="l">{location}</Mono>],
+        ["contract", contract ? <ResultContract key="c" result={contract} /> : <Muted key="c">no synchronous result</Muted>],
       ]} />
-      <FactNote fact={responseSource(result)}>
-        {result && <span className="text-xs text-kumo-subtle">from <IdLink id={result} /></span>}
-      </FactNote>
-      {txId && (
-        <FactNote fact={artifactRetention(op.transactions[txId].idempotency)}>
-          <span className="text-xs text-kumo-subtle">the result is established by <IdLink id={txId} /></span>
-        </FactNote>
-      )}
+      <FactNote fact={resultBinding()} />
     </Frame>
   );
+}
+
+/** Detail for a program step selected on the operation page: decisions
+ *  and terminals, which have no id of their own. */
+function StepDetail({ opId, location }: { opId: Id; location: string }) {
+  const { model } = useApp();
+  const op = model.operations[opId];
+  const located: LocatedStep | undefined = walkProgram(op.program).find((s) => s.location === location);
+  const sub = <span>step {location} of <IdLink id={opId} />'s program</span>;
+
+  if (!located) return <Frame kind="program step" title={`step ${location}`} subtitle={sub} />;
+
+  const step = located.step;
+  const arms = (label: string, block: OperationBlock | null) =>
+    [label, block ? `${block.steps.length} step${block.steps.length === 1 ? "" : "s"}` : "falls through"] as [string, ReactNode];
+
+  switch (step.kind) {
+    case "match_result":
+      return (
+        <Frame kind="program step" title={`match · ${shortId(step.result)}`} subtitle={sub}
+          description="Destructures the bound result: exactly one arm executes, and each variant payload is available only inside its own arm.">
+          <KeyValue rows={[
+            ["result", <IdLink key="r" id={step.result} />],
+            arms("ok arm", step.ok),
+            arms("err arm", step.err),
+          ]} />
+          <Obligations obKey={opId} />
+        </Frame>
+      );
+    case "branch":
+      return (
+        <Frame kind="program step" title="branch" subtitle={sub}
+          description={step.condition.kind === "unspecified"
+            ? "The condition declares no fact about how the decision is made, so a retry is not established to take the same arm."
+            : "An ordinary control decision over modeled values; a retry takes the same arm exactly when the condition's roots are replay-stable."}>
+          <KeyValue rows={[
+            ["condition", <Mono key="c" className="text-kumo-subtle">{conditionText(step.condition)}</Mono>],
+            arms("then arm", step.then),
+            arms("otherwise arm", step.otherwise),
+          ]} />
+        </Frame>
+      );
+    case "return":
+      return (
+        <Frame kind="program step" title={`return ${step.outcome.kind}`} subtitle={sub}
+          description="Terminates the execution by constructing the request input's declared result.">
+          <KeyValue rows={[
+            ["request", <IdLink key="r" id={step.request} />],
+            ["variant", <Tag key="v" variant={step.outcome.kind === "ok" ? "success" : "warning"}>{step.outcome.kind}</Tag>],
+          ]} />
+          <Section title="payload provenance"><DerivationView value={step.outcome.values} /></Section>
+        </Frame>
+      );
+    case "complete":
+      return (
+        <Frame kind="program step" title="complete" subtitle={sub}
+          description="Terminates the execution without a returned value, as is natural for a subscription-driven operation." />
+      );
+    case "transaction":
+      return (
+        <Frame kind="program step" title={`transaction · ${shortId(step.transaction)}`} subtitle={sub}>
+          <KeyValue rows={[["transaction", <IdLink key="t" id={step.transaction} />]]} />
+        </Frame>
+      );
+    case "execute_effect":
+      return (
+        <Frame kind="program step" title={`execute effect · ${shortId(step.effect)}`} subtitle={sub}>
+          <KeyValue rows={[
+            ["effect", <IdLink key="e" id={step.effect} />],
+            ["binds", step.result ? <IdLink key="b" id={step.result} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+          ]} />
+          <Section title="instance provenance"><DerivationView value={step.values} /></Section>
+        </Frame>
+      );
+    case "execute_effect_intent":
+      return (
+        <Frame kind="program step" title={`execute intent · ${shortId(step.intent)}`} subtitle={sub}>
+          <KeyValue rows={[
+            ["intent", <IdLink key="i" id={step.intent} />],
+            ["binds", step.result ? <IdLink key="b" id={step.result} /> : <Muted key="b">nothing — the result is ignored</Muted>],
+          ]} />
+        </Frame>
+      );
+  }
 }
 
 function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
@@ -601,27 +728,11 @@ function TransactionDetail({ opId, id }: { opId: Id; id: Id }) {
             {s.kind === "transition" && <Mono className="text-kumo-subtle">{shortId(s.transition)}</Mono>}
             {(s.kind === "read" || s.kind === "write" || s.kind === "delete" || s.kind === "lock") && <Mono className="text-kumo-subtle">{shortId(s.target.object)}</Mono>}
             {s.kind === "insert" && <Mono className="text-kumo-subtle">{shortId(s.object)}</Mono>}
+            {s.kind === "establish_transaction_output" && <Mono className="text-kumo-subtle">{shortId(s.output)}</Mono>}
+            {s.kind === "establish_effect_intent" && <Mono className="text-kumo-subtle">{shortId(s.intent)}</Mono>}
           </button>
         ))} />
       </Section>
-      <Obligations obKey={`${opId}/${id}`} />
-    </Frame>
-  );
-}
-
-function FlowDetail({ opId, id }: { opId: Id; id: Id }) {
-  const { model } = useApp();
-  const flow = model.operations[opId].flows[id];
-  return (
-    <Frame kind="invocation flow" title={id} subtitle={<span>flow of <NavLink hash={hashes.op(opId, id)} selection={`flow:${id}`}>{shortId(opId)}</NavLink></span>}>
-      <Section title="steps" count={flow.steps.length}>
-        <List items={flow.steps.map((s, i) => (
-          <span key={i} className="flex items-center gap-2"><Tag>{i + 1}</Tag><span className="text-sm">{s.kind}</span>
-            <IdLink id={s.kind === "transaction" ? s.transaction : s.kind === "execute_effect" ? s.effect : s.intent} />
-          </span>
-        ))} />
-      </Section>
-      <KeyValue rows={[["terminal response", flow.response ? <IdLink key="r" id={flow.response} /> : <Muted key="r">none</Muted>]]} />
       <Obligations obKey={`${opId}/${id}`} />
     </Frame>
   );
@@ -642,7 +753,7 @@ function RequirementDetail({ opId, prop, reqIndex }: { opId: Id; prop: Requireme
     rows.push(<KeyComponents key="k" value={r.key} />);
   }
   const extra: [string, ReactNode][] = prop === "idempotency"
-    ? [["response", <Tag key="r" variant={reqs.idempotency[reqIndex].response === "replay_consistent" ? "info" : "neutral"}>{reqs.idempotency[reqIndex].response}</Tag>]]
+    ? [["result", <Tag key="r" variant={reqs.idempotency[reqIndex].result === "replay_consistent" ? "info" : "neutral"}>{reqs.idempotency[reqIndex].result}</Tag>]]
     : prop === "recoverability"
       ? [["completion", <Tag key="c">{reqs.recoverability[reqIndex].completion}</Tag>]]
       : [];
@@ -717,10 +828,10 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
         </Frame>
       );
-    case "establish_invocation_result":
+    case "establish_transaction_output":
       return (
-        <Frame kind="transaction step" title={`establish result · ${shortId(step.result)}`} subtitle={sub}>
-          <KeyValue rows={[["result", <IdLink key="r" id={step.result} />]]} />
+        <Frame kind="transaction step" title={`establish output · ${shortId(step.output)}`} subtitle={sub}>
+          <KeyValue rows={[["output", <IdLink key="o" id={step.output} />]]} />
           <Section title="value provenance"><DerivationView value={step.values} /></Section>
         </Frame>
       );
@@ -728,11 +839,11 @@ function TxStepDetail({ opId, txId, stepIndex }: { opId: Id; txId: Id; stepIndex
 }
 
 function EdgeDetail({ edge: e }: { edge: Edge }) {
-  const executed = "executed_by" in e ? (
-    <Section title="executed by flows" count={e.executed_by.length}>
-      {e.executed_by.length
-        ? <List items={e.executed_by.map((f) => <IdLink key={f} id={f} />)} />
-        : <span className="flex items-center gap-1.5"><Tag variant="warning">declared, not executed</Tag><Muted>no declared flow executes this effect</Muted></span>}
+  const executed = "executed_at" in e ? (
+    <Section title="executed at program steps" count={e.executed_at.length}>
+      {e.executed_at.length
+        ? <List items={e.executed_at.map((loc, i) => <Mono key={i}>step {loc}</Mono>)} />
+        : <span className="flex items-center gap-1.5"><Tag variant="warning">declared, not executed</Tag><Muted>no step of the program executes this effect</Muted></span>}
     </Section>
   ) : null;
   const via = "via_transition" in e && e.via_transition ? (

@@ -7,11 +7,19 @@
 # Resilience: every state change is a keyed commit recovering its
 # artifacts on retry; every event is identified; external boundaries
 # declare their own deduplication; subscriptions are at-least-once with
-# guaranteed completion.
+# guaranteed completion. The transcoder branches on the engine's
+# synchronous result: a rendered manifest completes the job, a rejected
+# source fails it.
 #
 # Scalability: operations run unbounded; same-video work is serialized
 # through the topic's video_id key and single-lane dispatch, while
 # different videos proceed in parallel.
+#
+# One honest gap remains, and the checker reports it. The engine
+# deduplicates renders by video_id, but no declared fact says a
+# repeated render returns the same result, so a retried transcode is
+# not established to take the same arm again: its idempotency is
+# unknown, and so — through the cascade — is the upload's.
 revision: 1
 services:
   service.ingest:
@@ -53,6 +61,24 @@ schemas:
       video_id: uuid
       status: string
       manifest_uri: string?
+  schema.RequestRejected:
+    kind: canonical
+    description: The err payload of a request the boundary refused.
+    completeness: complete
+    fields:
+      reason: string
+  schema.RenderCompleted:
+    kind: canonical
+    description: The transcoding engine's ok payload.
+    completeness: complete
+    fields:
+      manifest_uri: string
+  schema.RenderFailed:
+    kind: canonical
+    description: The transcoding engine's err payload.
+    completeness: complete
+    fields:
+      reason: string
   schema.VideoUploaded:
     kind: canonical
     description: A new source video is available for transcoding.
@@ -104,18 +130,12 @@ data_models:
         schema: schema.VideoRecord
         identity:
         - video_id
-        requirements:
-          history:
-          - linearizable
   data.transcoder:
     objects:
       object.job:
         schema: schema.TranscodeJob
         identity:
         - video_id
-        requirements:
-          history:
-          - linearizable
 topics:
   topic.video_events:
     messages:
@@ -208,6 +228,9 @@ operations:
           kind: keyed
           fields:
           - upload_id
+        result:
+          ok: schema.UploadCompleteResponse
+          err: schema.RequestRejected
     effects:
       effect.complete_upload.publish_uploaded:
         kind: publication
@@ -225,16 +248,9 @@ operations:
     effect_intents:
       intent.complete_upload.publish_uploaded:
         effect: effect.complete_upload.publish_uploaded
-    invocation_results:
-      result.complete_upload:
+    transaction_outputs:
+      output.complete_upload:
         schema: schema.UploadCompleteResponse
-    responses:
-      response.complete_upload:
-        request: input.complete_upload.request
-        schema: schema.UploadCompleteResponse
-        source:
-          kind: invocation_result
-          result: result.complete_upload
     transactions:
       tx.complete_upload.register:
         data_model: data.videos
@@ -270,21 +286,32 @@ operations:
               path: owner_id
             - source: input:input.complete_upload.request
               path: source_uri
-        - kind: establish_invocation_result
-          result: result.complete_upload
+        # status is the constant initial state, so the only provenance
+        # root is the video id.
+        - kind: establish_transaction_output
+          output: output.complete_upload
           values:
             kind: deterministic
             from:
             - source: input:input.complete_upload.request
               path: video_id
-    flows:
-      flow.complete_upload:
-        steps:
-        - kind: transaction
-          transaction: tx.complete_upload.register
-        - kind: execute_effect_intent
-          intent: intent.complete_upload.publish_uploaded
-        response: response.complete_upload
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.complete_upload.register
+      - kind: execute_effect_intent
+        intent: intent.complete_upload.publish_uploaded
+      - kind: return
+        request: input.complete_upload.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: transaction_output:output.complete_upload
+              path: video_id
+            - source: transaction_output:output.complete_upload
+              path: status
     requirements:
       serialization: []
       ordering: []
@@ -293,7 +320,7 @@ operations:
           components:
           - source: input:input.complete_upload.request
             path: upload_id
-        response: replay_consistent
+        result: replay_consistent
       recoverability:
       - key:
           components:
@@ -305,7 +332,7 @@ operations:
         kind: unbounded
   operation.transcode_video:
     service: service.transcoder
-    description: Claim the transcode job for an uploaded video and render its renditions through the transcoding engine; one flow announces completion, the alternative marks the job failed when the engine rejects the source.
+    description: Claim the transcode job for an uploaded video and render its renditions through the transcoding engine; a rendered manifest completes the job, a rejected source fails it.
     inputs:
       input.transcode_video.uploaded:
         kind: subscription
@@ -330,11 +357,13 @@ operations:
             components:
             - source: input:input.transcode_video.uploaded
               path: video_id
+        result:
+          ok: schema.RenderCompleted
+          err: schema.RenderFailed
     effect_intents:
       intent.transcode_video.completed:
         effect: effect.job.completed
-    invocation_results: {}
-    responses: {}
+    transaction_outputs: {}
     transactions:
       tx.transcode_video.claim:
         data_model: data.transcoder
@@ -391,8 +420,8 @@ operations:
           values:
             kind: deterministic
             from:
-            - source: input:input.transcode_video.uploaded
-              path: video_id
+            - source: effect_result_ok:result.transcode_video.render
+              path: manifest_uri
         - kind: transition
           machine: machine.job_lifecycle
           transition: transition.job.complete
@@ -412,6 +441,8 @@ operations:
                 path: event_id
               - source: input:input.transcode_video.uploaded
                 path: video_id
+              - source: effect_result_ok:result.transcode_video.render
+                path: manifest_uri
       tx.transcode_video.fail:
         data_model: data.transcoder
         isolation: read_committed
@@ -434,41 +465,34 @@ operations:
                 source: input:input.transcode_video.uploaded
                 path: video_id
           effect_values: {}
-    flows:
-      flow.transcode_video.completed:
-        steps:
-        - kind: transaction
-          transaction: tx.transcode_video.claim
-        - kind: execute_effect
-          effect: effect.transcode_video.engine
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.transcode_video.uploaded
-              path: video_id
-            - source: input:input.transcode_video.uploaded
-              path: source_uri
-        - kind: transaction
-          transaction: tx.transcode_video.complete
-        - kind: execute_effect_intent
-          intent: intent.transcode_video.completed
-        response: null
-      flow.transcode_video.failed:
-        steps:
-        - kind: transaction
-          transaction: tx.transcode_video.claim
-        - kind: execute_effect
-          effect: effect.transcode_video.engine
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.transcode_video.uploaded
-              path: video_id
-            - source: input:input.transcode_video.uploaded
-              path: source_uri
-        - kind: transaction
-          transaction: tx.transcode_video.fail
-        response: null
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.transcode_video.claim
+      - kind: execute_effect
+        effect: effect.transcode_video.engine
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.transcode_video.uploaded
+            path: video_id
+          - source: input:input.transcode_video.uploaded
+            path: source_uri
+        result: result.transcode_video.render
+      - kind: match_result
+        result: result.transcode_video.render
+        ok:
+          steps:
+          - kind: transaction
+            transaction: tx.transcode_video.complete
+          - kind: execute_effect_intent
+            intent: intent.transcode_video.completed
+          - kind: complete
+        err:
+          steps:
+          - kind: transaction
+            transaction: tx.transcode_video.fail
+          - kind: complete
     requirements:
       serialization:
       - key:
@@ -483,7 +507,7 @@ operations:
           components:
           - source: input:input.transcode_video.uploaded
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability:
       - key:
           components:
@@ -514,8 +538,7 @@ operations:
     effect_intents:
       intent.publish_video.published:
         effect: effect.video.published
-    invocation_results: {}
-    responses: {}
+    transaction_outputs: {}
     transactions:
       tx.publish_video.ready:
         data_model: data.videos
@@ -564,14 +587,13 @@ operations:
                 path: video_id
               - source: input:input.publish_video.completed
                 path: manifest_uri
-    flows:
-      flow.publish_video:
-        steps:
-        - kind: transaction
-          transaction: tx.publish_video.ready
-        - kind: execute_effect_intent
-          intent: intent.publish_video.published
-        response: null
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.publish_video.ready
+      - kind: execute_effect_intent
+        intent: intent.publish_video.published
+      - kind: complete
     requirements:
       serialization:
       - key:
@@ -586,7 +608,7 @@ operations:
           components:
           - source: input:input.publish_video.completed
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability:
       - key:
           components:
@@ -623,23 +645,22 @@ operations:
             components:
             - source: input:input.notify_published.published
               path: event_id
+        result: null
     effect_intents: {}
-    invocation_results: {}
-    responses: {}
+    transaction_outputs: {}
     transactions: {}
-    flows:
-      flow.notify_published:
-        steps:
-        - kind: execute_effect
-          effect: effect.notify_published.push
-          values:
-            kind: deterministic
-            from:
-            - source: input:input.notify_published.published
-              path: event_id
-            - source: input:input.notify_published.published
-              path: video_id
-        response: null
+    program:
+      steps:
+      - kind: execute_effect
+        effect: effect.notify_published.push
+        values:
+          kind: deterministic
+          from:
+          - source: input:input.notify_published.published
+            path: event_id
+          - source: input:input.notify_published.published
+            path: video_id
+      - kind: complete
     requirements:
       serialization:
       - key:
@@ -651,7 +672,7 @@ operations:
           components:
           - source: input:input.notify_published.published
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability:
       - key:
           components:
@@ -663,25 +684,21 @@ operations:
         kind: unbounded
   operation.get_playback:
     service: service.catalog
-    description: Resolve a playable manifest. Read-only, so repeating it is harmless; its response is deliberately not declared replay-consistent, because the video's state may legitimately change between attempts.
+    description: Resolve a playable manifest. Read-only, so repeating it is harmless; its result is deliberately not declared replay-consistent, because the video's state may legitimately change between attempts.
     inputs:
       input.get_playback.request:
         kind: request
         schema: schema.PlaybackRequest
         identity:
           kind: unspecified
+        result:
+          ok: schema.PlaybackResponse
+          err: schema.RequestRejected
     effects: {}
     effect_intents: {}
-    invocation_results:
-      result.get_playback:
+    transaction_outputs:
+      output.get_playback:
         schema: schema.PlaybackResponse
-    responses:
-      response.get_playback:
-        request: input.get_playback.request
-        schema: schema.PlaybackResponse
-        source:
-          kind: invocation_result
-          result: result.get_playback
     transactions:
       tx.get_playback.read:
         data_model: data.videos
@@ -704,8 +721,8 @@ operations:
             fields:
             - status
             - manifest_uri
-        - kind: establish_invocation_result
-          result: result.get_playback
+        - kind: establish_transaction_output
+          output: output.get_playback
           values:
             kind: deterministic
             from:
@@ -715,12 +732,23 @@ operations:
               path: status
             - source: transaction_read:read.get_playback.video
               path: manifest_uri
-    flows:
-      flow.get_playback:
-        steps:
-        - kind: transaction
-          transaction: tx.get_playback.read
-        response: response.get_playback
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.get_playback.read
+      - kind: return
+        request: input.get_playback.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: transaction_output:output.get_playback
+              path: video_id
+            - source: transaction_output:output.get_playback
+              path: status
+            - source: transaction_output:output.get_playback
+              path: manifest_uri
     requirements:
       serialization: []
       ordering: []
@@ -729,7 +757,7 @@ operations:
           components:
           - source: input:input.get_playback.request
             path: video_id
-        response: unspecified
+        result: unspecified
       recoverability: []
     execution:
       concurrency:

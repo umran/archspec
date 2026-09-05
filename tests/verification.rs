@@ -9,24 +9,26 @@ use archspec::{
     analyzer::{
         DiagnosticCode, Severity, VerificationCode, validation,
         verification::{
-            self, ArtifactReplay, ConsumerCollapse, EffectRetrySafety, EffectSafety,
-            GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof, IdempotencyVerdict,
-            KeyIdentity, PayloadIdentityGap, RecoverabilityNote, RecoverabilityObstacle,
-            RecoverabilityProof, RecoverabilityVerdict, ReplayGap, Resolution,
-            ResponseReplayObstacle, ResponseReplayProof, ResponseReplayVerdict, RetryDriver,
-            SerializationObstacle, SerializationProof, SerializationVerdict, StabilityGap,
-            StabilityRule, StableRoot, TransactionResolution, canonical_value_path,
+            self, ArtifactReplay, ConsumerCollapse, DecisionGap, DecisionRule, EffectRetrySafety,
+            EffectSafety, GoverningKeyDefect, IdempotencyObstacle, IdempotencyProof,
+            IdempotencyVerdict, KeyIdentity, PathRef, PayloadIdentityGap, RecoverabilityNote,
+            RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, ReplayGap,
+            Resolution, ResultGap, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict,
+            RetryDriver, SerializationObstacle, SerializationProof, SerializationVerdict,
+            StabilityGap, StabilityRule, StableRoot, TransactionResolution, canonical_value_path,
         },
     },
     parser::yaml,
     spec::{
-        CompletionRequirement, Derivation, DispatchRouting, EstablishInvocationResult, FieldPath,
-        FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, IdempotencyRequirement, Input,
-        InvocationFlow, InvocationResult, LaneConcurrency, MessageIdentity, MessageSelector,
-        Model, ObjectSelector, OperationConcurrency, RecoverabilityRequirement, RequestIdentity,
-        ResponseReplayRequirement, ResponseSource, Schema, SchemaFragment, SelectorPredicate,
-        SelectorValue, SerializationRequirement, SubscriptionInput, TopicOrdering, Transaction,
-        TransactionIsolation, TransactionStep, ValueRef, ValueSource, Write,
+        Arm, Branch, CompletionRequirement, Condition, Derivation, DispatchRouting,
+        EstablishTransactionOutput, ExecuteEffect, FieldPath, Id, IdempotencyGuarantee,
+        IdempotencyKey, IdempotencyRequirement, Input, LaneConcurrency, Literal, MatchResult,
+        MessageIdentity, MessageSelector, Model, ObjectSelector, OperationBlock,
+        OperationConcurrency, OperationStep, RecoverabilityRequirement, RequestIdentity,
+        RequestInput, ResultOutcome, ResultReplayRequirement, ResultType, ResultVariant, Return,
+        RunTransaction, Schema, SchemaFragment, SelectorPredicate, SelectorValue,
+        SerializationRequirement, SubscriptionInput, TopicOrdering, Transaction,
+        TransactionIsolation, TransactionOutput, TransactionStep, ValueRef, ValueSource, Write,
     },
 };
 
@@ -45,6 +47,81 @@ fn input_key(input: &str, components: &[&str]) -> ValueRef {
     }
 }
 
+fn program_mut<'a>(model: &'a mut Model, operation: &str) -> &'a mut OperationBlock {
+    &mut model.operations.get_mut(&id(operation)).unwrap().program
+}
+
+fn run(transaction: &str) -> OperationStep {
+    OperationStep::Transaction(RunTransaction {
+        transaction: id(transaction),
+    })
+}
+
+fn execute(effect: &str, values: Derivation, result: Option<&str>) -> OperationStep {
+    OperationStep::ExecuteEffect(ExecuteEffect {
+        effect: id(effect),
+        values,
+        result: result.map(id),
+    })
+}
+
+fn return_ok(request: &str, values: Derivation) -> OperationStep {
+    OperationStep::Return(Return {
+        request: id(request),
+        outcome: ResultOutcome::Ok { values },
+    })
+}
+
+fn return_err(request: &str, values: Derivation) -> OperationStep {
+    OperationStep::Return(Return {
+        request: id(request),
+        outcome: ResultOutcome::Err { values },
+    })
+}
+
+fn output_ref(output: &str, components: &[&str]) -> ValueRef {
+    ValueRef {
+        source: ValueSource::TransactionOutput(id(output)),
+        path: path(components),
+    }
+}
+
+fn block(steps: Vec<OperationStep>) -> OperationBlock {
+    OperationBlock { steps }
+}
+
+/// A request effect from `caller` into `target`'s request input.
+fn request_effect(target: &str, input: &str, schema: &str) -> archspec::spec::Effect {
+    archspec::spec::Effect::Request(archspec::spec::RequestEffect {
+        target: archspec::spec::RequestTarget {
+            operation: id(target),
+            input: id(input),
+        },
+        schema: id(schema),
+        retry: archspec::spec::RetrySemantics::Unspecified,
+        idempotency_key_propagation: vec![],
+    })
+}
+
+/// Straightens charge_payment: the card is charged without binding its
+/// result and the capture is published unconditionally, as before the
+/// provider's decline was modeled.
+fn linearize_charge_payment(model: &mut Model) {
+    let program = program_mut(model, "operation.charge_payment");
+
+    let OperationStep::MatchResult(matched) = program.steps.remove(1) else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(card) = &mut program.steps[0] else {
+        panic!("expected the card charge");
+    };
+
+    card.result = None;
+
+    program.steps.extend(matched.ok.steps);
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -61,7 +138,11 @@ fn load_flash_checkout() -> Model {
     yaml::parse(&source).expect("flash checkout fixture should parse")
 }
 
-fn subscription_mut<'a>(model: &'a mut Model, operation: &str, input: &str) -> &'a mut SubscriptionInput {
+fn subscription_mut<'a>(
+    model: &'a mut Model,
+    operation: &str,
+    input: &str,
+) -> &'a mut SubscriptionInput {
     let input = model
         .operations
         .get_mut(&id(operation))
@@ -76,7 +157,11 @@ fn subscription_mut<'a>(model: &'a mut Model, operation: &str, input: &str) -> &
     }
 }
 
-fn serialization_verdict(model: &Model, operation: &str, requirement: usize) -> SerializationVerdict {
+fn serialization_verdict(
+    model: &Model,
+    operation: &str,
+    requirement: usize,
+) -> SerializationVerdict {
     let report = verification::verify(model);
 
     report
@@ -156,7 +241,10 @@ fn keyed_lane_proof_states_its_facts() {
 fn operation_concurrency_of_one_proves_any_key() {
     let mut model = load_flash_checkout();
 
-    let operation = model.operations.get_mut(&id("operation.transfer_stock")).unwrap();
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
 
     operation
         .requirements
@@ -348,7 +436,11 @@ fn serialization_key_diverging_from_topic_key_is_unproven() {
 fn topic_without_keyed_ordering_defeats_by_topic_key_routing() {
     let mut model = load_flash_checkout();
 
-    model.topics.get_mut(&id("topic.order_events")).unwrap().ordering = TopicOrdering::Global;
+    model
+        .topics
+        .get_mut(&id("topic.order_events"))
+        .unwrap()
+        .ordering = TopicOrdering::Global;
 
     let verdict = serialization_verdict(&model, "operation.reserve_inventory", 0);
 
@@ -430,7 +522,14 @@ fn fragment_aliasing_establishes_key_identity() {
     // `order_id` under a different name.
     let mut mapping = BTreeMap::new();
 
-    for field in ["order_id", "event_id", "warehouse_id", "sku", "quantity", "amount"] {
+    for field in [
+        "order_id",
+        "event_id",
+        "warehouse_id",
+        "sku",
+        "quantity",
+        "amount",
+    ] {
         mapping.insert(field.to_owned(), path(&[field]));
     }
 
@@ -453,7 +552,8 @@ fn fragment_aliasing_establishes_key_identity() {
     };
 
     // The topic keys the fragment schema by its aliased name.
-    key.mapping.insert(id("schema.OrderCreatedView"), path(&["ref"]));
+    key.mapping
+        .insert(id("schema.OrderCreatedView"), path(&["ref"]));
 
     let subscription = subscription_mut(
         &mut model,
@@ -620,20 +720,61 @@ fn deterministic(from: Vec<ValueRef>) -> Derivation {
     Derivation::Deterministic { from }
 }
 
-fn response_replay_verdict(
+fn result_replay_verdict(
     model: &Model,
     operation: &str,
     requirement: usize,
-) -> ResponseReplayVerdict {
+) -> ResultReplayVerdict {
     let report = verification::verify(model);
 
     report
-        .response_replay
+        .result_replay
         .iter()
         .find(|check| check.operation == id(operation) && check.requirement == requirement)
-        .unwrap_or_else(|| panic!("no response-replay check for `{operation}` #{requirement}"))
+        .unwrap_or_else(|| panic!("no result-replay check for `{operation}` #{requirement}"))
         .verdict
         .clone()
+}
+
+/// The single returning path of a proven result-replay verdict.
+fn single_return(verdict: &ResultReplayVerdict) -> &verification::ReturnedResult {
+    let ResultReplayVerdict::Proven {
+        proof: ResultReplayProof::ClassFixedResult { returns },
+    } = verdict
+    else {
+        panic!("expected a class-fixed result, found {verdict:?}");
+    };
+
+    assert_eq!(
+        returns.len(),
+        1,
+        "expected one returning path:\n{returns:#?}"
+    );
+
+    &returns[0]
+}
+
+/// The unavailable-artifact gap behind the first unstable root of an
+/// unproven result-replay verdict.
+fn unavailable_result_root(verdict: &ResultReplayVerdict) -> (&Vec<ReplayGap>, &Vec<ReplayGap>) {
+    let ResultReplayVerdict::Unproven { obstacles } = verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    let ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. } = &obstacles[0] else {
+        panic!("expected an unstable result root, found {:?}", obstacles[0]);
+    };
+
+    let StabilityGap::ArtifactUnavailable {
+        recovery,
+        reconstruction,
+        ..
+    } = &roots[0].gap
+    else {
+        panic!("expected an unavailable artifact, found {:?}", roots[0].gap);
+    };
+
+    (recovery, reconstruction)
 }
 
 fn create_order_transaction(model: &mut Model) -> &mut Transaction {
@@ -647,7 +788,7 @@ fn create_order_transaction(model: &mut Model) -> &mut Transaction {
 }
 
 /// Replaces create_order's transaction body with a naturally
-/// replayable shape: a key-derived write and a result establishment,
+/// replayable shape: a key-derived write and an output establishment,
 /// with no keyed commit.
 fn make_create_order_natural(model: &mut Model) {
     let transaction = create_order_transaction(model);
@@ -672,103 +813,123 @@ fn make_create_order_natural(model: &mut Model) {
                 input_key("input.create_order.request", &["amount"]),
             ]),
         }),
-        TransactionStep::EstablishInvocationResult(EstablishInvocationResult {
-            result: id("result.create_order"),
+        TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
+            output: id("output.create_order"),
             values: deterministic(vec![input_key("input.create_order.request", &["order_id"])]),
         }),
     ];
 
-    // The intent is no longer established, so the flow must not
+    // The intent is no longer established, so the program must not
     // execute it.
-    model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .flows
-        .get_mut(&id("flow.create_order.new"))
-        .unwrap()
-        .steps = vec![FlowStep::Transaction {
-        transaction: id("tx.create_order.new"),
-    }];
+    program_mut(model, "operation.create_order").steps.remove(1);
 }
 
 #[test]
-fn flash_checkout_response_replay_is_proven_by_recovery() {
+fn flash_checkout_result_replay_is_proven_by_recovery() {
     let model = load_flash_checkout();
 
     let report = verification::verify(&model);
 
-    // Only create_order declares `response: replay_consistent`.
-    assert_eq!(report.response_replay.len(), 1);
+    // Only create_order declares `result: replay_consistent`.
+    assert_eq!(report.result_replay.len(), 1);
 
-    let check = &report.response_replay[0];
+    let check = &report.result_replay[0];
 
     assert_eq!(check.operation, id("operation.create_order"));
     assert_eq!(check.requirement, 0);
+    assert!(!check.coinductive);
 
-    let ResponseReplayVerdict::Proven {
-        proof:
-            ResponseReplayProof::ClassFixedResult {
-                result,
-                transaction,
-                replay,
-                flows,
-            },
-    } = &check.verdict
-    else {
-        panic!("expected a class-fixed result, found {:?}", check.verdict);
-    };
+    let returned = single_return(&check.verdict);
 
-    assert_eq!(result, &id("result.create_order"));
-    assert_eq!(transaction, &id("tx.create_order.new"));
-    assert_eq!(flows, &vec![id("flow.create_order.new")]);
-
-    // Route B: the commit key is the governing key itself.
-    let ArtifactReplay::Recovered { key, .. } = replay else {
-        panic!("expected recovery, found {replay:?}");
-    };
+    // One path, no decisions, returning ok from the recovered output.
+    assert_eq!(returned.path, PathRef::default());
+    assert_eq!(returned.variant, ResultVariant::Ok);
+    assert!(returned.decisions.is_empty());
 
     assert_eq!(
-        key,
-        &vec![StableRoot {
+        returned.derivation,
+        vec![
+            StableRoot {
+                root: output_ref("output.create_order", &["order_id"]),
+                rule: StabilityRule::RecoveredArtifact {
+                    transaction: id("tx.create_order.new"),
+                },
+            },
+            StableRoot {
+                root: output_ref("output.create_order", &["status"]),
+                rule: StabilityRule::RecoveredArtifact {
+                    transaction: id("tx.create_order.new"),
+                },
+            },
+        ]
+    );
+
+    // Route B rests on the commit key being the governing key itself;
+    // the recoverability proof states that fact.
+    let verdict = recoverability_verdict(&model, "operation.create_order", 0);
+
+    let RecoverabilityVerdict::Proven {
+        proof: RecoverabilityProof::Resumable { paths },
+    } = &verdict
+    else {
+        panic!("expected create_order resumable, found {verdict:?}");
+    };
+
+    assert!(matches!(
+        &paths[0].transactions[..],
+        [TransactionResolution {
+            resolution: Resolution::KeyedCommit { key },
+            ..
+        }] if key == &vec![StableRoot {
             root: input_key("input.create_order.request", &["idempotency_key"]),
             rule: StabilityRule::KeyComponent,
         }]
-    );
+    ));
 }
 
 #[test]
-fn natural_reconstruction_proves_response_replay() {
+fn natural_reconstruction_proves_result_replay() {
     let mut model = load_flash_checkout();
 
     make_create_order_natural(&mut model);
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Proven {
-        proof: ResponseReplayProof::ClassFixedResult { replay, .. },
+    let returned = single_return(&verdict);
+
+    // Route A: the output is reconstructed by naturally replaying the
+    // transaction, every root of its derivation covered by the request
+    // identity pinned by the governing key.
+    assert!(
+        returned.derivation.iter().all(|root| root.rule
+            == StabilityRule::ReconstructedArtifact {
+                transaction: id("tx.create_order.new"),
+            }),
+        "{:#?}",
+        returned.derivation
+    );
+
+    let verdict = recoverability_verdict(&model, "operation.create_order", 0);
+
+    let RecoverabilityVerdict::Proven {
+        proof: RecoverabilityProof::Resumable { paths },
     } = &verdict
     else {
-        panic!("expected a class-fixed result, found {verdict:?}");
+        panic!("expected create_order resumable, found {verdict:?}");
     };
 
-    // Route A: every root is covered by the request identity pinned by
-    // the governing key.
-    let ArtifactReplay::Reconstructed { transaction, derivation } = replay else {
-        panic!("expected reconstruction, found {replay:?}");
-    };
-
-    assert_eq!(transaction, &id("tx.create_order.new"));
-
-    assert_eq!(
-        derivation,
-        &vec![StableRoot {
+    assert!(matches!(
+        &paths[0].artifacts[..],
+        [verification::ArtifactAvailability {
+            replay: ArtifactReplay::Reconstructed { derivation, .. },
+            ..
+        }] if derivation == &vec![StableRoot {
             root: input_key("input.create_order.request", &["order_id"]),
             rule: StabilityRule::IdentifiedPayload,
         }]
-    );
+    ));
 }
 
 #[test]
@@ -793,22 +954,9 @@ fn poison_retry_defeats_natural_reconstruction() {
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Unproven { obstacles } = &verdict else {
-        panic!("expected an unproven verdict, found {verdict:?}");
-    };
-
-    assert_eq!(obstacles.len(), 1);
-
-    let ResponseReplayObstacle::ResultNotReplayAvailable {
-        recovery,
-        reconstruction,
-        ..
-    } = &obstacles[0]
-    else {
-        panic!("expected an unavailable result, found {:?}", obstacles[0]);
-    };
+    let (recovery, reconstruction) = unavailable_result_root(&verdict);
 
     assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
 
@@ -846,20 +994,9 @@ fn unstable_commit_key_defeats_recovery() {
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Unproven { obstacles } = &verdict else {
-        panic!("expected an unproven verdict, found {verdict:?}");
-    };
-
-    let ResponseReplayObstacle::ResultNotReplayAvailable {
-        recovery,
-        reconstruction,
-        ..
-    } = &obstacles[0]
-    else {
-        panic!("expected an unavailable result, found {:?}", obstacles[0]);
-    };
+    let (recovery, reconstruction) = unavailable_result_root(&verdict);
 
     // The keyed commit exists, but its key is an unidentified non-key
     // field, so attempts may address different commits.
@@ -889,26 +1026,32 @@ fn identified_payload_stabilizes_commit_key() {
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Proven {
-        proof: ResponseReplayProof::ClassFixedResult { replay, .. },
+    assert!(matches!(
+        single_return(&verdict).derivation[0].rule,
+        StabilityRule::RecoveredArtifact { .. }
+    ));
+
+    let verdict = recoverability_verdict(&model, "operation.create_order", 0);
+
+    let RecoverabilityVerdict::Proven {
+        proof: RecoverabilityProof::Resumable { paths },
     } = &verdict
     else {
-        panic!("expected a class-fixed result, found {verdict:?}");
+        panic!("expected create_order resumable, found {verdict:?}");
     };
 
-    let ArtifactReplay::Recovered { key, .. } = replay else {
-        panic!("expected recovery, found {replay:?}");
-    };
-
-    assert_eq!(
-        key,
-        &vec![StableRoot {
+    assert!(matches!(
+        &paths[0].transactions[..],
+        [TransactionResolution {
+            resolution: Resolution::KeyedCommit { key },
+            ..
+        }] if key == &vec![StableRoot {
             root: input_key("input.create_order.request", &["amount"]),
             rule: StabilityRule::IdentifiedPayload,
         }]
-    );
+    ));
 }
 
 #[test]
@@ -922,9 +1065,9 @@ fn chained_artifact_recovery_is_class_fixed() {
         .get_mut(&id("operation.create_order"))
         .unwrap();
 
-    operation.invocation_results.insert(
-        id("result.create_order.receipt"),
-        InvocationResult {
+    operation.transaction_outputs.insert(
+        id("output.create_order.receipt"),
+        TransactionOutput {
             schema: id("schema.CreateOrderResponse"),
         },
     );
@@ -936,15 +1079,12 @@ fn chained_artifact_recovery_is_class_fixed() {
             isolation: TransactionIsolation::Unspecified,
             idempotency: IdempotencyGuarantee::DeduplicatedBy {
                 key: IdempotencyKey {
-                    components: vec![ValueRef {
-                        source: ValueSource::InvocationResult(id("result.create_order")),
-                        path: path(&["order_id"]),
-                    }],
+                    components: vec![output_ref("output.create_order", &["order_id"])],
                 },
             },
-            steps: vec![TransactionStep::EstablishInvocationResult(
-                EstablishInvocationResult {
-                    result: id("result.create_order.receipt"),
+            steps: vec![TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    output: id("output.create_order.receipt"),
                     values: deterministic(vec![input_key(
                         "input.create_order.request",
                         &["order_id"],
@@ -954,47 +1094,50 @@ fn chained_artifact_recovery_is_class_fixed() {
         },
     );
 
-    let flow = operation.flows.get_mut(&id("flow.create_order.new")).unwrap();
-
-    flow.steps.insert(
-        1,
-        FlowStep::Transaction {
-            transaction: id("tx.create_order.receipt"),
-        },
-    );
-
     operation
-        .responses
-        .get_mut(&id("response.create_order"))
-        .unwrap()
-        .source = ResponseSource::InvocationResult {
-        result: id("result.create_order.receipt"),
-    };
+        .program
+        .steps
+        .insert(1, run("tx.create_order.receipt"));
+
+    operation.program.steps[3] = return_ok(
+        "input.create_order.request",
+        deterministic(vec![output_ref(
+            "output.create_order.receipt",
+            &["order_id"],
+        )]),
+    );
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Proven {
-        proof:
-            ResponseReplayProof::ClassFixedResult {
-                result,
-                transaction,
-                replay,
-                ..
+    assert_eq!(
+        single_return(&verdict).derivation,
+        vec![StableRoot {
+            root: output_ref("output.create_order.receipt", &["order_id"]),
+            rule: StabilityRule::RecoveredArtifact {
+                transaction: id("tx.create_order.receipt"),
             },
-    } = &verdict
-    else {
-        panic!("expected a class-fixed result, found {verdict:?}");
-    };
-
-    assert_eq!(result, &id("result.create_order.receipt"));
-    assert_eq!(transaction, &id("tx.create_order.receipt"));
+        }]
+    );
 
     // The second commit key is stable because the first artifact is
     // recovered: stability chains through the artifact context.
-    let ArtifactReplay::Recovered { key, .. } = replay else {
-        panic!("expected recovery, found {replay:?}");
+    let verdict = recoverability_verdict(&model, "operation.create_order", 0);
+
+    let RecoverabilityVerdict::Proven {
+        proof: RecoverabilityProof::Resumable { paths },
+    } = &verdict
+    else {
+        panic!("expected create_order resumable, found {verdict:?}");
+    };
+
+    let TransactionResolution {
+        resolution: Resolution::KeyedCommit { key },
+        ..
+    } = &paths[0].transactions[1]
+    else {
+        panic!("expected the receipt commit resolved by key");
     };
 
     assert_eq!(key.len(), 1);
@@ -1008,7 +1151,7 @@ fn chained_artifact_recovery_is_class_fixed() {
 }
 
 #[test]
-fn subscription_key_without_response_is_vacuous() {
+fn subscription_key_without_a_return_is_vacuous() {
     let mut model = load_flash_checkout();
 
     model
@@ -1017,16 +1160,16 @@ fn subscription_key_without_response_is_vacuous() {
         .unwrap()
         .requirements
         .idempotency[0]
-        .response = ResponseReplayRequirement::ReplayConsistent;
+        .result = ResultReplayRequirement::ReplayConsistent;
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.reserve_inventory", 0);
+    let verdict = result_replay_verdict(&model, "operation.reserve_inventory", 0);
 
     assert_eq!(
         verdict,
-        ResponseReplayVerdict::Proven {
-            proof: ResponseReplayProof::NoResolvedResponse {
+        ResultReplayVerdict::Proven {
+            proof: ResultReplayProof::NoReturnedResult {
                 input: id("input.reserve_inventory.created"),
             },
         }
@@ -1051,12 +1194,12 @@ fn governing_key_mixing_sources_is_inadmissible() {
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
     assert_eq!(
         verdict,
-        ResponseReplayVerdict::Unproven {
-            obstacles: vec![ResponseReplayObstacle::GoverningKeyInadmissible {
+        ResultReplayVerdict::Unproven {
+            obstacles: vec![ResultReplayObstacle::GoverningKeyInadmissible {
                 defect: GoverningKeyDefect::ComponentNotFromInput {
                     source: ValueSource::StateMachineSubject(id("machine.order_lifecycle")),
                 },
@@ -1074,29 +1217,21 @@ fn read_dependent_result_is_not_reconstructible() {
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    operation.invocation_results.insert(
-        id("result.transfer_stock"),
-        InvocationResult {
+    operation.transaction_outputs.insert(
+        id("output.transfer_stock"),
+        TransactionOutput {
             schema: id("schema.TransferStockResponse"),
         },
     );
-
-    operation
-        .responses
-        .get_mut(&id("response.transfer_stock"))
-        .unwrap()
-        .source = ResponseSource::InvocationResult {
-        result: id("result.transfer_stock"),
-    };
 
     operation
         .transactions
         .get_mut(&id("tx.transfer_stock"))
         .unwrap()
         .steps
-        .push(TransactionStep::EstablishInvocationResult(
-            EstablishInvocationResult {
-                result: id("result.transfer_stock"),
+        .push(TransactionStep::EstablishTransactionOutput(
+            EstablishTransactionOutput {
+                output: id("output.transfer_stock"),
                 values: deterministic(vec![ValueRef {
                     source: ValueSource::TransactionRead(id("read.transfer_stock.source_stock")),
                     path: path(&["on_hand"]),
@@ -1104,30 +1239,24 @@ fn read_dependent_result_is_not_reconstructible() {
             },
         ));
 
+    operation.program.steps[1] = return_ok(
+        "input.transfer_stock.request",
+        deterministic(vec![output_ref("output.transfer_stock", &["accepted"])]),
+    );
+
     operation
         .requirements
         .idempotency
         .push(IdempotencyRequirement {
             key: ikey("input.transfer_stock.request", &[&["sku"]]),
-            response: ResponseReplayRequirement::ReplayConsistent,
+            result: ResultReplayRequirement::ReplayConsistent,
         });
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.transfer_stock", 0);
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
 
-    let ResponseReplayVerdict::Unproven { obstacles } = &verdict else {
-        panic!("expected an unproven verdict, found {verdict:?}");
-    };
-
-    let ResponseReplayObstacle::ResultNotReplayAvailable {
-        recovery,
-        reconstruction,
-        ..
-    } = &obstacles[0]
-    else {
-        panic!("expected an unavailable result, found {:?}", obstacles[0]);
-    };
+    let (recovery, reconstruction) = unavailable_result_root(&verdict);
 
     assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
 
@@ -1151,87 +1280,496 @@ fn read_dependent_result_is_not_reconstructible() {
 }
 
 #[test]
-fn result_never_established_is_an_obstacle() {
+fn output_never_established_is_conservatively_unproven() {
     let mut model = load_flash_checkout();
 
     create_order_transaction(&mut model)
         .steps
-        .retain(|step| !matches!(step, TransactionStep::EstablishInvocationResult(_)));
+        .retain(|step| !matches!(step, TransactionStep::EstablishTransactionOutput(_)));
+
+    // Validation rejects the shape; verification stays total and finds
+    // the output missing from the context at the terminal.
+    assert!(!validation::validate(&model).is_empty());
+
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    assert!(matches!(
+        &obstacles[..],
+        [ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. }]
+            if roots.iter().all(|root| matches!(
+                &root.gap,
+                StabilityGap::ArtifactNotInContext { artifact }
+                    if artifact == &id("output.create_order")
+            ))
+    ));
+}
+
+/// Wraps create_order's whole program in a branch on the request's
+/// `amount`, both arms running the same steps.
+fn branch_create_order_on_amount(model: &mut Model, condition: Condition) {
+    let program = program_mut(model, "operation.create_order");
+
+    let steps = std::mem::take(&mut program.steps);
+
+    program.steps = vec![OperationStep::Branch(Branch {
+        condition,
+        then: block(steps.clone()),
+        otherwise: Some(block(steps)),
+    })];
+}
+
+fn amount_is_large() -> Condition {
+    Condition::Eq {
+        value: input_key("input.create_order.request", &["amount"]),
+        equals: SelectorValue::Literal(Literal::Int(1000)),
+    }
+}
+
+#[test]
+fn a_branch_over_stable_roots_replays() {
+    let mut model = load_flash_checkout();
+
+    branch_create_order_on_amount(&mut model, amount_is_large());
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    // `amount` is covered by the request identity pinned by the key, so
+    // every attempt in a class takes the same arm: each path returns a
+    // class-fixed result, and no cross-path argument is needed.
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    assert_eq!(
-        verdict,
-        ResponseReplayVerdict::Unproven {
-            obstacles: vec![ResponseReplayObstacle::ResultNotEstablished {
-                flow: id("flow.create_order.new"),
-                response: id("response.create_order"),
-                result: id("result.create_order"),
-            }],
-        }
+    let ResultReplayVerdict::Proven {
+        proof: ResultReplayProof::ClassFixedResult { returns },
+    } = &verdict
+    else {
+        panic!("expected a class-fixed result, found {verdict:?}");
+    };
+
+    assert_eq!(returns.len(), 2);
+
+    for (returned, arm) in returns.iter().zip([Arm::Then, Arm::Otherwise]) {
+        assert!(matches!(
+            &returned.path.decisions[..],
+            [verification::DecisionTaken::Branch { arm: taken, .. }] if *taken == arm
+        ));
+
+        assert!(matches!(
+            &returned.decisions[..],
+            [verification::DecisionReplay {
+                rule: DecisionRule::StableCondition { roots },
+                ..
+            }] if roots == &vec![StableRoot {
+                root: input_key("input.create_order.request", &["amount"]),
+                rule: StabilityRule::IdentifiedPayload,
+            }]
+        ));
+    }
+}
+
+#[test]
+fn a_branch_over_unstable_roots_defeats_result_replay() {
+    let mut model = load_flash_checkout();
+
+    branch_create_order_on_amount(&mut model, amount_is_large());
+
+    // Without the boundary identity, same-key attempts may present
+    // different amounts and take different arms.
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.create_order.request"))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    request.identity = RequestIdentity::Unspecified;
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    // The same decision reached by both paths is one obstacle.
+    assert!(
+        matches!(
+            &obstacles[..],
+            [ResultReplayObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ConditionRootsUnstable { roots },
+                ..
+            }] if roots.len() == 1
+                && roots[0].root == input_key("input.create_order.request", &["amount"])
+                && matches!(roots[0].gap, StabilityGap::UnidentifiedPayloadField { .. })
+        ),
+        "{obstacles:#?}"
     );
 }
 
 #[test]
-fn divergent_flows_are_not_class_fixed() {
+fn an_unspecified_condition_never_replays() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap();
-
-    // A second flow establishing the same result through a different
-    // keyed transaction.
-    operation.transactions.insert(
-        id("tx.create_order.replayed"),
-        Transaction {
-            data_model: None,
-            isolation: TransactionIsolation::Unspecified,
-            idempotency: IdempotencyGuarantee::DeduplicatedBy {
-                key: ikey("input.create_order.request", &[&["idempotency_key"]]),
-            },
-            steps: vec![TransactionStep::EstablishInvocationResult(
-                EstablishInvocationResult {
-                    result: id("result.create_order"),
-                    values: deterministic(vec![input_key(
-                        "input.create_order.request",
-                        &["order_id"],
-                    )]),
-                },
-            )],
-        },
-    );
-
-    operation.flows.insert(
-        id("flow.create_order.replayed"),
-        InvocationFlow {
-            steps: vec![FlowStep::Transaction {
-                transaction: id("tx.create_order.replayed"),
-            }],
-            response: Some(id("response.create_order")),
-        },
-    );
+    branch_create_order_on_amount(&mut model, Condition::Unspecified);
 
     assert!(validation::validate(&model).is_empty());
 
-    let verdict = response_replay_verdict(&model, "operation.create_order", 0);
+    let verdict = result_replay_verdict(&model, "operation.create_order", 0);
 
-    let ResponseReplayVerdict::Unproven { obstacles } = &verdict else {
+    assert!(
+        matches!(
+            &verdict,
+            ResultReplayVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [ResultReplayObstacle::PathDecisionUnstable {
+                        gap: DecisionGap::ConditionUnspecified,
+                        ..
+                    }]
+                )
+        ),
+        "{verdict:?}"
+    );
+}
+
+/// Makes transfer_stock forward a request into create_order and return
+/// its result: ok from the created order, err from the rejection.
+fn forward_transfer_to_create_order(model: &mut Model) {
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    operation.effects.insert(
+        id("effect.transfer_stock.forward"),
+        request_effect(
+            "operation.create_order",
+            "input.create_order.request",
+            "schema.CreateOrderRequest",
+        ),
+    );
+
+    operation.program.steps = vec![
+        execute(
+            "effect.transfer_stock.forward",
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            Some("result.transfer_stock.forward"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.transfer_stock.forward"),
+            ok: block(vec![return_ok(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultOk(id("result.transfer_stock.forward")),
+                    path: path(&["order_id"]),
+                }]),
+            )]),
+            err: block(vec![return_err(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultErr(id("result.transfer_stock.forward")),
+                    path: path(&["reason"]),
+                }]),
+            )]),
+        }),
+    ];
+
+    operation
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+}
+
+#[test]
+fn a_match_on_a_consistent_request_result_replays() {
+    let mut model = load_flash_checkout();
+
+    forward_transfer_to_create_order(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // create_order proves its result replay-consistent for payload-equal
+    // requests, so the class-fixed request observes one result: the
+    // match replays, and each arm returns a payload derived from it.
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Proven {
+        proof: ResultReplayProof::ClassFixedResult { returns },
+    } = &verdict
+    else {
+        panic!("expected a class-fixed result, found {verdict:?}");
+    };
+
+    assert_eq!(returns.len(), 2);
+    assert_eq!(returns[0].variant, ResultVariant::Ok);
+    assert_eq!(returns[1].variant, ResultVariant::Err);
+
+    for returned in returns {
+        assert!(matches!(
+            &returned.decisions[..],
+            [verification::DecisionReplay {
+                rule: DecisionRule::StableResult {
+                    rule: verification::ResultStabilityRule::ReplayConsistentTarget {
+                        operation, input, requirement: 0, ..
+                    },
+                    ..
+                },
+                ..
+            }] if operation == &id("operation.create_order")
+                && input == &id("input.create_order.request")
+        ));
+
+        assert!(matches!(
+            &returned.derivation[..],
+            [StableRoot {
+                rule: StabilityRule::ReplayConsistentResult { result, effect },
+                ..
+            }] if result == &id("result.transfer_stock.forward")
+                && effect == &id("effect.transfer_stock.forward")
+        ));
+    }
+
+    // Without the target's declaration, nothing says the request
+    // observes one result.
+    model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .requirements
+        .idempotency[0]
+        .result = ResultReplayRequirement::Unspecified;
+
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
         panic!("expected an unproven verdict, found {verdict:?}");
     };
 
-    assert_eq!(obstacles.len(), 1);
+    // The decision and both returned payloads rest on the same result.
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::TargetResultNotDeclared { operation, .. },
+                    ..
+                },
+                ..
+            } if operation == &id("operation.create_order")
+        )),
+        "{obstacles:#?}"
+    );
 
-    let ResponseReplayObstacle::DivergentResponseSites { sites } = &obstacles[0] else {
-        panic!("expected divergent sites, found {:?}", obstacles[0]);
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        ResultReplayObstacle::ResultDerivationRootUnstable { .. }
+    )));
+}
+
+#[test]
+fn a_request_result_is_only_as_stable_as_its_request() {
+    let mut model = load_flash_checkout();
+
+    forward_transfer_to_create_order(&mut model);
+
+    // The forwarded request now depends on an unidentified field of the
+    // transfer request, so the target may be asked different questions.
+    let OperationStep::ExecuteEffect(forward) =
+        &mut program_mut(&mut model, "operation.transfer_stock").steps[0]
+    else {
+        panic!("expected the forwarded request");
     };
 
-    assert_eq!(sites.len(), 2);
-    assert_eq!(sites[0].transaction, id("tx.create_order.new"));
-    assert_eq!(sites[1].transaction, id("tx.create_order.replayed"));
+    forward.values = deterministic(vec![input_key(
+        "input.transfer_stock.request",
+        &["quantity"],
+    )]);
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            ResultReplayVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    ResultReplayObstacle::PathDecisionUnstable {
+                        gap: DecisionGap::ResultUnstable {
+                            gap: ResultGap::InstanceNotClassFixed {
+                                gap: verification::InstanceGap::RootsUnstable { .. },
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn cyclic_result_dependencies_prove_coinductively() {
+    let mut model = load_flash_checkout();
+
+    // transfer_stock and cancel_order each return the other's result.
+    let transfer = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    transfer.effects.insert(
+        id("effect.transfer_stock.cancel"),
+        request_effect(
+            "operation.cancel_order",
+            "input.cancel_order.request",
+            "schema.CancelOrderRequest",
+        ),
+    );
+
+    transfer.program.steps = vec![
+        execute(
+            "effect.transfer_stock.cancel",
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            Some("result.transfer_stock.cancel"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.transfer_stock.cancel"),
+            ok: block(vec![return_ok(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultOk(id("result.transfer_stock.cancel")),
+                    path: path(&["order_id"]),
+                }]),
+            )]),
+            err: block(vec![return_err(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultErr(id("result.transfer_stock.cancel")),
+                    path: path(&["reason"]),
+                }]),
+            )]),
+        }),
+    ];
+
+    transfer
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+
+    let cancel = model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap();
+
+    cancel.effects.insert(
+        id("effect.cancel_order.transfer"),
+        request_effect(
+            "operation.transfer_stock",
+            "input.transfer_stock.request",
+            "schema.TransferStockRequest",
+        ),
+    );
+
+    cancel.program.steps = vec![
+        execute(
+            "effect.cancel_order.transfer",
+            deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
+            Some("result.cancel_order.transfer"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.cancel_order.transfer"),
+            ok: block(vec![return_ok(
+                "input.cancel_order.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultOk(id("result.cancel_order.transfer")),
+                    path: path(&["accepted"]),
+                }]),
+            )]),
+            err: block(vec![return_err(
+                "input.cancel_order.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultErr(id("result.cancel_order.transfer")),
+                    path: path(&["reason"]),
+                }]),
+            )]),
+        }),
+    ];
+
+    cancel
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.cancel_order.request", &[&["order_id"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let report = verification::verify(&model);
+
+    for operation in ["operation.transfer_stock", "operation.cancel_order"] {
+        let check = report
+            .result_replay
+            .iter()
+            .find(|check| check.operation == id(operation))
+            .unwrap();
+
+        assert!(
+            matches!(check.verdict, ResultReplayVerdict::Proven { .. }),
+            "expected `{operation}` proven, found {:?}",
+            check.verdict
+        );
+
+        assert!(
+            check.coinductive,
+            "`{operation}` should be marked coinductive"
+        );
+    }
+
+    // A member failing locally fails the cycle with it.
+    let OperationStep::ExecuteEffect(forward) =
+        &mut program_mut(&mut model, "operation.cancel_order").steps[0]
+    else {
+        panic!("expected the forwarded request");
+    };
+
+    forward.values = Derivation::Unspecified;
+
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            ResultReplayVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    ResultReplayObstacle::PathDecisionUnstable {
+                        gap: DecisionGap::ResultUnstable {
+                            gap: ResultGap::TargetResultUnproven { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+        ),
+        "{verdict:?}"
+    );
 }
 
 fn recoverability_verdict(
@@ -1261,32 +1799,32 @@ fn flash_checkout_recoverability_verdicts() {
     assert_eq!(report.recoverability.len(), 3);
 
     // create_order resumes through its keyed commit; the intent and
-    // result are recovered, and the response resolves the result.
+    // output are recovered, and the return derives from the output.
     let verdict = recoverability_verdict(&model, "operation.create_order", 0);
 
     let RecoverabilityVerdict::Proven {
-        proof: RecoverabilityProof::Resumable { flows },
+        proof: RecoverabilityProof::Resumable { paths },
     } = &verdict
     else {
         panic!("expected create_order resumable, found {verdict:?}");
     };
 
-    assert_eq!(flows.len(), 1);
-    assert_eq!(flows[0].flow, id("flow.create_order.new"));
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].path, PathRef::default());
 
     assert!(matches!(
-        &flows[0].transactions[..],
+        &paths[0].transactions[..],
         [TransactionResolution {
             resolution: Resolution::KeyedCommit { .. },
             ..
         }]
     ));
 
-    // The consumed intent and the response's result, both recovered.
-    assert_eq!(flows[0].artifacts.len(), 2);
+    // The consumed intent and the returned output, both recovered.
+    assert_eq!(paths[0].artifacts.len(), 2);
 
     assert!(
-        flows[0]
+        paths[0]
             .artifacts
             .iter()
             .all(|artifact| matches!(artifact.replay, ArtifactReplay::Recovered { .. }))
@@ -1329,19 +1867,23 @@ fn flash_checkout_recoverability_verdicts() {
         ..
     } = &obstacles[0]
     else {
-        panic!("expected an unresolvable transaction, found {:?}", obstacles[0]);
+        panic!(
+            "expected an unresolvable transaction, found {:?}",
+            obstacles[0]
+        );
     };
 
     assert_eq!(transaction, &id("tx.reserve_inventory"));
     assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
 
     assert!(
-        reconstruction
-            .iter()
-            .any(|gap| matches!(gap, ReplayGap::MutationDerivationRootUnstable {
+        reconstruction.iter().any(|gap| matches!(
+            gap,
+            ReplayGap::MutationDerivationRootUnstable {
                 gap: StabilityGap::TransactionReadRoot { .. },
                 ..
-            })),
+            }
+        )),
         "expected the read-dependent write gap:\n{reconstruction:#?}"
     );
 
@@ -1353,7 +1895,7 @@ fn flash_checkout_recoverability_verdicts() {
 }
 
 #[test]
-fn final_transaction_of_a_response_less_flow_needs_no_replay_route() {
+fn final_transaction_before_completion_needs_no_replay_route() {
     let mut model = load_flash_checkout();
 
     let operation = model
@@ -1362,12 +1904,8 @@ fn final_transaction_of_a_response_less_flow_needs_no_replay_route() {
         .unwrap();
 
     // The transaction is unreplayable in every way, but nothing
-    // follows it once the response is removed.
-    operation
-        .flows
-        .get_mut(&id("flow.transfer_stock"))
-        .unwrap()
-        .response = None;
+    // follows it once the program completes instead of returning.
+    operation.program.steps[1] = OperationStep::Complete;
 
     operation
         .requirements
@@ -1382,14 +1920,14 @@ fn final_transaction_of_a_response_less_flow_needs_no_replay_route() {
     let verdict = recoverability_verdict(&model, "operation.transfer_stock", 0);
 
     let RecoverabilityVerdict::Proven {
-        proof: RecoverabilityProof::Resumable { flows },
+        proof: RecoverabilityProof::Resumable { paths },
     } = &verdict
     else {
         panic!("expected resumable, found {verdict:?}");
     };
 
     assert_eq!(
-        flows[0].transactions,
+        paths[0].transactions,
         vec![TransactionResolution {
             transaction: id("tx.transfer_stock"),
             resolution: Resolution::TerminalStep,
@@ -1398,10 +1936,10 @@ fn final_transaction_of_a_response_less_flow_needs_no_replay_route() {
 }
 
 #[test]
-fn response_after_the_final_transaction_requires_resolution() {
+fn a_return_after_the_final_transaction_requires_resolution() {
     let mut model = load_flash_checkout();
 
-    // Same flow, but the declared response follows the transaction,
+    // Same program, but the result is returned after the transaction,
     // so a failing prefix exists after its commit.
     model
         .operations
@@ -1524,14 +2062,16 @@ fn inbound_repeatable_request_supplies_the_driver() {
 }
 
 #[test]
-fn executed_intent_must_be_established_by_the_flow() {
+fn an_unestablished_intent_is_conservatively_unproven() {
     let mut model = load_flash_checkout();
 
     create_order_transaction(&mut model)
         .steps
         .retain(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)));
 
-    assert!(validation::validate(&model).is_empty());
+    // Validation now rejects an intent executed where no path
+    // establishes it; verification stays total on the shape.
+    assert!(!validation::validate(&model).is_empty());
 
     let verdict = recoverability_verdict(&model, "operation.create_order", 0);
 
@@ -1542,7 +2082,7 @@ fn executed_intent_must_be_established_by_the_flow() {
     assert_eq!(
         obstacles,
         &vec![RecoverabilityObstacle::ArtifactNotEstablished {
-            flow: id("flow.create_order.new"),
+            path: PathRef::default(),
             artifact: id("intent.create_order.publish_created"),
             consumer: id("intent.create_order.publish_created"),
         }]
@@ -1587,8 +2127,85 @@ fn unavailable_consumed_artifacts_block_resumption() {
     assert!(obstacles.iter().any(|obstacle| matches!(
         obstacle,
         RecoverabilityObstacle::ArtifactNotReplayAvailable { artifact, .. }
-            if artifact == &id("result.create_order")
+            if artifact == &id("output.create_order")
     )));
+}
+
+#[test]
+fn a_diverging_decision_does_not_block_progress() {
+    let mut model = load_flash_checkout();
+
+    branch_create_order_on_amount(&mut model, amount_is_large());
+
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.create_order.request"))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    request.identity = RequestIdentity::Unspecified;
+
+    assert!(validation::validate(&model).is_empty());
+
+    // A retry may take the other arm, but whichever path it follows
+    // resumes: progress holds per path, and the difference in work is
+    // idempotency's concern.
+    let verdict = recoverability_verdict(&model, "operation.create_order", 0);
+
+    let RecoverabilityVerdict::Proven {
+        proof: RecoverabilityProof::Resumable { paths },
+    } = &verdict
+    else {
+        panic!("expected create_order resumable, found {verdict:?}");
+    };
+
+    assert_eq!(paths.len(), 2);
+
+    assert!(matches!(
+        result_replay_verdict(&model, "operation.create_order", 0),
+        ResultReplayVerdict::Unproven { .. }
+    ));
+}
+
+#[test]
+fn an_unterminated_path_cannot_reach_a_terminal() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    operation.program.steps.pop();
+
+    operation
+        .requirements
+        .recoverability
+        .push(RecoverabilityRequirement {
+            key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            completion: CompletionRequirement::Resumable,
+        });
+
+    // Validation rejects the fall-through; verification records it.
+    assert!(!validation::validate(&model).is_empty());
+
+    let verdict = recoverability_verdict(&model, "operation.transfer_stock", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            RecoverabilityVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    RecoverabilityObstacle::PathNotTerminated { .. }
+                ))
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -1647,9 +2264,7 @@ fn recoverability_key_mixing_sources_is_inadmissible() {
     );
 }
 
-fn order_events_message_identity(
-    model: &mut Model,
-) -> &mut BTreeMap<Id, Vec<FieldPath>> {
+fn order_events_message_identity(model: &mut Model) -> &mut BTreeMap<Id, Vec<FieldPath>> {
     let topic = model.topics.get_mut(&id("topic.order_events")).unwrap();
 
     let MessageIdentity::Keyed { mapping } = &mut topic.message_identity else {
@@ -1713,20 +2328,37 @@ fn flash_checkout_idempotency_verdicts() {
     ));
 
     // charge_payment: the capture publication is safe, but the card
-    // charge is explicitly not deduplicated — the model admits
-    // charging the card twice, and that is the only obstacle.
+    // charge is explicitly not deduplicated — the model admits charging
+    // the card twice — and the branch on the provider's result is not
+    // established to replay, so the decline publication, which reads
+    // that result, is not class-fixed either. Each fact is reported
+    // once, however many paths run through its step.
     let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
 
     let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
         panic!("expected charge_payment unproven, found {verdict:?}");
     };
 
-    assert_eq!(
-        obstacles,
-        &vec![IdempotencyObstacle::ExternalEffectNotDeduplicated {
-            flow: id("flow.charge_payment"),
-            effect: id("effect.charge_payment.card"),
-        }]
+    assert!(
+        matches!(
+            &obstacles[..],
+            [
+                IdempotencyObstacle::ExternalEffectNotDeduplicated { effect, .. },
+                IdempotencyObstacle::PathDecisionUnstable {
+                    decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
+                    gap: DecisionGap::ResultUnstable {
+                        gap: ResultGap::ExternalResultUndeclared,
+                        ..
+                    },
+                    ..
+                },
+                IdempotencyObstacle::EffectInstanceRootUnstable { effect: failed, roots, .. },
+            ] if effect == &id("effect.charge_payment.card")
+                && result == &id("result.charge_payment.card")
+                && failed == &id("effect.charge_payment.publish_failed")
+                && matches!(roots[0].gap, StabilityGap::ResultUnstable { .. })
+        ),
+        "{obstacles:#?}"
     );
 
     // reserve_inventory: the reservation transaction is retry-unsafe
@@ -1780,17 +2412,43 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 
     assert!(validation::validate(&model).is_empty());
 
+    // The boundary now collapses duplicate charges, but nothing says a
+    // repeated charge returns the same result, so the branch on it
+    // remains the obstacle.
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            IdempotencyVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [
+                        IdempotencyObstacle::PathDecisionUnstable { .. },
+                        IdempotencyObstacle::EffectInstanceRootUnstable { .. },
+                    ]
+                )
+        ),
+        "{verdict:?}"
+    );
+
+    // Without the branch, the declared deduplication completes the
+    // proof.
+    linearize_charge_payment(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
     let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
 
     let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
+        proof: IdempotencyProof::RetrySafePaths { paths },
     } = &verdict
     else {
         panic!("expected charge_payment proven, found {verdict:?}");
     };
 
     assert!(matches!(
-        &flows[0].effects[0],
+        &paths[0].effects[0],
         EffectRetrySafety {
             safety: EffectSafety::ExternallyDeduplicated { key },
             ..
@@ -1830,8 +2488,8 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
     };
 
     assert!(matches!(
-        &obstacles[..],
-        [IdempotencyObstacle::ExternalDeduplicationKeyUnstable { roots, .. }]
+        &obstacles[0],
+        IdempotencyObstacle::ExternalDeduplicationKeyUnstable { roots, .. }
             if matches!(roots[0].gap, StabilityGap::MutableSubjectState { .. })
     ));
 }
@@ -1921,18 +2579,21 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
         }),
     );
 
-    operation.flows.get_mut(&id("flow.transfer_stock")).unwrap().steps =
-        vec![FlowStep::ExecuteEffect {
-            effect: id("effect.transfer_stock.forward"),
-            values: deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
-        }];
+    operation.program.steps = vec![
+        execute(
+            "effect.transfer_stock.forward",
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            None,
+        ),
+        return_ok("input.transfer_stock.request", Derivation::Unspecified),
+    ];
 
     operation
         .requirements
         .idempotency
         .push(IdempotencyRequirement {
             key: ikey("input.transfer_stock.request", &[&["sku"]]),
-            response: ResponseReplayRequirement::Unspecified,
+            result: ResultReplayRequirement::Unspecified,
         });
 
     assert!(validation::validate(&model).is_empty());
@@ -1940,14 +2601,14 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
     let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
 
     let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
+        proof: IdempotencyProof::RetrySafePaths { paths },
     } = &verdict
     else {
         panic!("expected transfer_stock proven, found {verdict:?}");
     };
 
     assert!(matches!(
-        &flows[0].effects[..],
+        &paths[0].effects[..],
         [EffectRetrySafety {
             safety: EffectSafety::DeduplicatedByTarget { operation, input, .. },
             ..
@@ -2003,18 +2664,21 @@ fn cyclic_request_dependencies_prove_coinductively() {
         }),
     );
 
-    transfer.flows.get_mut(&id("flow.transfer_stock")).unwrap().steps =
-        vec![FlowStep::ExecuteEffect {
-            effect: id("effect.transfer_stock.cancel"),
-            values: deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
-        }];
+    transfer.program.steps = vec![
+        execute(
+            "effect.transfer_stock.cancel",
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            None,
+        ),
+        return_ok("input.transfer_stock.request", Derivation::Unspecified),
+    ];
 
     transfer
         .requirements
         .idempotency
         .push(IdempotencyRequirement {
             key: ikey("input.transfer_stock.request", &[&["sku"]]),
-            response: ResponseReplayRequirement::Unspecified,
+            result: ResultReplayRequirement::Unspecified,
         });
 
     let cancel = model
@@ -2035,18 +2699,21 @@ fn cyclic_request_dependencies_prove_coinductively() {
         }),
     );
 
-    cancel.flows.get_mut(&id("flow.cancel_order")).unwrap().steps =
-        vec![FlowStep::ExecuteEffect {
-            effect: id("effect.cancel_order.transfer"),
-            values: deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
-        }];
+    cancel.program.steps = vec![
+        execute(
+            "effect.cancel_order.transfer",
+            deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
+            None,
+        ),
+        return_ok("input.cancel_order.request", Derivation::Unspecified),
+    ];
 
     cancel
         .requirements
         .idempotency
         .push(IdempotencyRequirement {
             key: ikey("input.cancel_order.request", &[&["order_id"]]),
-            response: ResponseReplayRequirement::Unspecified,
+            result: ResultReplayRequirement::Unspecified,
         });
 
     assert!(validation::validate(&model).is_empty());
@@ -2066,23 +2733,20 @@ fn cyclic_request_dependencies_prove_coinductively() {
             check.verdict
         );
 
-        assert!(check.coinductive, "`{operation}` should be marked coinductive");
+        assert!(
+            check.coinductive,
+            "`{operation}` should be marked coinductive"
+        );
     }
 
     // A member failing locally fails the cycle with it: with an
     // unspecified instance, cancel_order's request leg is unsafe, and
     // transfer_stock's target is no longer proven.
-    model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap()
-        .flows
-        .get_mut(&id("flow.cancel_order"))
-        .unwrap()
-        .steps = vec![FlowStep::ExecuteEffect {
-        effect: id("effect.cancel_order.transfer"),
-        values: archspec::spec::Derivation::Unspecified,
-    }];
+    program_mut(&mut model, "operation.cancel_order").steps[0] = execute(
+        "effect.cancel_order.transfer",
+        Derivation::Unspecified,
+        None,
+    );
 
     let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
 
@@ -2118,19 +2782,21 @@ fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
         key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
     };
 
+    linearize_charge_payment(&mut model);
+
     assert!(validation::validate(&model).is_empty());
 
     let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
 
     let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
+        proof: IdempotencyProof::RetrySafePaths { paths },
     } = &verdict
     else {
         panic!("expected charge_payment proven, found {verdict:?}");
     };
 
     assert!(matches!(
-        &flows[0].effects[..],
+        &paths[0].effects[..],
         [
             EffectRetrySafety {
                 safety: EffectSafety::ExternallyDeduplicated { .. },
@@ -2210,14 +2876,14 @@ fn at_most_once_consumers_collapse_duplicates_by_delivery() {
     let verdict = idempotency_verdict(&model, "operation.create_order", 0);
 
     let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
+        proof: IdempotencyProof::RetrySafePaths { paths },
     } = &verdict
     else {
         panic!("expected create_order proven, found {verdict:?}");
     };
 
     assert!(matches!(
-        &flows[0].effects[..],
+        &paths[0].effects[..],
         [EffectRetrySafety {
             safety: EffectSafety::SameLogicalMessage { consumers, .. },
             ..
@@ -2257,16 +2923,19 @@ fn cyclic_publication_dependencies_prove_coinductively() {
         .unwrap();
 
     let IdempotencyVerdict::Proven {
-        proof: IdempotencyProof::RetrySafeFlows { flows },
+        proof: IdempotencyProof::RetrySafePaths { paths },
     } = &check.verdict
     else {
         panic!("expected apply_payment proven, found {:?}", check.verdict);
     };
 
-    assert!(check.coinductive, "the self-consuming proof should be marked coinductive");
+    assert!(
+        check.coinductive,
+        "the self-consuming proof should be marked coinductive"
+    );
 
     assert!(
-        flows[0].effects.iter().any(|effect| matches!(
+        paths[0].effects.iter().any(|effect| matches!(
             &effect.safety,
             EffectSafety::SameLogicalMessage { consumers, .. }
                 if consumers.iter().any(|consumer| matches!(
@@ -2275,7 +2944,7 @@ fn cyclic_publication_dependencies_prove_coinductively() {
                         if operation == &id("operation.apply_payment")
                 ))
         )),
-        "the proof should cite apply_payment as its own collapsing consumer:\n{flows:#?}"
+        "the proof should cite apply_payment as its own collapsing consumer:\n{paths:#?}"
     );
 }
 
@@ -2319,7 +2988,10 @@ fn guaranteed_completion_without_keyed_idempotency_is_noted() {
 
     let check = apply_payment(&model);
 
-    assert!(matches!(check.verdict, RecoverabilityVerdict::Proven { .. }));
+    assert!(matches!(
+        check.verdict,
+        RecoverabilityVerdict::Proven { .. }
+    ));
 
     assert_eq!(
         check.notes,
@@ -2344,22 +3016,34 @@ fn guaranteed_completion_without_keyed_idempotency_is_noted() {
 }
 
 #[test]
-fn no_admitted_flow_is_vacuously_idempotent() {
+fn no_admitted_path_is_vacuously_idempotent() {
     let mut model = load_flash_checkout();
 
+    // A second request input whose result the program never returns:
+    // no path is admitted for it, so its attempts do no modeled work.
     let operation = model
         .operations
         .get_mut(&id("operation.cancel_order"))
         .unwrap();
 
-    operation.flows.clear();
+    operation.inputs.insert(
+        id("input.cancel_order.admin"),
+        Input::Request(RequestInput {
+            schema: id("schema.CancelOrderRequest"),
+            identity: RequestIdentity::Unspecified,
+            result: ResultType {
+                ok: id("schema.CancelOrderResponse"),
+                err: id("schema.RequestRejected"),
+            },
+        }),
+    );
 
     operation
         .requirements
         .idempotency
         .push(IdempotencyRequirement {
-            key: ikey("input.cancel_order.request", &[&["order_id"]]),
-            response: ResponseReplayRequirement::Unspecified,
+            key: ikey("input.cancel_order.admin", &[&["order_id"]]),
+            result: ResultReplayRequirement::Unspecified,
         });
 
     assert!(validation::validate(&model).is_empty());
@@ -2369,18 +3053,159 @@ fn no_admitted_flow_is_vacuously_idempotent() {
     assert_eq!(
         verdict,
         IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::NoAdmittedFlows {
-                input: id("input.cancel_order.request"),
+            proof: IdempotencyProof::NoAdmittedPaths {
+                input: id("input.cancel_order.admin"),
             },
         }
     );
+
+    // Recoverability treats the same shape as an obstacle: progress is
+    // impossible where safety is trivial.
+    model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap()
+        .requirements
+        .recoverability
+        .push(RecoverabilityRequirement {
+            key: ikey("input.cancel_order.admin", &[&["order_id"]]),
+            completion: CompletionRequirement::Resumable,
+        });
+
+    assert_eq!(
+        recoverability_verdict(&model, "operation.cancel_order", 0),
+        RecoverabilityVerdict::Unproven {
+            obstacles: vec![RecoverabilityObstacle::NoAdmittedPath {
+                input: id("input.cancel_order.admin"),
+            }],
+        }
+    );
+}
+
+#[test]
+fn an_unstable_branch_decision_defeats_idempotency() {
+    let mut model = load_flash_checkout();
+
+    // apply_payment branches on the captured amount, both arms doing
+    // the same work. The topic identity pins `amount`, so the decision
+    // replays and the proof records it.
+    let program = program_mut(&mut model, "operation.apply_payment");
+
+    let steps = std::mem::take(&mut program.steps);
+
+    program.steps = vec![OperationStep::Branch(Branch {
+        condition: Condition::Eq {
+            value: input_key("input.apply_payment.captured", &["amount"]),
+            equals: SelectorValue::Literal(Literal::Int(0)),
+        },
+        then: block(steps.clone()),
+        otherwise: Some(block(steps)),
+    })];
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+    } = &verdict
+    else {
+        panic!("expected apply_payment proven, found {verdict:?}");
+    };
+
+    assert_eq!(paths.len(), 2);
+
+    assert!(matches!(
+        &paths[0].decisions[..],
+        [verification::DecisionReplay {
+            rule: DecisionRule::StableCondition { roots },
+            ..
+        }] if matches!(roots[0].rule, StabilityRule::IdentifiedPayload)
+    ));
+
+    // Without the identity, same-key deliveries may carry different
+    // amounts and a retry may take the other arm.
+    order_events_message_identity(&mut model).remove(&id("schema.PaymentCaptured"));
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    assert!(
+        matches!(
+            &verdict,
+            IdempotencyVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [IdempotencyObstacle::PathDecisionUnstable {
+                        gap: DecisionGap::ConditionRootsUnstable { .. },
+                        ..
+                    }]
+                )
+        ),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_match_on_a_consistent_request_result_is_idempotent() {
+    let mut model = load_flash_checkout();
+
+    // create_order's own requirement proves only when its cascade
+    // collapses.
+    subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    )
+    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+
+    forward_transfer_to_create_order(&mut model);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // The request is collapsed by create_order's proven requirement,
+    // and the match on its result replays because create_order proves
+    // its result replay-consistent.
+    let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+    } = &verdict
+    else {
+        panic!("expected transfer_stock proven, found {verdict:?}");
+    };
+
+    assert_eq!(paths.len(), 2);
+
+    for path in paths {
+        assert!(matches!(
+            &path.effects[..],
+            [EffectRetrySafety {
+                safety: EffectSafety::DeduplicatedByTarget { .. },
+                ..
+            }]
+        ));
+
+        assert!(matches!(
+            &path.decisions[..],
+            [verification::DecisionReplay {
+                rule: DecisionRule::StableResult { .. },
+                ..
+            }]
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Ordering
 // ---------------------------------------------------------------------------
 
-fn ordering_verdict(model: &Model, operation: &str, requirement: usize) -> verification::OrderingVerdict {
+fn ordering_verdict(
+    model: &Model,
+    operation: &str,
+    requirement: usize,
+) -> verification::OrderingVerdict {
     verification::verify(model)
         .ordering
         .into_iter()
@@ -2466,8 +3291,12 @@ fn flash_checkout_ordering_verdicts() {
 fn at_most_once_delivery_records_single_delivery() {
     let mut model = load_flash_checkout();
 
-    subscription_mut(&mut model, "operation.reserve_inventory", "input.reserve_inventory.created")
-        .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    subscription_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "input.reserve_inventory.created",
+    )
+    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
 
     let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
 
@@ -2503,11 +3332,14 @@ fn request_inputs_have_no_precedence_source() {
 
     let verdict = ordering_verdict(&model, "operation.create_order", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Unproven { obstacles }
-            if matches!(&obstacles[..], [verification::OrderingObstacle::RequestInputHasNoPrecedenceSource { .. }])
-    ), "{verdict:?}");
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(&obstacles[..], [verification::OrderingObstacle::RequestInputHasNoPrecedenceSource { .. }])
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -2524,32 +3356,42 @@ fn ordering_key_not_carrying_the_topic_key_inherits_no_precedence() {
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Unproven { obstacles }
-            if matches!(
-                &obstacles[..],
-                [verification::OrderingObstacle::KeyIdentityUnestablished { schema, .. }]
-                    if schema == &id("schema.PaymentCaptured")
-            )
-    ), "{verdict:?}");
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(
+                    &obstacles[..],
+                    [verification::OrderingObstacle::KeyIdentityUnestablished { schema, .. }]
+                        if schema == &id("schema.PaymentCaptured")
+                )
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[test]
 fn lane_concurrency_above_one_admits_overtaking() {
     let mut model = load_flash_checkout();
 
-    subscription_mut(&mut model, "operation.apply_payment", "input.apply_payment.captured")
-        .dispatch
-        .lane_concurrency = LaneConcurrency::Unbounded;
+    subscription_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .dispatch
+    .lane_concurrency = LaneConcurrency::Unbounded;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Unproven { obstacles }
-            if matches!(&obstacles[..], [verification::OrderingObstacle::LaneConcurrencyNotSerial { .. }])
-    ), "{verdict:?}");
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(&obstacles[..], [verification::OrderingObstacle::LaneConcurrencyNotSerial { .. }])
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -2565,28 +3407,38 @@ fn a_global_topic_orders_any_key_through_a_single_lane() {
     // by_topic_key has no key domain to route by on a global topic.
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Unproven { obstacles }
-            if matches!(&obstacles[..], [verification::OrderingObstacle::ByTopicKeyWithoutKeyDomain { .. }])
-    ), "{verdict:?}");
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if matches!(&obstacles[..], [verification::OrderingObstacle::ByTopicKeyWithoutKeyDomain { .. }])
+        ),
+        "{verdict:?}"
+    );
 
-    subscription_mut(&mut model, "operation.apply_payment", "input.apply_payment.captured")
-        .dispatch
-        .routing = archspec::spec::DispatchRouting::SingleLane;
+    subscription_mut(
+        &mut model,
+        "operation.apply_payment",
+        "input.apply_payment.captured",
+    )
+    .dispatch
+    .routing = archspec::spec::DispatchRouting::SingleLane;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Proven {
-            proof: verification::OrderingProof::LaneOrder {
-                precedence: verification::PrecedenceSource::GlobalTopic,
-                lane: verification::LaneFact::SingleLane,
-                ..
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Proven {
+                proof: verification::OrderingProof::LaneOrder {
+                    precedence: verification::PrecedenceSource::GlobalTopic,
+                    lane: verification::LaneFact::SingleLane,
+                    ..
+                }
             }
-        }
-    ), "{verdict:?}");
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -2601,17 +3453,20 @@ fn an_unordered_topic_provides_no_precedence() {
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
-    assert!(matches!(
-        &verdict,
-        verification::OrderingVerdict::Unproven { obstacles }
-            if obstacles.iter().any(|obstacle| matches!(
-                obstacle,
-                verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
-                    declared: archspec::spec::TopicOrdering::Unordered,
-                    ..
-                }
-            ))
-    ), "{verdict:?}");
+    assert!(
+        matches!(
+            &verdict,
+            verification::OrderingVerdict::Unproven { obstacles }
+                if obstacles.iter().any(|obstacle| matches!(
+                    obstacle,
+                    verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
+                        declared: archspec::spec::TopicOrdering::Unordered,
+                        ..
+                    }
+                ))
+        ),
+        "{verdict:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2714,4 +3569,131 @@ fn consumer_checks_record_producer_lineage() {
         ),
         "{facts:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Amendment A: transition transactions without keyed deduplication
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_transition_without_keyed_recovery_is_unknown_not_invalid() {
+    let mut model = load_flash_checkout();
+
+    // The transaction is structurally valid with the explicit negative
+    // guarantee; what it loses is every replay route, so the
+    // obligations over it settle unproven with the missing facts
+    // recorded — never as a validation error.
+    model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.apply_payment"))
+        .unwrap()
+        .idempotency = IdempotencyGuarantee::NotDeduplicated;
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = idempotency_verdict(&model, "operation.apply_payment", 0);
+
+    let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected apply_payment unproven, found {verdict:?}");
+    };
+
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        IdempotencyObstacle::TransactionNotRetrySafe {
+            transaction,
+            recovery,
+            reconstruction,
+            ..
+        } if transaction == &id("tx.apply_payment")
+            && recovery == &vec![ReplayGap::NoKeyedCommit]
+            && reconstruction.contains(&ReplayGap::ContainsTransition)
+    )));
+
+    // The transition-established intent is replay-available by neither
+    // route, so its execution is not class-fixed either.
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        IdempotencyObstacle::IntentNotReplayAvailable { intent, .. }
+            if intent == &id("intent.apply_payment.order_paid")
+    )));
+
+    let verdict = recoverability_verdict(&model, "operation.apply_payment", 0);
+
+    let RecoverabilityVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected apply_payment recoverability unproven, found {verdict:?}");
+    };
+
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        RecoverabilityObstacle::TransactionNotResolvable { transaction, .. }
+            if transaction == &id("tx.apply_payment")
+    )));
+
+    assert!(obstacles.iter().any(|obstacle| matches!(
+        obstacle,
+        RecoverabilityObstacle::ArtifactNotReplayAvailable { artifact, .. }
+            if artifact == &id("intent.apply_payment.order_paid")
+    )));
+}
+
+#[test]
+fn a_transition_established_output_without_recovery_defeats_result_replay() {
+    let mut model = load_flash_checkout();
+
+    // A transition transaction with no keyed commit exports an output
+    // the terminal returns: structurally valid, and the result-replay
+    // obligation over it is unknown because the output is
+    // replay-available by neither route.
+    let operation = model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap();
+
+    operation.transaction_outputs.insert(
+        id("output.cancel_order"),
+        TransactionOutput {
+            schema: id("schema.CancelOrderResponse"),
+        },
+    );
+
+    let transaction = operation
+        .transactions
+        .get_mut(&id("tx.cancel_order"))
+        .unwrap();
+
+    transaction.idempotency = IdempotencyGuarantee::Unspecified;
+
+    transaction
+        .steps
+        .push(TransactionStep::EstablishTransactionOutput(
+            EstablishTransactionOutput {
+                output: id("output.cancel_order"),
+                values: deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
+            },
+        ));
+
+    operation.program.steps[2] = return_ok(
+        "input.cancel_order.request",
+        deterministic(vec![output_ref("output.cancel_order", &["order_id"])]),
+    );
+
+    operation
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.cancel_order.request", &[&["order_id"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+
+    assert!(validation::validate(&model).is_empty());
+
+    let verdict = result_replay_verdict(&model, "operation.cancel_order", 0);
+
+    let (recovery, reconstruction) = unavailable_result_root(&verdict);
+
+    assert_eq!(recovery, &vec![ReplayGap::NoKeyedCommit]);
+    assert!(reconstruction.contains(&ReplayGap::ContainsTransition));
 }

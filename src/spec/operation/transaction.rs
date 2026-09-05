@@ -5,8 +5,8 @@ use serde::de::value::{MapAccessDeserializer, StrDeserializer};
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::spec::{FieldPath, Id};
 use crate::spec::operation::value::opens_with_value_source_kind;
+use crate::spec::{FieldPath, Id};
 
 use super::{Derivation, IdempotencyGuarantee, ValueRef};
 
@@ -23,7 +23,7 @@ pub struct Transaction {
     /// Explicit durable keyed commit deduplication provided by the
     /// execution environment.
     ///
-    /// This is independent of any invocation-result or effect-intent
+    /// This is independent of any transaction-output or effect-intent
     /// declaration. `Unspecified` and `NotDeduplicated` leave the
     /// analyzer free to prove natural replayability from the body.
     pub idempotency: IdempotencyGuarantee,
@@ -51,7 +51,47 @@ pub enum TransactionStep {
 
     Transition(StateTransition),
     EstablishEffectIntent(EstablishEffectIntent),
-    EstablishInvocationResult(EstablishInvocationResult),
+    EstablishTransactionOutput(EstablishTransactionOutput),
+}
+
+impl TransactionStep {
+    /// Every value reference the step evaluates: selector roots,
+    /// mutation and artifact derivations, and transition effect values.
+    /// The transaction's commit key is not a step's and is judged
+    /// separately.
+    pub fn roots(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::Read(read) => read.target.predicate.roots(),
+
+            Self::Write(write) => {
+                let mut roots = write.target.predicate.roots();
+
+                roots.extend(write.values.roots());
+
+                roots
+            }
+
+            Self::Insert(insert) => insert.values.roots(),
+
+            Self::Delete(delete) => delete.target.predicate.roots(),
+
+            Self::Lock(lock) => lock.target.predicate.roots(),
+
+            Self::Transition(transition) => {
+                let mut roots = transition.subject.predicate.roots();
+
+                for values in transition.effect_values.values() {
+                    roots.extend(values.roots());
+                }
+
+                roots
+            }
+
+            Self::EstablishEffectIntent(establish) => establish.values.roots(),
+
+            Self::EstablishTransactionOutput(establish) => establish.values.roots(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +198,26 @@ pub enum SelectorPredicate {
     And {
         predicates: Vec<SelectorPredicate>,
     },
+}
+
+impl SelectorPredicate {
+    /// Every value reference the predicate constrains against.
+    /// Literals are constants and contribute nothing.
+    pub fn roots(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::All => Vec::new(),
+
+            Self::Eq { value, .. } => match value {
+                SelectorValue::Value(root) => vec![root],
+                SelectorValue::Literal(_) => Vec::new(),
+            },
+
+            Self::And { predicates } => predicates
+                .iter()
+                .flat_map(SelectorPredicate::roots)
+                .collect(),
+        }
+    }
 }
 
 /// What a selector compares a field against.
@@ -472,11 +532,20 @@ pub struct EstablishEffectIntent {
     pub values: Derivation,
 }
 
+/// Exports a typed value from the transaction into the enclosing
+/// operation's control.
+///
+/// For `EstablishTransactionOutput(O, D)` the transaction constructs a
+/// value shaped by `O`'s schema, declares its provenance through `D`,
+/// establishes `O` atomically with its commit, and makes `O` available
+/// to the operation control that follows a successful execution or a
+/// commit recovery. It implies no response, no success or failure, no
+/// effect execution, no idempotency, and no storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EstablishInvocationResult {
-    pub result: Id,
+pub struct EstablishTransactionOutput {
+    pub output: Id,
 
-    /// Provenance of the result's logical contents.
+    /// Provenance of the output's logical contents.
     pub values: Derivation,
 }

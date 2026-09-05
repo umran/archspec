@@ -17,8 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use archspec::spec::{
-    Effect, FlowStep, Id, Input, MessageSelector, Model, TransactionStep,
-    TransitionSideEffect,
+    Effect, Id, Input, MessageSelector, Model, OperationStep, TransactionStep, TransitionSideEffect,
 };
 
 pub const CLIENT_NODE_ID: &str = "@client";
@@ -59,7 +58,9 @@ pub struct OperationNode {
     pub description: Option<String>,
 
     pub inputs: usize,
-    pub flows: usize,
+
+    /// Steps of the operation program, nested ones included.
+    pub steps: usize,
 
     /// State machines this operation touches, via transition steps or
     /// by executing transition-owned effects.
@@ -118,9 +119,10 @@ pub enum EdgeDetail {
         /// rather than declared on the operation.
         via_transition: Option<TransitionKey>,
 
-        /// Flows of `operation` that execute the effect. Empty means
-        /// the capability is declared but no declared flow uses it.
-        executed_by: Vec<Id>,
+        /// Program steps of `operation` that execute the effect, as
+        /// step locations. Empty means the capability is declared but
+        /// no step of the program uses it.
+        executed_at: Vec<String>,
     },
 
     Subscribe {
@@ -145,7 +147,7 @@ pub enum EdgeDetail {
         schema: Id,
         retry: String,
         via_transition: Option<TransitionKey>,
-        executed_by: Vec<Id>,
+        executed_at: Vec<String>,
     },
 
     /// An external effect execution; the modeled system ends here.
@@ -153,11 +155,15 @@ pub enum EdgeDetail {
         operation: Id,
         effect: Id,
         idempotency: String,
-        executed_by: Vec<Id>,
+        executed_at: Vec<String>,
     },
 
     /// A request input no modeled operation invokes.
-    Client { operation: Id, input: Id, schema: Id },
+    Client {
+        operation: Id,
+        input: Id,
+        schema: Id,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,9 +246,7 @@ pub fn extract(model: &Model) -> Graph {
                             .get(&sub.topic)
                             .map(|t| t.messages.iter().cloned().collect())
                             .unwrap_or_default(),
-                        MessageSelector::Only(schemas) => {
-                            schemas.iter().cloned().collect()
-                        }
+                        MessageSelector::Only(schemas) => schemas.iter().cloned().collect(),
                     };
 
                     edges.push(Edge {
@@ -255,9 +259,7 @@ pub fn extract(model: &Model) -> Graph {
                             schemas,
                             delivery: to_tag(&sub.delivery),
                             routing: to_tag(&sub.dispatch.routing),
-                            lane_concurrency: concurrency_label(
-                                &sub.dispatch.lane_concurrency,
-                            ),
+                            lane_concurrency: concurrency_label(&sub.dispatch.lane_concurrency),
                         },
                     });
                 }
@@ -285,13 +287,11 @@ pub fn extract(model: &Model) -> Graph {
 
         // Effects available to the operation: its own declarations
         // plus transition-owned effects reachable through its intents.
-        let mut available: Vec<(Id, ResolvedEffect, Option<TransitionKey>)> =
-            op.effects
-                .iter()
-                .map(|(id, effect)| {
-                    (id.clone(), ResolvedEffect::from(effect), None)
-                })
-                .collect();
+        let mut available: Vec<(Id, ResolvedEffect, Option<TransitionKey>)> = op
+            .effects
+            .iter()
+            .map(|(id, effect)| (id.clone(), ResolvedEffect::from(effect), None))
+            .collect();
 
         for intent in op.effect_intents.values() {
             if op.effects.contains_key(&intent.effect) {
@@ -302,30 +302,23 @@ pub fn extract(model: &Model) -> Graph {
                 machine,
                 transition,
             }) = effect_owners.get(&intent.effect)
+                && let Some(effect) = transition_effect(model, machine, transition, &intent.effect)
             {
-                if let Some(effect) = transition_effect(
-                    model,
-                    machine,
-                    transition,
-                    &intent.effect,
-                ) {
-                    machines.insert(machine.clone());
+                machines.insert(machine.clone());
 
-                    available.push((
-                        intent.effect.clone(),
-                        effect,
-                        Some(TransitionKey {
-                            machine: machine.clone(),
-                            transition: transition.clone(),
-                        }),
-                    ));
-                }
+                available.push((
+                    intent.effect.clone(),
+                    effect,
+                    Some(TransitionKey {
+                        machine: machine.clone(),
+                        transition: transition.clone(),
+                    }),
+                ));
             }
         }
 
         for (effect_id, effect, via_transition) in available {
-            let executed_by =
-                executions.get(&effect_id).cloned().unwrap_or_default();
+            let executed_at = executions.get(&effect_id).cloned().unwrap_or_default();
 
             match effect {
                 ResolvedEffect::Publication(publication) => {
@@ -338,7 +331,7 @@ pub fn extract(model: &Model) -> Graph {
                             effect: effect_id,
                             schema: publication.schema.clone(),
                             via_transition,
-                            executed_by,
+                            executed_at,
                         },
                     });
                 }
@@ -355,7 +348,7 @@ pub fn extract(model: &Model) -> Graph {
                             schema: request.schema.clone(),
                             retry: to_tag(&request.retry),
                             via_transition,
-                            executed_by,
+                            executed_at,
                         },
                     });
                 }
@@ -371,10 +364,8 @@ pub fn extract(model: &Model) -> Graph {
                         detail: EdgeDetail::External {
                             operation: op_id.clone(),
                             effect: effect_id,
-                            idempotency: idempotency_label(
-                                &external.idempotency,
-                            ),
-                            executed_by,
+                            idempotency: idempotency_label(&external.idempotency),
+                            executed_at,
                         },
                     });
                 }
@@ -395,7 +386,7 @@ pub fn extract(model: &Model) -> Graph {
             service: op.service.clone(),
             description: op.description.clone(),
             inputs: op.inputs.len(),
-            flows: op.flows.len(),
+            steps: op.program.steps_with_locations().len(),
             machines: machines.into_iter().collect(),
             requirements: RequirementBadges {
                 serialization: op.requirements.serialization.len(),
@@ -403,9 +394,7 @@ pub fn extract(model: &Model) -> Graph {
                 idempotency: op.requirements.idempotency.len(),
                 recoverability: op.requirements.recoverability.len(),
             },
-            concurrency: operation_concurrency_label(
-                &op.execution.concurrency,
-            ),
+            concurrency: operation_concurrency_label(&op.execution.concurrency),
         });
     }
 
@@ -487,25 +476,20 @@ fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
     owners
 }
 
-fn collect_transition_refs(
-    model: &Model,
-) -> BTreeMap<String, Vec<TransitionRef>> {
+fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>> {
     let mut refs: BTreeMap<String, Vec<TransitionRef>> = BTreeMap::new();
 
     for (op_id, op) in &model.operations {
         for (tx_id, transaction) in &op.transactions {
             for (index, step) in transaction.steps.iter().enumerate() {
                 if let TransactionStep::Transition(transition) = step {
-                    refs.entry(format!(
-                        "{}/{}",
-                        transition.machine, transition.transition
-                    ))
-                    .or_default()
-                    .push(TransitionRef {
-                        operation: op_id.clone(),
-                        transaction: tx_id.clone(),
-                        step: index,
-                    });
+                    refs.entry(format!("{}/{}", transition.machine, transition.transition))
+                        .or_default()
+                        .push(TransitionRef {
+                            operation: op_id.clone(),
+                            transaction: tx_id.clone(),
+                            step: index,
+                        });
                 }
             }
         }
@@ -514,33 +498,28 @@ fn collect_transition_refs(
     refs
 }
 
-/// For one operation: effect id → flows that execute it, either
-/// directly or by executing an intent that names it.
-fn collect_effect_executions(
-    op: &archspec::spec::Operation,
-) -> BTreeMap<Id, Vec<Id>> {
-    let mut executions: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+/// For one operation: effect id → program steps that execute it,
+/// either directly or by executing an intent that names it.
+fn collect_effect_executions(op: &archspec::spec::Operation) -> BTreeMap<Id, Vec<String>> {
+    let mut executions: BTreeMap<Id, Vec<String>> = BTreeMap::new();
 
-    for (flow_id, flow) in &op.flows {
-        for step in &flow.steps {
-            let effect_id = match step {
-                FlowStep::ExecuteEffect { effect, .. } => Some(effect.clone()),
+    for (location, step) in op.program.steps_with_locations() {
+        let effect_id = match step {
+            OperationStep::ExecuteEffect(step) => Some(step.effect.clone()),
 
-                FlowStep::ExecuteEffectIntent { intent } => op
-                    .effect_intents
-                    .get(intent)
-                    .map(|intent| intent.effect.clone()),
+            OperationStep::ExecuteEffectIntent(step) => op
+                .effect_intents
+                .get(&step.intent)
+                .map(|intent| intent.effect.clone()),
 
-                FlowStep::Transaction { .. } => None,
-            };
+            _ => None,
+        };
 
-            if let Some(effect_id) = effect_id {
-                let flows = executions.entry(effect_id).or_default();
-
-                if !flows.contains(flow_id) {
-                    flows.push(flow_id.clone());
-                }
-            }
+        if let Some(effect_id) = effect_id {
+            executions
+                .entry(effect_id)
+                .or_default()
+                .push(location.to_string());
         }
     }
 
@@ -568,9 +547,7 @@ impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
 impl<'a> From<&'a TransitionSideEffect> for ResolvedEffect<'a> {
     fn from(effect: &'a TransitionSideEffect) -> Self {
         match effect {
-            TransitionSideEffect::Publication(publication) => {
-                Self::Publication(publication)
-            }
+            TransitionSideEffect::Publication(publication) => Self::Publication(publication),
             TransitionSideEffect::Request(request) => Self::Request(request),
         }
     }
@@ -606,40 +583,26 @@ fn to_tag<T: serde::Serialize>(value: &T) -> String {
 
 fn concurrency_label(value: &archspec::spec::LaneConcurrency) -> String {
     match value {
-        archspec::spec::LaneConcurrency::Unspecified => {
-            "unspecified".to_string()
-        }
+        archspec::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
         archspec::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
         archspec::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn operation_concurrency_label(
-    value: &archspec::spec::OperationConcurrency,
-) -> String {
+fn operation_concurrency_label(value: &archspec::spec::OperationConcurrency) -> String {
     match value {
-        archspec::spec::OperationConcurrency::Unspecified => {
-            "unspecified".to_string()
-        }
+        archspec::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
         archspec::spec::OperationConcurrency::Bounded(n) => {
             format!("bounded({n})")
         }
-        archspec::spec::OperationConcurrency::Unbounded => {
-            "unbounded".to_string()
-        }
+        archspec::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn idempotency_label(
-    value: &archspec::spec::IdempotencyGuarantee,
-) -> String {
+fn idempotency_label(value: &archspec::spec::IdempotencyGuarantee) -> String {
     match value {
-        archspec::spec::IdempotencyGuarantee::Unspecified => {
-            "unspecified".to_string()
-        }
-        archspec::spec::IdempotencyGuarantee::NotDeduplicated => {
-            "not_deduplicated".to_string()
-        }
+        archspec::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
+        archspec::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
         archspec::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => {
             "deduplicated_by".to_string()
         }
@@ -648,9 +611,7 @@ fn idempotency_label(
 
 fn topic_ordering_label(value: &archspec::spec::TopicOrdering) -> String {
     match value {
-        archspec::spec::TopicOrdering::Unspecified => {
-            "unspecified".to_string()
-        }
+        archspec::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
         archspec::spec::TopicOrdering::Unordered => "unordered".to_string(),
         archspec::spec::TopicOrdering::Global => "global".to_string(),
         archspec::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
@@ -665,19 +626,15 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/flash_checkout.yaml");
 
-        archspec::parser::yaml::parse(
-            &std::fs::read_to_string(path).expect("fixture readable"),
-        )
-        .expect("fixture parses")
+        archspec::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
+            .expect("fixture parses")
     }
 
     fn edges_of_kind<'a>(graph: &'a Graph, kind: &str) -> Vec<&'a Edge> {
         graph
             .edges
             .iter()
-            .filter(|e| {
-                serde_json::to_value(&e.detail).unwrap()["kind"] == kind
-            })
+            .filter(|e| serde_json::to_value(&e.detail).unwrap()["kind"] == kind)
             .collect()
     }
 
@@ -697,9 +654,9 @@ mod tests {
     fn extracts_expected_edges() {
         let graph = extract(&flash_checkout());
 
-        // Four operation-declared publications plus one transition-owned
+        // Five operation-declared publications plus one transition-owned
         // publication surfaced through operation.apply_payment's intent.
-        assert_eq!(edges_of_kind(&graph, "publish").len(), 5);
+        assert_eq!(edges_of_kind(&graph, "publish").len(), 6);
         assert_eq!(edges_of_kind(&graph, "subscribe").len(), 3);
         assert_eq!(edges_of_kind(&graph, "external").len(), 1);
 
@@ -720,23 +677,20 @@ mod tests {
                     operation,
                     effect,
                     via_transition: Some(key),
-                    executed_by,
+                    executed_at,
                     ..
-                } => Some((operation, effect, key, executed_by)),
+                } => Some((operation, effect, key, executed_at)),
                 _ => None,
             })
             .collect();
 
         assert_eq!(via_transition.len(), 1);
-        let (operation, effect, key, executed_by) = &via_transition[0];
+        let (operation, effect, key, executed_at) = &via_transition[0];
         assert_eq!(operation.0, "operation.apply_payment");
         assert_eq!(effect.0, "effect.order.paid");
         assert_eq!(key.machine.0, "machine.order_lifecycle");
         assert_eq!(key.transition.0, "transition.order.mark_paid");
-        assert_eq!(
-            executed_by.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
-            ["flow.apply_payment"],
-        );
+        assert_eq!(**executed_at, vec!["2".to_string()]);
     }
 
     #[test]

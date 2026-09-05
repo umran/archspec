@@ -5,15 +5,16 @@
 //! > not cause externally distinguishable duplicate logical work
 //! > beyond what the declared idempotency contract permits.
 //!
-//! The analysis composes the replay engine across each admitted flow
-//! (the same admitted-flow scoping as recoverability), under the
-//! governing key's population (§12):
+//! The analysis composes the replay engine along each admitted path of
+//! the operation program — a path ending at `complete` or at a
+//! `return` for the triggering input — under the governing key's
+//! population (§12):
 //!
 //! - **State leg**: every transaction step must be retry-safe — a
 //!   keyed commit over a stable key commits once per class, and a
 //!   naturally replayable body reproduces the same logical state on
 //!   re-execution. There is no final-step exemption: a duplicate
-//!   delivery re-drives the whole flow even after terminal
+//!   delivery re-drives the whole program even after terminal
 //!   completion, so every committed transaction may be
 //!   re-encountered.
 //! - **Effect leg**: duplicate execution is possible at every effect
@@ -28,39 +29,54 @@
 //!   consumer of that message collapsing duplicate deliveries of it:
 //!   a proven idempotency requirement keyed from the subscription, or
 //!   `at_most_once` delivery of the one logical message.
+//! - **Control leg**: every decision on the path must replay (§30) — a
+//!   matched result replay-stable, or a branch condition deterministic
+//!   over stable roots — so a retry traverses the same path. When a
+//!   controlling observation may differ, the retry may do different
+//!   work, and V1 has no compatibility argument for the two histories.
 //!
 //! The request and publication legs follow the trigger graph
 //! (`trigger`): duplicate work an attempt causes downstream is still
 //! work it caused, so a requirement is proven only when the cascade
 //! it starts collapses everywhere the model can see. That makes
-//! verdicts mutually dependent, so `check` computes a least fixpoint:
-//! requirements are re-checked as their request targets and message
-//! consumers become proven, and cyclic dependencies settle unproven —
-//! the conservative answer.
+//! verdicts mutually dependent, so `check` computes a greatest
+//! fixpoint: every requirement with an admissible governing key is
+//! assumed, and whatever fails under that assumption is dropped until
+//! nothing more fails. A cycle through request targets or message
+//! consumers whose members each pass their local checks is therefore
+//! proven, and the proof is marked coinductive
+//! (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1).
 //!
-//! Response consistency is the separate response-replay obligation
-//! and is not re-checked here. Vacuous routes: an empty population,
-//! no admitted flow (no modeled work to duplicate — recoverability
-//! treats the same shape as an obstacle, and the asymmetry is
-//! deliberate: progress is impossible, safety is trivial), and
-//! single delivery (`at_most_once` with the payload identity-pinned:
-//! same-class messages are one logical message delivered at most
-//! once, so a class holds at most one attempt).
+//! Result consistency is the separate result-replay obligation and is
+//! not re-checked here; its verdicts feed in only where a decision
+//! rests on a request effect's result. Vacuous routes: an empty
+//! population, no admitted path (no modeled work to duplicate —
+//! recoverability treats the same shape as an obstacle, and the
+//! asymmetry is deliberate: progress is impossible, safety is
+//! trivial), and single delivery (`at_most_once` with the payload
+//! identity-pinned: same-class messages are one logical message
+//! delivered at most once, so a class holds at most one attempt).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    DeliverySemantics, Derivation, Effect, ExternalEffect, FieldPath, FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, InvocationFlow, MessageIdentity, MessageSelector, Model, Operation, PublicationEffect, RequestEffect, TransitionSideEffect, ValueRef, ValueSource,
+    DeliverySemantics, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
+    MessageSelector, Model, Operation, ValueSource,
 };
 
-use super::describe::{gap_sentences, governing_key_evidence, stability_sentence};
-use super::replay::{
-    ArtifactReplay, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StabilityGap, StableRoot,
+use super::describe::{
+    decision_gap_sentence, describe_decision, describe_path, gap_sentences, governing_key_evidence,
+    unstable_roots,
 };
-use super::trigger::{ProducerSite, TriggerGraph, collapses_duplicates};
+use super::paths::{DecisionTaken, Path, PathRef, paths};
+use super::replay::{
+    DecisionGap, DecisionReplay, EffectSite, GoverningKeyDefect, InstanceGap, InstanceStability,
+    PathContext, ReplayAnalysis, ReplayGap, StableRoot, TracedStep, UnstableRoot,
+};
+use super::trigger::{EffectContract, ProducerSite, TriggerGraph, collapses_duplicates, key_input};
 
 /// The verdict for one declared idempotency requirement's side-effect
 /// obligation.
@@ -108,8 +124,15 @@ pub struct IdentityLineage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProducerRef {
-    Operation { operation: Id, effect: Id },
-    Transition { machine: Id, transition: Id, effect: Id },
+    Operation {
+        operation: Id,
+        effect: Id,
+    },
+    Transition {
+        machine: Id,
+        transition: Id,
+        effect: Id,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,29 +168,32 @@ pub enum IdempotencyProof {
     /// attempt can bear the key.
     NoAdmittedInvocations { input: Id },
 
-    /// No admitted flow exists for the triggering input: an attempt
+    /// No admitted path exists for the triggering input: an attempt
     /// performs no modeled work, so nothing can be duplicated.
-    NoAdmittedFlows { input: Id },
+    NoAdmittedPaths { input: Id },
 
     /// `at_most_once` delivery with the payload identity-pinned:
     /// same-class messages are one logical message, delivered no more
     /// than once, so repeated attempts cannot exist.
     SingleDelivery { input: Id, topic: Id },
 
-    /// Every admitted flow is retry-safe in both legs.
-    RetrySafeFlows { flows: Vec<FlowRetrySafety> },
+    /// Every admitted path is retry-safe in all three legs.
+    RetrySafePaths { paths: Vec<PathRetrySafety> },
 }
 
-/// The retry-safety argument for one admitted flow.
+/// The retry-safety argument for one admitted path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FlowRetrySafety {
-    pub flow: Id,
+pub struct PathRetrySafety {
+    pub path: PathRef,
 
-    /// Per transaction step, in flow order.
+    /// Why a retry takes the same arm at every decision on the path.
+    pub decisions: Vec<DecisionReplay>,
+
+    /// Per transaction step, in path order.
     pub transactions: Vec<TransactionRetrySafety>,
 
-    /// Per effect-executing step, in flow order.
+    /// Per effect-executing step, in path order.
     pub effects: Vec<EffectRetrySafety>,
 }
 
@@ -192,7 +218,7 @@ pub enum RetryRoute {
 #[serde(deny_unknown_fields)]
 pub struct EffectRetrySafety {
     /// The executed effect (for intent executions, the intent's
-    /// effect's site is recorded by the intent id in `safety`).
+    /// effect; the intent itself is recorded in `safety`).
     pub effect: Id,
 
     pub safety: EffectSafety,
@@ -241,29 +267,6 @@ pub enum ConsumerCollapse {
     SingleDelivery { operation: Id, input: Id },
 }
 
-/// Why every attempt constructs the same logical effect instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InstanceStability {
-    /// A direct execution whose derivation is replay-deterministic
-    /// over the cited roots.
-    ReplayDeterministic { roots: Vec<StableRoot> },
-
-    /// An intent whose values were fixed at establishment and are
-    /// recovered or reconstructed on every attempt.
-    EstablishedIntent {
-        intent: Id,
-        replay: ArtifactReplay,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnstableRoot {
-    pub root: ValueRef,
-    pub gap: StabilityGap,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IdempotencyObstacle {
@@ -271,10 +274,18 @@ pub enum IdempotencyObstacle {
     /// (§12).
     GoverningKeyInadmissible { defect: GoverningKeyDefect },
 
+    /// A decision on the path is not established to replay, so a retry
+    /// may take a different path and do different work.
+    PathDecisionUnstable {
+        path: PathRef,
+        decision: DecisionTaken,
+        gap: DecisionGap,
+    },
+
     /// A committed transaction may be re-encountered, and neither
     /// retry route holds.
     TransactionNotRetrySafe {
-        flow: Id,
+        path: PathRef,
         transaction: Id,
         recovery: Vec<ReplayGap>,
         reconstruction: Vec<ReplayGap>,
@@ -282,15 +293,15 @@ pub enum IdempotencyObstacle {
 
     /// The external boundary explicitly does not deduplicate: a
     /// duplicate execution is distinguishable duplicate work (§13.3).
-    ExternalEffectNotDeduplicated { flow: Id, effect: Id },
+    ExternalEffectNotDeduplicated { path: PathRef, effect: Id },
 
     /// No deduplication fact is available for the external boundary.
-    ExternalEffectDeduplicationUnknown { flow: Id, effect: Id },
+    ExternalEffectDeduplicationUnknown { path: PathRef, effect: Id },
 
     /// The declared external deduplication key is not replay-stable,
     /// so attempts may execute under different keys.
     ExternalDeduplicationKeyUnstable {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         roots: Vec<UnstableRoot>,
     },
@@ -299,7 +310,7 @@ pub enum IdempotencyObstacle {
     /// logical message: the topic declares no message identity for
     /// the published schema.
     PublicationNotIdentified {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         topic: Id,
         schema: Id,
@@ -309,7 +320,7 @@ pub enum IdempotencyObstacle {
     /// idempotency requirement keyed from its subscription, so nothing
     /// collapses the duplicate work a duplicate delivery causes there.
     PublicationConsumerNotKeyed {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         topic: Id,
         schema: Id,
@@ -318,10 +329,11 @@ pub enum IdempotencyObstacle {
     },
 
     /// The consumer declares such a requirement, but it is not proven
-    /// in this analysis — including cyclic dependencies, which settle
-    /// unproven.
+    /// in this analysis. Under the greatest fixpoint a requirement is
+    /// dropped only by failing its own checks, so a cycle is not by
+    /// itself a cause.
     PublicationConsumerRequirementUnproven {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         topic: Id,
         schema: Id,
@@ -331,24 +343,24 @@ pub enum IdempotencyObstacle {
 
     /// A direct execution declares no instance provenance, so the
     /// instances attempts construct are not class-fixed.
-    EffectInstanceUnspecified { flow: Id, effect: Id },
+    EffectInstanceUnspecified { path: PathRef, effect: Id },
 
     /// A direct execution's instance derivation depends on unstable
     /// roots.
     EffectInstanceRootUnstable {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         roots: Vec<UnstableRoot>,
     },
 
     /// The executed intent is established by no earlier step, so no
     /// class-fixed instance exists to argue about.
-    IntentNotEstablished { flow: Id, intent: Id },
+    IntentNotEstablished { path: PathRef, intent: Id },
 
     /// The executed intent is replay-available through neither route,
     /// so a retry's instance may differ.
     IntentNotReplayAvailable {
-        flow: Id,
+        path: PathRef,
         intent: Id,
         transaction: Id,
         recovery: Vec<ReplayGap>,
@@ -358,7 +370,7 @@ pub enum IdempotencyObstacle {
     /// The request effect's schema is not the targeted input's
     /// schema, so payload equality does not transfer.
     RequestSchemaMismatch {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         expected: Id,
         actual: Id,
@@ -368,43 +380,40 @@ pub enum IdempotencyObstacle {
     /// from the targeted input, so nothing collapses duplicate
     /// invocations.
     RequestTargetHasNoKeyedRequirement {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         operation: Id,
         input: Id,
     },
 
     /// The target declares such a requirement, but it is not proven
-    /// in this analysis — including cyclic dependencies, which settle
-    /// unproven.
+    /// in this analysis. Under the greatest fixpoint a requirement is
+    /// dropped only by failing its own checks, so a cycle is not by
+    /// itself a cause.
     RequestTargetRequirementUnproven {
-        flow: Id,
+        path: PathRef,
         effect: Id,
         operation: Id,
         input: Id,
     },
 }
 
-/// The effect contract behind an execution site, unifying
-/// operation-owned effects and transition side effects.
-enum Contract<'a> {
-    Publication(&'a PublicationEffect),
-    Request(&'a RequestEffect),
-    External(&'a ExternalEffect),
-}
-
 /// What a check reads beyond the operation under analysis: the model,
-/// its trigger graph, and the requirements proven so far in the
-/// fixpoint, keyed by operation and triggering input.
+/// its trigger graph, the requirements proven so far in the fixpoint,
+/// keyed by operation and triggering input, and the result-replay
+/// verdicts decisions may rest on.
 struct Scope<'a> {
     model: &'a Model,
     graph: &'a TriggerGraph<'a>,
     proven: &'a BTreeSet<(Id, Id)>,
+    consistent: &'a BTreeSet<(Id, Id)>,
 }
 
 /// Checks every idempotency requirement declared by the model, as a
 /// fixpoint over cross-operation discharge through request targets and
-/// message consumers.
+/// message consumers. `consistent` names the `(operation, input)`
+/// pairs whose result replay is proven, which a decision on a request
+/// effect's result rests on.
 ///
 /// The verdicts are the greatest fixpoint: every requirement with an
 /// admissible governing key is assumed, and whatever fails under that
@@ -412,10 +421,10 @@ struct Scope<'a> {
 /// requirements that each collapse the others' duplicates proves
 /// (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1). The least fixpoint is
 /// computed alongside to mark which proofs rest on such a cycle.
-pub fn check(model: &Model) -> Vec<IdempotencyCheck> {
+pub fn check(model: &Model, consistent: &BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
     let graph = TriggerGraph::new(model);
 
-    let least = proven_set(&fixpoint(model, &graph, BTreeSet::new()));
+    let least = proven_set(&fixpoint(model, &graph, consistent, BTreeSet::new()));
 
     let every: BTreeSet<(Id, Id)> = model
         .operations
@@ -431,7 +440,7 @@ pub fn check(model: &Model) -> Vec<IdempotencyCheck> {
         })
         .collect();
 
-    let mut checks = fixpoint(model, &graph, every);
+    let mut checks = fixpoint(model, &graph, consistent, every);
 
     for check in &mut checks {
         if matches!(check.verdict, IdempotencyVerdict::Proven { .. })
@@ -449,12 +458,18 @@ pub fn check(model: &Model) -> Vec<IdempotencyCheck> {
 /// the empty set the chain ascends to the least fixpoint; from every
 /// admissible requirement it descends to the greatest, since fewer
 /// assumptions never prove more.
-fn fixpoint(model: &Model, graph: &TriggerGraph<'_>, mut assumed: BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
+fn fixpoint(
+    model: &Model,
+    graph: &TriggerGraph<'_>,
+    consistent: &BTreeSet<(Id, Id)>,
+    mut assumed: BTreeSet<(Id, Id)>,
+) -> Vec<IdempotencyCheck> {
     loop {
         let checks = run(&Scope {
             model,
             graph,
             proven: &assumed,
+            consistent,
         });
 
         let next = proven_set(&checks);
@@ -534,13 +549,9 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
                                     .operations
                                     .get(operation)
                                     .and_then(|declaration| {
-                                        declaration
-                                            .requirements
-                                            .idempotency
-                                            .iter()
-                                            .position(|requirement| {
-                                                requirement.key == propagation.source
-                                            })
+                                        declaration.requirements.idempotency.iter().position(
+                                            |requirement| requirement.key == propagation.source,
+                                        )
                                     }),
 
                                 ProducerSite::Transition { .. } => None,
@@ -580,14 +591,6 @@ fn lineage(scope: &Scope<'_>, operation: &Operation, key: &IdempotencyKey) -> Ve
     out
 }
 
-/// The triggering input of an admissible governing key.
-fn key_input(key: &IdempotencyKey) -> Option<&Id> {
-    match &key.components.first()?.source {
-        ValueSource::Input(input) => Some(input),
-        _ => None,
-    }
-}
-
 fn run(scope: &Scope<'_>) -> Vec<IdempotencyCheck> {
     let mut checks = Vec::new();
 
@@ -612,7 +615,7 @@ fn check_requirement(
     operation: &Operation,
     key: &IdempotencyKey,
 ) -> IdempotencyVerdict {
-    let analysis = match ReplayAnalysis::new(scope.model, operation, key) {
+    let analysis = match ReplayAnalysis::new(scope.model, operation, key, scope.consistent) {
         Ok(analysis) => analysis,
 
         Err(defect) => {
@@ -644,301 +647,247 @@ fn check_requirement(
         };
     }
 
-    let admitted: Vec<_> = operation
-        .flows
-        .iter()
-        .filter(|(_, flow)| match &flow.response {
-            None => true,
+    let all = paths(&operation.program);
 
-            Some(response) => operation
-                .responses
-                .get(response)
-                .is_none_or(|response| &response.request == analysis.input()),
-        })
+    let admitted: Vec<&Path<'_>> = all
+        .iter()
+        .filter(|path| path.admitted_for(analysis.input()))
         .collect();
 
     if admitted.is_empty() {
         return IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::NoAdmittedFlows {
+            proof: IdempotencyProof::NoAdmittedPaths {
                 input: analysis.input().clone(),
             },
         };
     }
 
     let mut obstacles = Vec::new();
-    let mut flows = Vec::new();
+    let mut safe = Vec::new();
 
-    for (flow_id, flow) in admitted {
-        if let Some(safety) =
-            analyze_flow(scope, &analysis, operation, flow_id, flow, &mut obstacles)
-        {
-            flows.push(safety);
+    for path in admitted {
+        if let Some(safety) = analyze_path(scope, &analysis, path, &mut obstacles) {
+            safe.push(safety);
         }
     }
 
     if obstacles.is_empty() {
         IdempotencyVerdict::Proven {
-            proof: IdempotencyProof::RetrySafeFlows { flows },
+            proof: IdempotencyProof::RetrySafePaths { paths: safe },
         }
     } else {
-        IdempotencyVerdict::Unproven { obstacles }
+        IdempotencyVerdict::Unproven {
+            obstacles: dedupe(obstacles, IdempotencyObstacle::site),
+        }
     }
 }
 
-fn analyze_flow(
-    scope: &Scope<'_>,
-    analysis: &ReplayAnalysis<'_>,
-    operation: &Operation,
-    flow_id: &Id,
-    flow: &InvocationFlow,
-    obstacles: &mut Vec<IdempotencyObstacle>,
-) -> Option<FlowRetrySafety> {
-    let before = obstacles.len();
+/// Keeps the first obstacle per site: paths sharing a prefix reach its
+/// steps with the same context and report the same facts about them.
+pub(crate) fn dedupe<T, K: PartialEq>(obstacles: Vec<T>, site: impl Fn(&T) -> K) -> Vec<T> {
+    let mut kept: Vec<T> = Vec::new();
+    let mut sites: Vec<K> = Vec::new();
 
-    let mut context: BTreeMap<Id, ArtifactReplay> = BTreeMap::new();
-    let mut transactions = Vec::new();
-    let mut effects = Vec::new();
+    for obstacle in obstacles {
+        let key = site(&obstacle);
 
-    for step in &flow.steps {
-        match step {
-            FlowStep::Transaction { transaction } => {
-                let Some(body) = operation.transactions.get(transaction) else {
-                    continue;
-                };
+        if !sites.contains(&key) {
+            sites.push(key);
+            kept.push(obstacle);
+        }
+    }
 
-                let (recovery, natural) =
-                    analysis.apply_transaction(&mut context, transaction, body);
+    kept
+}
 
-                match (recovery, natural) {
-                    (Ok(key), _) => transactions.push(TransactionRetrySafety {
-                        transaction: transaction.clone(),
-                        route: RetryRoute::KeyedCommit { key },
-                    }),
+impl IdempotencyObstacle {
+    /// The obstacle with its path forgotten — and, for a decision, the
+    /// arm — so the same fact on two paths compares equal.
+    fn site(&self) -> Self {
+        let mut site = self.clone();
 
-                    (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
-                        transaction: transaction.clone(),
-                        route: RetryRoute::NaturalReplay,
-                    }),
+        match &mut site {
+            Self::GoverningKeyInadmissible { .. } => {}
 
-                    (Err(recovery), Err(reconstruction)) => {
-                        obstacles.push(IdempotencyObstacle::TransactionNotRetrySafe {
-                            flow: flow_id.clone(),
-                            transaction: transaction.clone(),
-                            recovery,
-                            reconstruction,
-                        });
-                    }
+            Self::PathDecisionUnstable { path, decision, .. } => {
+                *path = PathRef::default();
+
+                match decision {
+                    DecisionTaken::Match { arm, .. } => *arm = crate::spec::ResultVariant::Ok,
+                    DecisionTaken::Branch { arm, .. } => *arm = crate::spec::Arm::Then,
                 }
             }
 
-            FlowStep::ExecuteEffect { effect, values } => {
-                let Some(contract) = operation_contract(operation, effect) else {
+            Self::TransactionNotRetrySafe { path, .. }
+            | Self::ExternalEffectNotDeduplicated { path, .. }
+            | Self::ExternalEffectDeduplicationUnknown { path, .. }
+            | Self::ExternalDeduplicationKeyUnstable { path, .. }
+            | Self::PublicationNotIdentified { path, .. }
+            | Self::PublicationConsumerNotKeyed { path, .. }
+            | Self::PublicationConsumerRequirementUnproven { path, .. }
+            | Self::EffectInstanceUnspecified { path, .. }
+            | Self::EffectInstanceRootUnstable { path, .. }
+            | Self::IntentNotEstablished { path, .. }
+            | Self::IntentNotReplayAvailable { path, .. }
+            | Self::RequestSchemaMismatch { path, .. }
+            | Self::RequestTargetHasNoKeyedRequirement { path, .. }
+            | Self::RequestTargetRequirementUnproven { path, .. } => *path = PathRef::default(),
+        }
+
+        site
+    }
+}
+
+fn analyze_path(
+    scope: &Scope<'_>,
+    analysis: &ReplayAnalysis<'_>,
+    path: &Path<'_>,
+    obstacles: &mut Vec<IdempotencyObstacle>,
+) -> Option<PathRetrySafety> {
+    let before = obstacles.len();
+
+    let reference = path.reference();
+    let trace = analysis.trace(path);
+
+    let mut transactions = Vec::new();
+    let mut effects = Vec::new();
+
+    for step in &trace.steps {
+        match step {
+            TracedStep::Transaction {
+                transaction,
+                recovery,
+                natural,
+                ..
+            } => match (recovery, natural) {
+                (Ok(key), _) => transactions.push(TransactionRetrySafety {
+                    transaction: (*transaction).clone(),
+                    route: RetryRoute::KeyedCommit { key: key.clone() },
+                }),
+
+                (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
+                    transaction: (*transaction).clone(),
+                    route: RetryRoute::NaturalReplay,
+                }),
+
+                (Err(recovery), Err(reconstruction)) => {
+                    obstacles.push(IdempotencyObstacle::TransactionNotRetrySafe {
+                        path: reference.clone(),
+                        transaction: (*transaction).clone(),
+                        recovery: recovery.clone(),
+                        reconstruction: reconstruction.clone(),
+                    });
+                }
+            },
+
+            TracedStep::Effect {
+                site,
+                contract,
+                before: context,
+                instance,
+                ..
+            } => {
+                let Some(contract) = contract else {
                     continue;
                 };
 
-                let instance = |obstacles: &mut Vec<IdempotencyObstacle>| {
-                    direct_instance(analysis, &context, flow_id, effect, values, obstacles)
-                };
-
                 if let Some(safety) = contract_safety(
-                    scope, analysis, &context, flow_id, effect, &contract, instance, obstacles,
+                    scope, analysis, context, &reference, site, contract, instance, obstacles,
                 ) {
                     effects.push(EffectRetrySafety {
-                        effect: effect.clone(),
+                        effect: site.effect().clone(),
                         safety,
                     });
                 }
             }
 
-            FlowStep::ExecuteEffectIntent { intent } => {
-                let Some(declaration) = operation.effect_intents.get(intent) else {
-                    continue;
-                };
-
-                let effect = &declaration.effect;
-
-                let Some(contract) = operation_contract(operation, effect)
-                    .or_else(|| transition_contract(scope.model, effect))
-                else {
-                    continue;
-                };
-
-                let instance = |obstacles: &mut Vec<IdempotencyObstacle>| {
-                    intent_instance(&context, flow_id, intent, obstacles)
-                };
-
-                if let Some(safety) = contract_safety(
-                    scope, analysis, &context, flow_id, effect, &contract, instance, obstacles,
-                ) {
-                    effects.push(EffectRetrySafety {
-                        effect: effect.clone(),
-                        safety,
+            TracedStep::Decision { taken, replay, .. } => {
+                if let Err(gap) = replay {
+                    obstacles.push(IdempotencyObstacle::PathDecisionUnstable {
+                        path: reference.clone(),
+                        decision: taken.clone(),
+                        gap: gap.clone(),
                     });
                 }
             }
         }
     }
 
-    (obstacles.len() == before).then_some(FlowRetrySafety {
-        flow: flow_id.clone(),
+    (obstacles.len() == before).then_some(PathRetrySafety {
+        path: reference,
+        decisions: trace.stable_decisions(),
         transactions,
         effects,
     })
 }
 
-fn operation_contract<'a>(operation: &'a Operation, effect: &Id) -> Option<Contract<'a>> {
-    operation.effects.get(effect).map(|effect| match effect {
-        Effect::Publication(publication) => Contract::Publication(publication),
-        Effect::Request(request) => Contract::Request(request),
-        Effect::External(external) => Contract::External(external),
-    })
-}
+/// The obstacle a non-class-fixed instance is, at the site that needs
+/// one.
+fn instance_obstacle(
+    path: &PathRef,
+    site: &EffectSite<'_>,
+    gap: &InstanceGap,
+) -> IdempotencyObstacle {
+    match gap {
+        InstanceGap::DerivationUnspecified => IdempotencyObstacle::EffectInstanceUnspecified {
+            path: path.clone(),
+            effect: site.effect().clone(),
+        },
 
-fn transition_contract<'a>(model: &'a Model, effect: &Id) -> Option<Contract<'a>> {
-    for machine in model.state_machines.values() {
-        for transition in machine.transitions.values() {
-            if let Some(side_effect) = transition.side_effects.get(effect) {
-                return Some(match side_effect {
-                    TransitionSideEffect::Publication(publication) => {
-                        Contract::Publication(publication)
-                    }
+        InstanceGap::RootsUnstable { roots } => IdempotencyObstacle::EffectInstanceRootUnstable {
+            path: path.clone(),
+            effect: site.effect().clone(),
+            roots: roots.clone(),
+        },
 
-                    TransitionSideEffect::Request(request) => Contract::Request(request),
-                });
-            }
-        }
-    }
+        InstanceGap::IntentNotEstablished { intent } => IdempotencyObstacle::IntentNotEstablished {
+            path: path.clone(),
+            intent: intent.clone(),
+        },
 
-    None
-}
-
-/// A direct execution's instance: class-fixed iff its derivation is
-/// replay-deterministic.
-fn direct_instance(
-    analysis: &ReplayAnalysis<'_>,
-    context: &BTreeMap<Id, ArtifactReplay>,
-    flow: &Id,
-    effect: &Id,
-    values: &Derivation,
-    obstacles: &mut Vec<IdempotencyObstacle>,
-) -> Option<InstanceStability> {
-    match values {
-        Derivation::Unspecified => {
-            obstacles.push(IdempotencyObstacle::EffectInstanceUnspecified {
-                flow: flow.clone(),
-                effect: effect.clone(),
-            });
-
-            None
-        }
-
-        Derivation::Deterministic { from } => {
-            let mut stable = Vec::new();
-            let mut unstable = Vec::new();
-
-            for root in from {
-                match analysis.root_stability(context, root) {
-                    Ok(root) => stable.push(root),
-
-                    Err(gap) => unstable.push(UnstableRoot {
-                        root: root.clone(),
-                        gap,
-                    }),
-                }
-            }
-
-            if unstable.is_empty() {
-                Some(InstanceStability::ReplayDeterministic { roots: stable })
-            } else {
-                obstacles.push(IdempotencyObstacle::EffectInstanceRootUnstable {
-                    flow: flow.clone(),
-                    effect: effect.clone(),
-                    roots: unstable,
-                });
-
-                None
-            }
-        }
-    }
-}
-
-/// An intent execution's instance: class-fixed iff the intent is
-/// replay-available; its values were fixed at establishment.
-fn intent_instance(
-    context: &BTreeMap<Id, ArtifactReplay>,
-    flow: &Id,
-    intent: &Id,
-    obstacles: &mut Vec<IdempotencyObstacle>,
-) -> Option<InstanceStability> {
-    match context.get(intent) {
-        None => {
-            obstacles.push(IdempotencyObstacle::IntentNotEstablished {
-                flow: flow.clone(),
-                intent: intent.clone(),
-            });
-
-            None
-        }
-
-        Some(ArtifactReplay::Unavailable {
+        InstanceGap::IntentNotReplayAvailable {
+            intent,
             transaction,
             recovery,
             reconstruction,
-        }) => {
-            obstacles.push(IdempotencyObstacle::IntentNotReplayAvailable {
-                flow: flow.clone(),
-                intent: intent.clone(),
-                transaction: transaction.clone(),
-                recovery: recovery.clone(),
-                reconstruction: reconstruction.clone(),
-            });
-
-            None
-        }
-
-        Some(replay) => Some(InstanceStability::EstablishedIntent {
+        } => IdempotencyObstacle::IntentNotReplayAvailable {
+            path: path.clone(),
             intent: intent.clone(),
-            replay: replay.clone(),
-        }),
+            transaction: transaction.clone(),
+            recovery: recovery.clone(),
+            reconstruction: reconstruction.clone(),
+        },
     }
 }
 
-/// The per-kind duplicate-execution judgment. `instance` is invoked
-/// only for kinds whose discharge needs a class-fixed instance; an
-/// external boundary deduplicates by key alone.
+/// The per-kind duplicate-execution judgment. The instance is consulted
+/// only for kinds whose discharge needs a class-fixed one; an external
+/// boundary deduplicates by key alone.
 #[allow(clippy::too_many_arguments)]
 fn contract_safety(
     scope: &Scope<'_>,
     analysis: &ReplayAnalysis<'_>,
-    context: &BTreeMap<Id, ArtifactReplay>,
-    flow: &Id,
-    effect: &Id,
-    contract: &Contract<'_>,
-    instance: impl FnOnce(&mut Vec<IdempotencyObstacle>) -> Option<InstanceStability>,
+    context: &PathContext,
+    path: &PathRef,
+    site: &EffectSite<'_>,
+    contract: &EffectContract<'_>,
+    instance: &Result<InstanceStability, InstanceGap>,
     obstacles: &mut Vec<IdempotencyObstacle>,
 ) -> Option<EffectSafety> {
+    let effect = site.effect();
+
     match contract {
-        Contract::External(external) => match &external.idempotency {
+        EffectContract::External(external) => match &external.idempotency {
             IdempotencyGuarantee::DeduplicatedBy { key } => {
-                let mut stable = Vec::new();
-                let mut unstable = Vec::new();
+                let roots: Vec<_> = key.components.iter().collect();
 
-                for component in &key.components {
-                    match analysis.root_stability(context, component) {
-                        Ok(root) => stable.push(root),
-
-                        Err(gap) => unstable.push(UnstableRoot {
-                            root: component.clone(),
-                            gap,
-                        }),
-                    }
-                }
+                let (stable, unstable) = analysis.roots_stability(context, &roots);
 
                 if unstable.is_empty() {
                     Some(EffectSafety::ExternallyDeduplicated { key: stable })
                 } else {
                     obstacles.push(IdempotencyObstacle::ExternalDeduplicationKeyUnstable {
-                        flow: flow.clone(),
+                        path: path.clone(),
                         effect: effect.clone(),
                         roots: unstable,
                     });
@@ -949,7 +898,7 @@ fn contract_safety(
 
             IdempotencyGuarantee::NotDeduplicated => {
                 obstacles.push(IdempotencyObstacle::ExternalEffectNotDeduplicated {
-                    flow: flow.clone(),
+                    path: path.clone(),
                     effect: effect.clone(),
                 });
 
@@ -958,7 +907,7 @@ fn contract_safety(
 
             IdempotencyGuarantee::Unspecified => {
                 obstacles.push(IdempotencyObstacle::ExternalEffectDeduplicationUnknown {
-                    flow: flow.clone(),
+                    path: path.clone(),
                     effect: effect.clone(),
                 });
 
@@ -966,22 +915,23 @@ fn contract_safety(
             }
         },
 
-        Contract::Publication(publication) => {
+        EffectContract::Publication(publication) => {
             let topic = &publication.topic;
             let schema = &publication.schema;
 
-            let identified = scope
-                .model
-                .topics
-                .get(topic)
-                .is_some_and(|topic| match &topic.message_identity {
-                    MessageIdentity::Keyed { mapping } => mapping.contains_key(schema),
-                    MessageIdentity::Unspecified => false,
-                });
+            let identified =
+                scope
+                    .model
+                    .topics
+                    .get(topic)
+                    .is_some_and(|topic| match &topic.message_identity {
+                        MessageIdentity::Keyed { mapping } => mapping.contains_key(schema),
+                        MessageIdentity::Unspecified => false,
+                    });
 
             if !identified {
                 obstacles.push(IdempotencyObstacle::PublicationNotIdentified {
-                    flow: flow.clone(),
+                    path: path.clone(),
                     effect: effect.clone(),
                     topic: topic.clone(),
                     schema: schema.clone(),
@@ -1012,7 +962,7 @@ fn contract_safety(
                     collapsed = false;
 
                     obstacles.push(IdempotencyObstacle::PublicationConsumerNotKeyed {
-                        flow: flow.clone(),
+                        path: path.clone(),
                         effect: effect.clone(),
                         topic: topic.clone(),
                         schema: schema.clone(),
@@ -1022,20 +972,30 @@ fn contract_safety(
                 } else if !scope.proven.contains(&(operation.clone(), input.clone())) {
                     collapsed = false;
 
-                    obstacles.push(IdempotencyObstacle::PublicationConsumerRequirementUnproven {
-                        flow: flow.clone(),
-                        effect: effect.clone(),
-                        topic: topic.clone(),
-                        schema: schema.clone(),
-                        operation,
-                        input,
-                    });
+                    obstacles.push(
+                        IdempotencyObstacle::PublicationConsumerRequirementUnproven {
+                            path: path.clone(),
+                            effect: effect.clone(),
+                            topic: topic.clone(),
+                            schema: schema.clone(),
+                            operation,
+                            input,
+                        },
+                    );
                 } else {
                     consumers.push(ConsumerCollapse::ProvenRequirement { operation, input });
                 }
             }
 
-            let instance = instance(obstacles)?;
+            let instance = match instance {
+                Ok(instance) => instance.clone(),
+
+                Err(gap) => {
+                    obstacles.push(instance_obstacle(path, site, gap));
+
+                    return None;
+                }
+            };
 
             (identified && collapsed).then_some(EffectSafety::SameLogicalMessage {
                 topic: topic.clone(),
@@ -1045,7 +1005,7 @@ fn contract_safety(
             })
         }
 
-        Contract::Request(request) => {
+        EffectContract::Request(request) => {
             let target_operation = &request.target.operation;
             let target_input = &request.target.input;
 
@@ -1060,14 +1020,14 @@ fn contract_safety(
                 Some((target, Input::Request(declared))) => {
                     if declared.schema != request.schema {
                         obstacles.push(IdempotencyObstacle::RequestSchemaMismatch {
-                            flow: flow.clone(),
+                            path: path.clone(),
                             effect: effect.clone(),
                             expected: declared.schema.clone(),
                             actual: request.schema.clone(),
                         });
                     } else if !collapses_duplicates(target, target_input) {
                         obstacles.push(IdempotencyObstacle::RequestTargetHasNoKeyedRequirement {
-                            flow: flow.clone(),
+                            path: path.clone(),
                             effect: effect.clone(),
                             operation: target_operation.clone(),
                             input: target_input.clone(),
@@ -1077,7 +1037,7 @@ fn contract_safety(
                         .contains(&(target_operation.clone(), target_input.clone()))
                     {
                         obstacles.push(IdempotencyObstacle::RequestTargetRequirementUnproven {
-                            flow: flow.clone(),
+                            path: path.clone(),
                             effect: effect.clone(),
                             operation: target_operation.clone(),
                             input: target_input.clone(),
@@ -1089,7 +1049,7 @@ fn contract_safety(
 
                 _ => {
                     obstacles.push(IdempotencyObstacle::RequestTargetHasNoKeyedRequirement {
-                        flow: flow.clone(),
+                        path: path.clone(),
                         effect: effect.clone(),
                         operation: target_operation.clone(),
                         input: target_input.clone(),
@@ -1097,7 +1057,15 @@ fn contract_safety(
                 }
             }
 
-            let instance = instance(obstacles)?;
+            let instance = match instance {
+                Ok(instance) => instance.clone(),
+
+                Err(gap) => {
+                    obstacles.push(instance_obstacle(path, site, gap));
+
+                    return None;
+                }
+            };
 
             target_ok.then_some(EffectSafety::DeduplicatedByTarget {
                 operation: target_operation.clone(),
@@ -1129,23 +1097,12 @@ impl IdempotencyCheck {
                  proven to avoid externally distinguishable duplicate logical \
                  work."
             ),
-            evidence: obstacles.iter().map(IdempotencyObstacle::evidence).collect(),
+            evidence: obstacles
+                .iter()
+                .map(IdempotencyObstacle::evidence)
+                .collect(),
         })
     }
-}
-
-fn unstable_roots(roots: &[UnstableRoot]) -> String {
-    roots
-        .iter()
-        .map(|entry| {
-            format!(
-                "`{}` ({})",
-                entry.root.path,
-                stability_sentence(&entry.gap)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 impl IdempotencyObstacle {
@@ -1153,66 +1110,90 @@ impl IdempotencyObstacle {
         match self {
             Self::GoverningKeyInadmissible { defect } => governing_key_evidence(defect),
 
+            Self::PathDecisionUnstable {
+                path,
+                decision,
+                gap,
+            } => Evidence {
+                subject: None,
+                message: format!(
+                    "On {}, {} is not established to replay, so a retry may do \
+                     different work: {}.",
+                    describe_path(path),
+                    describe_decision(decision),
+                    decision_gap_sentence(gap)
+                ),
+            },
+
             Self::TransactionNotRetrySafe {
-                flow,
+                path,
                 transaction,
                 recovery,
                 reconstruction,
             } => Evidence {
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "A duplicate attempt re-drives flow `{flow}` and re-encounters \
+                    "A duplicate attempt re-drives {} and re-encounters \
                      `{transaction}`, which is retry-safe by neither route. \
                      Recovery: {}. Reconstruction: {}.",
+                    describe_path(path),
                     gap_sentences(recovery),
                     gap_sentences(reconstruction),
                 ),
             },
 
-            Self::ExternalEffectNotDeduplicated { flow, effect } => Evidence {
+            Self::ExternalEffectNotDeduplicated { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Flow `{flow}` executes external effect `{effect}`, which is \
-                     explicitly `not_deduplicated`: a duplicate execution is \
-                     distinguishable duplicate work at that boundary."
+                    "{} executes external effect `{effect}`, which is explicitly \
+                     `not_deduplicated`: a duplicate execution is distinguishable \
+                     duplicate work at that boundary.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalEffectDeduplicationUnknown { flow, effect } => Evidence {
+            Self::ExternalEffectDeduplicationUnknown { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Flow `{flow}` executes external effect `{effect}`, and no \
-                     deduplication fact is declared for that boundary."
+                    "{} executes external effect `{effect}`, and no deduplication \
+                     fact is declared for that boundary.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
-            Self::ExternalDeduplicationKeyUnstable { flow, effect, roots } => Evidence {
+            Self::ExternalDeduplicationKeyUnstable {
+                path,
+                effect,
+                roots,
+            } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "External effect `{effect}` in flow `{flow}` deduplicates by a \
-                     key that is not replay-stable, so attempts may execute under \
-                     different keys: {}.",
+                    "External effect `{effect}` on {} deduplicates by a key that is \
+                     not replay-stable, so attempts may execute under different \
+                     keys: {}.",
+                    describe_path(path),
                     unstable_roots(roots)
                 ),
             },
 
             Self::PublicationNotIdentified {
-                flow,
+                path,
                 effect,
                 topic,
                 schema,
             } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Flow `{flow}` publishes `{schema}` to `{topic}` through \
-                     `{effect}`, but the topic declares no message identity for \
-                     that schema, so duplicate publications are not established \
-                     to be the same logical message."
+                    "{} publishes `{schema}` to `{topic}` through `{effect}`, but the \
+                     topic declares no message identity for that schema, so \
+                     duplicate publications are not established to be the same \
+                     logical message.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
             Self::PublicationConsumerNotKeyed {
-                flow,
+                path,
                 effect,
                 topic,
                 schema,
@@ -1221,16 +1202,16 @@ impl IdempotencyObstacle {
             } => Evidence {
                 subject: Some(operation.clone()),
                 message: format!(
-                    "Flow `{flow}` publishes `{schema}` to `{topic}` through \
-                     `{effect}`, and `{operation}` consumes it through `{input}` \
-                     with no idempotency requirement keyed from that input; \
-                     nothing collapses the duplicate work a duplicate delivery \
-                     causes there."
+                    "{} publishes `{schema}` to `{topic}` through `{effect}`, and \
+                     `{operation}` consumes it through `{input}` with no idempotency \
+                     requirement keyed from that input; nothing collapses the \
+                     duplicate work a duplicate delivery causes there.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
             Self::PublicationConsumerRequirementUnproven {
-                flow,
+                path,
                 effect,
                 topic,
                 schema,
@@ -1239,42 +1220,49 @@ impl IdempotencyObstacle {
             } => Evidence {
                 subject: Some(operation.clone()),
                 message: format!(
-                    "Flow `{flow}` publishes `{schema}` to `{topic}` through \
-                     `{effect}`, and `{operation}` consumes it through `{input}`, \
-                     whose idempotency requirement is not proven in this \
-                     analysis, so the duplicate work a duplicate delivery causes \
-                     there is not established to collapse."
+                    "{} publishes `{schema}` to `{topic}` through `{effect}`, and \
+                     `{operation}` consumes it through `{input}`, whose idempotency \
+                     requirement is not proven in this analysis, so the duplicate \
+                     work a duplicate delivery causes there is not established to \
+                     collapse.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
-            Self::EffectInstanceUnspecified { flow, effect } => Evidence {
+            Self::EffectInstanceUnspecified { path, effect } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Flow `{flow}` executes `{effect}` with unspecified instance \
-                     provenance, so the instances attempts construct are not \
-                     class-fixed."
+                    "{} executes `{effect}` with unspecified instance provenance, so \
+                     the instances attempts construct are not class-fixed.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
-            Self::EffectInstanceRootUnstable { flow, effect, roots } => Evidence {
+            Self::EffectInstanceRootUnstable {
+                path,
+                effect,
+                roots,
+            } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "The instance `{effect}` constructs in flow `{flow}` depends \
-                     on roots that are not replay-stable: {}.",
+                    "The instance `{effect}` constructs on {} depends on roots that \
+                     are not replay-stable: {}.",
+                    describe_path(path),
                     unstable_roots(roots)
                 ),
             },
 
-            Self::IntentNotEstablished { flow, intent } => Evidence {
+            Self::IntentNotEstablished { path, intent } => Evidence {
                 subject: Some(intent.clone()),
                 message: format!(
-                    "Flow `{flow}` executes intent `{intent}`, but no earlier step \
-                     establishes it, so no class-fixed instance exists."
+                    "{} executes intent `{intent}`, but no earlier step establishes \
+                     it, so no class-fixed instance exists.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
             Self::IntentNotReplayAvailable {
-                flow,
+                path,
                 intent,
                 transaction,
                 recovery,
@@ -1282,58 +1270,69 @@ impl IdempotencyObstacle {
             } => Evidence {
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Intent `{intent}` in flow `{flow}` is established by \
-                     `{transaction}` but replay-available through neither route, \
-                     so a retry's instance may differ. Recovery: {}. \
-                     Reconstruction: {}.",
+                    "Intent `{intent}` on {} is established by `{transaction}` but \
+                     replay-available through neither route, so a retry's instance \
+                     may differ. Recovery: {}. Reconstruction: {}.",
+                    describe_path(path),
                     gap_sentences(recovery),
                     gap_sentences(reconstruction),
                 ),
             },
 
             Self::RequestSchemaMismatch {
-                flow,
+                path,
                 effect,
                 expected,
                 actual,
             } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Request effect `{effect}` in flow `{flow}` declares schema \
-                     `{actual}`, but the targeted input declares `{expected}`, so \
-                     payload equality does not transfer to the target's key."
+                    "Request effect `{effect}` on {} declares schema `{actual}`, but \
+                     the targeted input declares `{expected}`, so payload equality \
+                     does not transfer to the target's key.",
+                    describe_path(path)
                 ),
             },
 
             Self::RequestTargetHasNoKeyedRequirement {
-                flow,
+                path,
                 effect,
                 operation,
                 input,
             } => Evidence {
                 subject: Some(effect.clone()),
                 message: format!(
-                    "Request effect `{effect}` in flow `{flow}` targets \
-                     `{operation}` through `{input}`, which carries no idempotency \
-                     requirement keyed from that input; nothing collapses \
-                     duplicate invocations."
+                    "Request effect `{effect}` on {} targets `{operation}` through \
+                     `{input}`, which carries no idempotency requirement keyed from \
+                     that input; nothing collapses duplicate invocations.",
+                    describe_path(path)
                 ),
             },
 
             Self::RequestTargetRequirementUnproven {
-                flow,
+                path,
                 effect,
                 operation,
                 input,
             } => Evidence {
                 subject: Some(operation.clone()),
                 message: format!(
-                    "Request effect `{effect}` in flow `{flow}` targets \
-                     `{operation}` through `{input}`, whose idempotency \
-                     requirement is not proven in this analysis, so duplicate \
-                     invocations are not established to collapse."
+                    "Request effect `{effect}` on {} targets `{operation}` through \
+                     `{input}`, whose idempotency requirement is not proven in this \
+                     analysis, so duplicate invocations are not established to \
+                     collapse.",
+                    describe_path(path)
                 ),
             },
         }
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut characters = text.chars();
+
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }

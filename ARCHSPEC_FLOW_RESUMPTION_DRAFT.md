@@ -5,15 +5,19 @@
 **Date:** 2026-08-21
 **Scope:** How V1 discharges `completion: resumable` and `completion: guaranteed`; the crash-prefix analysis; retry drivers; what remains open.
 
+**Terminology note (2026-09-04).** `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` replaced the surface this document was written against. Read its retired terms as follows: an *invocation flow* is a *path of the operation program* (one arm taken at each `match_result` or `branch`, ending at a terminal), so *same-flow continuation* is *same-path continuation*; `FlowStep` is `OperationStep`; `InvocationResult`, `EstablishInvocationResult`, and `ValueSource::invocation_result` are `TransactionOutput`, `EstablishTransactionOutput`, and `transaction_output`; a `Response` / `ResponseSource` / `flow.response` is the `return` terminal constructing the `RequestInput.result` contract, and a flow with `response: null` is a path ending at `complete`; *response replay* is *result replay*; `ObjectHistoryRequirement::linearizable` is removed and deferred. The V1 rules below carry over unchanged **per admitted path** — a path ending at `complete` or at `return` for the triggering input — with each decision judged where it is taken; for this progress obligation a decision is never an obstacle (§3.3). See V3 §48.
+
 ---
 
 ## 1. The question and this document's scope
 
 A recoverability requirement obliges the logical invocation identified
-by its key to reach terminal execution of a declared flow (§9). The
-requirement deliberately does not name a flow, and which flows remain
-admissible for a resumed attempt after a partial execution is open
-question 7 of the revision draft.
+by its key to reach terminal execution of a declared flow (§9) — since
+2026-09-04, a valid terminal of the operation program, `return` or
+`complete` (V3 §37). The requirement deliberately does not name a
+flow, and which flows (now: paths) remain admissible for a resumed
+attempt after a partial execution is open question 7 of the revision
+draft.
 
 This document does not answer question 7. It adopts a **sufficient**
 V1 route that does not prejudge it:
@@ -43,15 +47,18 @@ empty by declaration (a subscription admitting no message schemas)
 discharges the obligation vacuously.
 
 The flows analyzed for a population triggered by input `i` are the
-flows an `i`-invocation can complete:
+flows an `i`-invocation can complete — since 2026-09-04, the *paths*
+of the operation program an `i`-invocation can complete:
 
-- flows with `response: null`, and
-- flows whose response is declared for `i` itself.
+- flows with `response: null` — now paths ending at `complete`, and
+- flows whose response is declared for `i` itself — now paths ending
+  at `return` for `i`.
 
-A flow terminating with another request input's response is not a path
-an `i`-invocation can complete, and is outside the analysis. If no
-admitted flow exists, the obligation cannot be discharged: the
-population has no terminal path at all.
+A flow terminating with another request input's response — a path
+ending at `return` for another input — is not a path an
+`i`-invocation can complete, and is outside the analysis. If no
+admitted path exists, the obligation cannot be discharged: the
+population has no terminal path at all (`NoAdmittedPath`).
 
 ---
 
@@ -71,7 +78,8 @@ completion exactly when the following hold.
 
 For every transaction step that can be followed by a failing prefix —
 every transaction step, except one that is the flow's final step in a
-flow with no declared response — the resumed attempt re-encounters a
+flow with no declared response (now: the final step of a path ending
+at `complete`) — the resumed attempt re-encounters a
 transaction the prior attempt may already have committed. Per §9, the
 re-encounter must resolve:
 
@@ -90,11 +98,12 @@ unresolvable and the obligation as unproven. This is a progress
 obligation refusing to be discharged by a safety violation.
 
 The final-step exemption is exact: a transaction that is the last step
-of a response-less flow has no failing prefix after it. If the attempt
-crashed after that commit, the invocation already reached terminal
-execution; there is nothing to resume. When a response is declared,
-the response's resolution follows the last step, so every transaction
-in the flow needs re-encounter resolution.
+of a response-less flow (a path ending at `complete`) has no failing
+prefix after it. If the attempt crashed after that commit, the
+invocation already reached terminal execution; there is nothing to
+resume. When a response is declared — when the path ends at `return`
+— the result's construction and return follow the last step, so every
+transaction on the path needs re-encounter resolution.
 
 ### 3.2 Consumed artifacts are replay-available
 
@@ -109,13 +118,15 @@ different artifact is not continuing the same invocation.
 Consumption means:
 
 - an `execute_effect_intent` step — the intent must also have been
-  established at all, by a step earlier in the flow; a flow that
+  established at all, by a step earlier on the path; a path that
   executes an intent nothing establishes cannot proceed on any
   attempt;
-- a declared response sourced from an invocation result;
-- any `invocation_result` reference inside a later transaction's body
-  — selectors, mutation derivations, artifact derivations, transition
-  effect values — or inside a flow-level `execute_effect` derivation.
+- a declared response sourced from an invocation result — now a
+  `return` whose outcome derivation references a `transaction_output`;
+- any `invocation_result` (now `transaction_output`) reference inside
+  a later transaction's body — selectors, mutation derivations,
+  artifact derivations, transition effect values — or inside a
+  program-level `execute_effect` derivation.
 
 References to an artifact established earlier **in the same
 transaction** impose nothing: atomicity means a resumed attempt either
@@ -123,18 +134,28 @@ re-executes the whole body fresh or resolves the whole prior commit.
 A transaction's own commit key is judged by the re-encounter analysis
 of §3.1 and is not double-counted here.
 
-A response whose source is `unspecified` imposes no artifact
-condition: recoverability is progress, and the model declares no
-consumption for such a response. Its replay *stability* is a separate
-obligation with its own analysis.
+A response whose source is `unspecified` — a `return` whose outcome
+derivation is `unspecified` — imposes no artifact condition:
+recoverability is progress, and the model declares no consumption for
+such a result. Its replay *stability* is a separate obligation (result
+replay) with its own analysis.
 
 ### 3.3 Nothing else blocks
 
 The third §9 bullet — no step left in a state from which the flow
 cannot proceed — is discharged by construction in V1: transactions are
 atomic, effect executions can be re-attempted (their duplicate-safety
-is idempotency's concern, deliberately separate), and consuming an
-artifact does not remove it from the invocation's context.
+is idempotency's concern, deliberately separate) and re-observed, and
+consuming an artifact does not remove it from the invocation's context.
+
+*(Added 2026-09-04.)* A decision — a `match_result` or `branch` — is
+likewise never an obstacle to progress. A retry that is not
+established to take the same arm follows some other admitted path,
+which is analyzed on its own; that the two paths do different work is
+idempotency's concern (V3 §30, §48.2), not recoverability's. This is
+why `transcode_video` in the video-streaming fixture is recoverable
+while its idempotency is unproven: the match on the external engine's
+result may go either way on retry, but each arm resumes.
 
 ---
 
@@ -176,11 +197,12 @@ and the model has not supplied it.
 
 ## 5. Worked outcomes on the flash-checkout fixture
 
-- **`create_order`** (`resumable`): its only flow re-encounters
-  `tx.create_order.new`, which resolves by keyed commit — the commit
-  key is the governing key itself. The publication intent and the
-  invocation result are recovered from the same commit, and the
-  response resolves the recovered result. **Proven.**
+- **`create_order`** (`resumable`): its only path (the program has no
+  decisions) re-encounters `tx.create_order.new`, which resolves by
+  keyed commit — the commit key is the governing key itself. The
+  publication intent and the transaction output `output.create_order`
+  are recovered from the same commit, and the `return` derives its
+  `Ok` payload from the recovered output. **Proven.**
 - **`apply_payment`** (`guaranteed`): the transition transaction
   resolves by keyed commit over the stable `event_id`; the
   transition-established intent is recovered; the triggering
@@ -200,8 +222,8 @@ and the model has not supplied it.
 ## 6. What V1 deliberately does not infer
 
 1. **Alternative-flow continuation.** Question 7 remains open. V1
-   neither uses another flow as a continuation nor forbids a future
-   solver from doing so.
+   neither uses another flow (now: path) as a continuation nor
+   forbids a future solver from doing so.
 2. **Bounded liveness.** No retry count, backoff, or eventual-success
    fact exists in the DSL; `guaranteed` proofs are conditional on the
    driver abstraction.
@@ -227,3 +249,14 @@ Executed 2026-08-21:
    the V1 sufficient-route stance and a pointer here.
 3. **Implementation**: `analyzer::verification::recoverability`,
    reusing the replay engine.
+
+Revised 2026-09-04: the operation-execution revision
+(`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`, §48) replaced
+flows with one operation program. The same-flow route is now
+same-path continuation over the paths of the program admitted for the
+triggering input; the final-step exemption applies to a
+`complete`-terminated path, a `return` needs every transaction
+resolved, consumed artifacts include the `return` outcome's
+transaction outputs, and decisions are never an obstacle (§3.3). The
+terminology note after the status block maps the retired vocabulary.
+Verdicts on the flash-checkout fixture are unchanged (§5).

@@ -18,11 +18,12 @@ pub enum ReferenceKind {
     Input,
     Effect,
     EffectIntent,
-    InvocationResult,
-    Response,
+    TransactionOutput,
     Transaction,
     TransactionRead,
-    InvocationFlow,
+
+    /// A result binding declared by an effect-executing program step.
+    EffectResult,
 }
 
 impl fmt::Display for ReferenceKind {
@@ -44,11 +45,10 @@ impl fmt::Display for ReferenceKind {
             Self::Input => "input",
             Self::Effect => "effect",
             Self::EffectIntent => "effect intent",
-            Self::InvocationResult => "invocation result",
-            Self::Response => "response",
+            Self::TransactionOutput => "transaction output",
             Self::Transaction => "transaction",
             Self::TransactionRead => "transaction read",
-            Self::InvocationFlow => "invocation flow",
+            Self::EffectResult => "effect result binding",
         };
 
         f.write_str(name)

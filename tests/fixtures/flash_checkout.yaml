@@ -1,3 +1,14 @@
+# A flash-sale checkout: create an order, reserve stock, charge the
+# card, apply the payment — every hand-off an identified event on one
+# keyed topic.
+#
+# The model keeps four deliberate gaps, and the checker reports each:
+# tx.reserve_inventory is not deduplicated and its write depends on a
+# read, so reserve_inventory is neither idempotent nor recoverable;
+# the card charge is explicitly not deduplicated and nothing makes the
+# provider's returned result replay-consistent, so charge_payment's
+# branch on it is not established to replay; and create_order's
+# idempotency is unknown through the cascade those consumers start.
 revision: 1
 services:
   service.checkout:
@@ -47,6 +58,24 @@ schemas:
     completeness: complete
     fields:
       accepted: bool
+  schema.RequestRejected:
+    kind: canonical
+    description: The err payload of a request the boundary refused.
+    completeness: complete
+    fields:
+      reason: string
+  schema.ChargeAccepted:
+    kind: canonical
+    description: The payment provider's ok payload.
+    completeness: complete
+    fields:
+      authorization_id: string
+  schema.ChargeDeclined:
+    kind: canonical
+    description: The payment provider's err payload.
+    completeness: complete
+    fields:
+      reason: string
   schema.OrderCreated:
     kind: canonical
     completeness: complete
@@ -74,6 +103,13 @@ schemas:
       event_id: string
       order_id: uuid
       amount: decimal
+  schema.PaymentFailed:
+    kind: canonical
+    completeness: complete
+    fields:
+      event_id: string
+      order_id: uuid
+      reason: string
   schema.OrderCancelled:
     kind: canonical
     completeness: complete
@@ -108,9 +144,6 @@ data_models:
         schema: schema.OrderRecord
         identity:
         - order_id
-        requirements:
-          history:
-          - linearizable
   data.inventory:
     objects:
       object.stock:
@@ -118,9 +151,6 @@ data_models:
         identity:
         - warehouse_id
         - sku
-        requirements:
-          history:
-          - linearizable
 topics:
   topic.order_events:
     messages:
@@ -129,6 +159,7 @@ topics:
     - schema.OrderCreated
     - schema.OrderPaid
     - schema.PaymentCaptured
+    - schema.PaymentFailed
     ordering:
       kind: keyed
       mapping:
@@ -137,6 +168,7 @@ topics:
         schema.OrderCreated: order_id
         schema.OrderPaid: order_id
         schema.PaymentCaptured: order_id
+        schema.PaymentFailed: order_id
     message_identity:
       kind: keyed
       mapping:
@@ -149,6 +181,8 @@ topics:
         schema.OrderPaid:
         - event_id
         schema.PaymentCaptured:
+        - event_id
+        schema.PaymentFailed:
         - event_id
 state_machines:
   machine.order_lifecycle:
@@ -189,6 +223,9 @@ operations:
           kind: keyed
           fields:
           - idempotency_key
+        result:
+          ok: schema.CreateOrderResponse
+          err: schema.RequestRejected
     effects:
       effect.create_order.publish_created:
         kind: publication
@@ -206,16 +243,9 @@ operations:
     effect_intents:
       intent.create_order.publish_created:
         effect: effect.create_order.publish_created
-    invocation_results:
-      result.create_order:
+    transaction_outputs:
+      output.create_order:
         schema: schema.CreateOrderResponse
-    responses:
-      response.create_order:
-        request: input.create_order.request
-        schema: schema.CreateOrderResponse
-        source:
-          kind: invocation_result
-          result: result.create_order
     transactions:
       tx.create_order.new:
         data_model: data.checkout
@@ -245,21 +275,40 @@ operations:
               path: order_id
             - source: input:input.create_order.request
               path: idempotency_key
-        - kind: establish_invocation_result
-          result: result.create_order
+            - source: input:input.create_order.request
+              path: warehouse_id
+            - source: input:input.create_order.request
+              path: sku
+            - source: input:input.create_order.request
+              path: quantity
+            - source: input:input.create_order.request
+              path: amount
+        # status is the constant initial state, so the only provenance
+        # root is the order id.
+        - kind: establish_transaction_output
+          output: output.create_order
           values:
             kind: deterministic
             from:
             - source: input:input.create_order.request
               path: order_id
-    flows:
-      flow.create_order.new:
-        steps:
-        - kind: transaction
-          transaction: tx.create_order.new
-        - kind: execute_effect_intent
-          intent: intent.create_order.publish_created
-        response: response.create_order
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.create_order.new
+      - kind: execute_effect_intent
+        intent: intent.create_order.publish_created
+      - kind: return
+        request: input.create_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: transaction_output:output.create_order
+              path: order_id
+            - source: transaction_output:output.create_order
+              path: status
     requirements:
       serialization: []
       ordering: []
@@ -268,7 +317,7 @@ operations:
           components:
           - source: input:input.create_order.request
             path: idempotency_key
-        response: replay_consistent
+        result: replay_consistent
       recoverability:
       - key:
           components:
@@ -312,8 +361,7 @@ operations:
     effect_intents:
       intent.reserve_inventory.publish_reserved:
         effect: effect.reserve_inventory.publish_reserved
-    invocation_results: {}
-    responses: {}
+    transaction_outputs: {}
     transactions:
       tx.reserve_inventory:
         data_model: data.inventory
@@ -377,14 +425,21 @@ operations:
               path: order_id
             - source: input:input.reserve_inventory.created
               path: event_id
-    flows:
-      flow.reserve_inventory:
-        steps:
-        - kind: transaction
-          transaction: tx.reserve_inventory
-        - kind: execute_effect_intent
-          intent: intent.reserve_inventory.publish_reserved
-        response: null
+            - source: input:input.reserve_inventory.created
+              path: warehouse_id
+            - source: input:input.reserve_inventory.created
+              path: sku
+            - source: input:input.reserve_inventory.created
+              path: quantity
+            - source: input:input.reserve_inventory.created
+              path: amount
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.reserve_inventory
+      - kind: execute_effect_intent
+        intent: intent.reserve_inventory.publish_reserved
+      - kind: complete
     requirements:
       serialization:
       - key:
@@ -399,7 +454,7 @@ operations:
           components:
           - source: input:input.reserve_inventory.created
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability:
       - key:
           components:
@@ -411,7 +466,7 @@ operations:
         kind: unbounded
   operation.charge_payment:
     service: service.payments
-    description: Charge the card after inventory reservation.
+    description: Charge the card after inventory reservation, announcing the capture or the decline.
     inputs:
       input.charge_payment.reserved:
         kind: subscription
@@ -432,6 +487,9 @@ operations:
         name: payment-provider.charge
         idempotency:
           kind: not_deduplicated
+        result:
+          ok: schema.ChargeAccepted
+          err: schema.ChargeDeclined
       effect.charge_payment.publish_captured:
         kind: publication
         topic: topic.order_events
@@ -445,29 +503,61 @@ operations:
             components:
             - source: effect:effect.charge_payment.publish_captured
               path: event_id
-    effect_intents: {}
-    invocation_results: {}
-    responses: {}
-    transactions: {}
-    flows:
-      flow.charge_payment:
-        steps:
-        - kind: execute_effect
-          effect: effect.charge_payment.card
-          values:
-            kind: unspecified
-        - kind: execute_effect
-          effect: effect.charge_payment.publish_captured
-          values:
-            kind: deterministic
-            from:
+      # No modeled operation consumes PaymentFailed; the err arm exists
+      # to observe the provider's declined outcome.
+      effect.charge_payment.publish_failed:
+        kind: publication
+        topic: topic.order_events
+        schema: schema.PaymentFailed
+        idempotency_key_propagation:
+        - source:
+            components:
             - source: input:input.charge_payment.reserved
               path: event_id
-            - source: input:input.charge_payment.reserved
-              path: order_id
-            - source: input:input.charge_payment.reserved
-              path: amount
-        response: null
+          target:
+            components:
+            - source: effect:effect.charge_payment.publish_failed
+              path: event_id
+    effect_intents: {}
+    transaction_outputs: {}
+    transactions: {}
+    program:
+      steps:
+      - kind: execute_effect
+        effect: effect.charge_payment.card
+        values:
+          kind: unspecified
+        result: result.charge_payment.card
+      - kind: match_result
+        result: result.charge_payment.card
+        ok:
+          steps:
+          - kind: execute_effect
+            effect: effect.charge_payment.publish_captured
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.charge_payment.reserved
+                path: event_id
+              - source: input:input.charge_payment.reserved
+                path: order_id
+              - source: input:input.charge_payment.reserved
+                path: amount
+          - kind: complete
+        err:
+          steps:
+          - kind: execute_effect
+            effect: effect.charge_payment.publish_failed
+            values:
+              kind: deterministic
+              from:
+              - source: input:input.charge_payment.reserved
+                path: event_id
+              - source: input:input.charge_payment.reserved
+                path: order_id
+              - source: effect_result_err:result.charge_payment.card
+                path: reason
+          - kind: complete
     requirements:
       serialization:
       - key:
@@ -482,7 +572,7 @@ operations:
           components:
           - source: input:input.charge_payment.reserved
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability: []
     execution:
       concurrency:
@@ -496,6 +586,9 @@ operations:
         schema: schema.CancelOrderRequest
         identity:
           kind: unspecified
+        result:
+          ok: schema.CancelOrderResponse
+          err: schema.RequestRejected
     effects:
       effect.cancel_order.publish_cancelled:
         kind: publication
@@ -505,23 +598,17 @@ operations:
     effect_intents:
       intent.cancel_order.publish_cancelled:
         effect: effect.cancel_order.publish_cancelled
-    invocation_results: {}
-    responses:
-      response.cancel_order:
-        request: input.cancel_order.request
-        schema: schema.CancelOrderResponse
-        source:
-          kind: unspecified
+    transaction_outputs: {}
     transactions:
       tx.cancel_order:
         data_model: data.checkout
         isolation: read_committed
+        # A transition transaction needs no keyed commit when nothing
+        # declares a retry obligation over it: cancel_order carries no
+        # idempotency or recoverability requirement, so the blocked
+        # natural-replay route costs no proof (Amendment A).
         idempotency:
-          kind: deduplicated_by
-          key:
-            components:
-            - source: input:input.cancel_order.request
-              path: order_id
+          kind: unspecified
         steps:
         - kind: transition
           machine: machine.order_lifecycle
@@ -542,14 +629,21 @@ operations:
             from:
             - source: input:input.cancel_order.request
               path: order_id
-    flows:
-      flow.cancel_order:
-        steps:
-        - kind: transaction
-          transaction: tx.cancel_order
-        - kind: execute_effect_intent
-          intent: intent.cancel_order.publish_cancelled
-        response: response.cancel_order
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.cancel_order
+      - kind: execute_effect_intent
+        intent: intent.cancel_order.publish_cancelled
+      - kind: return
+        request: input.cancel_order.request
+        outcome:
+          kind: ok
+          values:
+            kind: deterministic
+            from:
+            - source: input:input.cancel_order.request
+              path: order_id
     requirements:
       serialization: []
       ordering: []
@@ -579,8 +673,7 @@ operations:
     effect_intents:
       intent.apply_payment.order_paid:
         effect: effect.order.paid
-    invocation_results: {}
-    responses: {}
+    transaction_outputs: {}
     transactions:
       tx.apply_payment:
         data_model: data.checkout
@@ -625,14 +718,13 @@ operations:
                 path: order_id
               - source: input:input.apply_payment.captured
                 path: event_id
-    flows:
-      flow.apply_payment:
-        steps:
-        - kind: transaction
-          transaction: tx.apply_payment
-        - kind: execute_effect_intent
-          intent: intent.apply_payment.order_paid
-        response: null
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.apply_payment
+      - kind: execute_effect_intent
+        intent: intent.apply_payment.order_paid
+      - kind: complete
     requirements:
       serialization:
       - key:
@@ -647,7 +739,7 @@ operations:
           components:
           - source: input:input.apply_payment.captured
             path: event_id
-        response: unspecified
+        result: unspecified
       recoverability:
       - key:
           components:
@@ -666,15 +758,12 @@ operations:
         schema: schema.TransferStockRequest
         identity:
           kind: unspecified
+        result:
+          ok: schema.TransferStockResponse
+          err: schema.RequestRejected
     effects: {}
     effect_intents: {}
-    invocation_results: {}
-    responses:
-      response.transfer_stock:
-        request: input.transfer_stock.request
-        schema: schema.TransferStockResponse
-        source:
-          kind: unspecified
+    transaction_outputs: {}
     transactions:
       tx.transfer_stock:
         data_model: data.inventory
@@ -792,12 +881,16 @@ operations:
           - on_hand
           values:
             kind: unspecified
-    flows:
-      flow.transfer_stock:
-        steps:
-        - kind: transaction
-          transaction: tx.transfer_stock
-        response: response.transfer_stock
+    program:
+      steps:
+      - kind: transaction
+        transaction: tx.transfer_stock
+      - kind: return
+        request: input.transfer_stock.request
+        outcome:
+          kind: ok
+          values:
+            kind: unspecified
     requirements:
       serialization: []
       ordering: []

@@ -160,7 +160,12 @@ pub enum TypeRef {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case", rename = "TypeRef")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    rename = "TypeRef"
+)]
 enum TypeRefLong {
     Scalar(ScalarType),
     Schema(Id),

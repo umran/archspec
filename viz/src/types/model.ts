@@ -54,7 +54,6 @@ export interface DataModel {
 export interface DataObject {
   schema: Id;
   identity: FieldPath[];
-  requirements: { history: "linearizable"[] };
 }
 
 export type TopicOrdering =
@@ -93,9 +92,11 @@ export type TransitionSideEffect =
 export type ValueSourceKind =
   | "input"
   | "effect"
-  | "invocation_result"
+  | "transaction_output"
   | "state_machine_subject"
-  | "transaction_read";
+  | "transaction_read"
+  | "effect_result_ok"
+  | "effect_result_err";
 
 export interface ValueSource {
   kind: ValueSourceKind;
@@ -125,6 +126,15 @@ export type IdempotencyGuarantee =
   | { kind: "not_deduplicated" }
   | { kind: "deduplicated_by"; key: IdempotencyKey };
 
+/** A first-class `Result<Ok, Err>` contract: two schemas, exactly one
+ *  of which shapes a given outcome. */
+export interface ResultType {
+  ok: Id;
+  err: Id;
+}
+
+export type ResultVariant = "ok" | "err";
+
 export interface PublicationEffect {
   topic: Id;
   schema: Id;
@@ -141,6 +151,8 @@ export interface RequestEffect {
 export interface ExternalEffect {
   name: string;
   idempotency: IdempotencyGuarantee;
+  /** The synchronous result the boundary returns; null when none is modeled. */
+  result: ResultType | null;
 }
 
 export type Effect =
@@ -168,7 +180,7 @@ export type DispatchRouting =
   | "by_topic_key";
 
 export type Input =
-  | { kind: "request"; schema: Id; identity: RequestIdentity }
+  | { kind: "request"; schema: Id; identity: RequestIdentity; result: ResultType }
   | {
       kind: "subscription";
       topic: Id;
@@ -176,12 +188,6 @@ export type Input =
       delivery: DeliverySemantics;
       dispatch: { routing: DispatchRouting; lane_concurrency: Concurrency };
     };
-
-export interface Response {
-  request: Id;
-  schema: Id;
-  source: { kind: "unspecified" } | { kind: "invocation_result"; result: Id };
-}
 
 export type Literal =
   | { kind: "string"; value: string }
@@ -222,7 +228,7 @@ export type TransactionStep =
       effect_values: Record<Id, Derivation>;
     }
   | { kind: "establish_effect_intent"; intent: Id; values: Derivation }
-  | { kind: "establish_invocation_result"; result: Id; values: Derivation };
+  | { kind: "establish_transaction_output"; output: Id; values: Derivation };
 
 export interface Transaction {
   data_model: Id | null;
@@ -231,20 +237,37 @@ export interface Transaction {
   steps: TransactionStep[];
 }
 
-export type FlowStep =
-  | { kind: "transaction"; transaction: Id }
-  | { kind: "execute_effect"; effect: Id; values: Derivation }
-  | { kind: "execute_effect_intent"; intent: Id };
+/** The predicate of a branch: deterministic over the references it
+ *  exposes, except `unspecified`. */
+export type Condition =
+  | { kind: "unspecified" }
+  | { kind: "eq"; value: ValueRef; equals: SelectorValue }
+  | { kind: "and"; conditions: Condition[] }
+  | { kind: "not"; condition: Condition };
 
-export interface InvocationFlow {
-  steps: FlowStep[];
-  response: Id | null;
+export type ResultOutcome =
+  | { kind: "ok"; values: Derivation }
+  | { kind: "err"; values: Derivation };
+
+export interface OperationBlock {
+  steps: OperationStep[];
 }
+
+export type OperationStep =
+  | { kind: "transaction"; transaction: Id }
+  | { kind: "execute_effect"; effect: Id; values: Derivation; result: Id | null }
+  | { kind: "execute_effect_intent"; intent: Id; result: Id | null }
+  | { kind: "match_result"; result: Id; ok: OperationBlock; err: OperationBlock }
+  | { kind: "branch"; condition: Condition; then: OperationBlock; otherwise: OperationBlock | null }
+  | { kind: "return"; request: Id; outcome: ResultOutcome }
+  | { kind: "complete" };
+
+export type ResultReplayRequirement = "unspecified" | "replay_consistent";
 
 export interface OperationRequirements {
   serialization: { key: ValueRef }[];
   ordering: { key: ValueRef }[];
-  idempotency: { key: IdempotencyKey; response: "unspecified" | "replay_consistent" }[];
+  idempotency: { key: IdempotencyKey; result: ResultReplayRequirement }[];
   recoverability: { key: IdempotencyKey; completion: "resumable" | "guaranteed" }[];
 }
 
@@ -256,10 +279,9 @@ export interface Operation {
   inputs: Record<Id, Input>;
   effects: Record<Id, Effect>;
   effect_intents: Record<Id, { effect: Id }>;
-  invocation_results: Record<Id, { schema: Id }>;
-  responses: Record<Id, Response>;
+  transaction_outputs: Record<Id, { schema: Id }>;
   transactions: Record<Id, Transaction>;
-  flows: Record<Id, InvocationFlow>;
+  program: OperationBlock;
   requirements: OperationRequirements;
   execution: { concurrency: Concurrency };
 }

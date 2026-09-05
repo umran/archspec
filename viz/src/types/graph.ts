@@ -34,7 +34,8 @@ export interface OperationNode {
   service: Id;
   description: string | null;
   inputs: number;
-  flows: number;
+  /** Steps of the operation program, nested ones included. */
+  steps: number;
   machines: Id[];
   requirements: RequirementBadges;
   concurrency: string;
@@ -74,7 +75,8 @@ export type Edge = EdgeBase &
         effect: Id;
         schema: Id;
         via_transition: TransitionKey | null;
-        executed_by: Id[];
+        /** Program steps executing the effect, as step locations. */
+        executed_at: string[];
       }
     | {
         kind: "subscribe";
@@ -93,14 +95,14 @@ export type Edge = EdgeBase &
         schema: Id;
         retry: string;
         via_transition: TransitionKey | null;
-        executed_by: Id[];
+        executed_at: string[];
       }
     | {
         kind: "external";
         operation: Id;
         effect: Id;
         idempotency: string;
-        executed_by: Id[];
+        executed_at: string[];
       }
     | { kind: "client"; operation: Id; input: Id; schema: Id }
   );

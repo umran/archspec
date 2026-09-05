@@ -1,40 +1,44 @@
 //! Verification of recoverability requirements (§9 of the semantics
 //! contract; `ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`).
 //!
-//! > The logical invocation identified by the key must reach terminal
-//! > execution of a declared flow.
+//! > The logical invocation identified by the key must reach a valid
+//! > terminal of the operation program — `return` or `complete` —
+//! > after any modeled interruption.
 //!
 //! Recoverability is a progress obligation, deliberately separate
 //! from idempotency's safety obligation. V1 discharges it by
-//! **same-flow continuation**: for every prefix at which an attempt
-//! may fail, re-driving the same flow from its first step reaches the
-//! flow's terminal completion. This is a sufficient route that does
-//! not prejudge revision question 7 (which *other* flows a resumed
-//! attempt may take).
+//! **same-path continuation**: for every prefix at which an attempt
+//! may fail, re-driving the same path of the program from its first
+//! step reaches the path's terminal. This is a sufficient route that
+//! does not prejudge revision question 7 (which *other* paths a
+//! resumed attempt may take). A decision a retry is not established
+//! to take the same way is no obstacle to progress: whichever
+//! admitted path it then follows is analyzed on its own, and the
+//! difference in work is idempotency's concern.
 //!
 //! The population is the attempt class of the requirement's governing
-//! key (§12), and the analyzed flows are those an invocation of the
-//! triggering input can complete: flows with no response, or flows
-//! whose response is declared for that input.
+//! key (§12), and the analyzed paths are those an invocation of the
+//! triggering input can complete: paths ending at `complete`, or at a
+//! `return` for that input.
 //!
-//! Per admitted flow, three conditions establish the continuation:
+//! Per admitted path, three conditions establish the continuation:
 //!
 //! 1. every committed transaction resolves on re-encounter — by keyed
 //!    commit over a stable key, or by natural replay — except a
-//!    transaction that is the final step of a response-less flow,
-//!    after which no failing prefix exists;
+//!    transaction that is the final step of a path ending at
+//!    `complete`, after which no failing prefix exists;
 //! 2. every artifact a later step consumes is replay-available by
 //!    route A or route B of §17, judged by the replay engine —
-//!    including intents the flow executes (which must be established
-//!    at all), invocation results referenced by later transaction
-//!    bodies or flow-level effect derivations, and the result a
-//!    declared response resolves; references within the establishing
+//!    including intents the path executes (which must be established
+//!    at all), transaction outputs referenced by later transaction
+//!    bodies or effect derivations, and the outputs the terminal
+//!    result is derived from; references within the establishing
 //!    transaction itself are exempt by atomicity, and a commit key is
 //!    judged by condition 1, not double-counted here;
 //! 3. nothing else blocks, by construction: transactions are atomic,
 //!    effect executions can be re-attempted (their duplicate-safety
-//!    is idempotency's concern), and consumption does not remove an
-//!    artifact from the context.
+//!    is idempotency's concern) and re-observed, and consumption does
+//!    not remove an artifact from the context.
 //!
 //! Re-executing a committed transaction that resolves by neither
 //! route is not a continuation of the same logical invocation, so V1
@@ -55,14 +59,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Evidence, Severity, VerificationCode};
 use crate::spec::{
-    CompletionRequirement, DeliverySemantics, Derivation, Effect, FlowStep, Id, IdempotencyKey,
-    Input, InvocationFlow, Model, Operation, ResponseSource, RetrySemantics, TransactionStep,
-    TransitionSideEffect, ValueRef, ValueSource,
+    CompletionRequirement, DeliverySemantics, Effect, Id, IdempotencyKey, Input, Model, Operation,
+    RetrySemantics, TransactionStep, TransitionSideEffect, ValueSource,
 };
 
-use super::describe::{gap_sentences, governing_key_evidence};
+use super::describe::{describe_path, gap_sentences, governing_key_evidence};
+use super::paths::{Path, PathRef, Terminal, paths};
 use super::replay::{
-    ArtifactReplay, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StableRoot, predicate_roots,
+    ArtifactReplay, EffectSite, GoverningKeyDefect, ReplayAnalysis, ReplayGap, StableRoot,
+    TracedStep,
 };
 use super::trigger::collapses_duplicates;
 
@@ -90,8 +95,12 @@ pub struct RecoverabilityCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecoverabilityVerdict {
-    Proven { proof: RecoverabilityProof },
-    Unproven { obstacles: Vec<RecoverabilityObstacle> },
+    Proven {
+        proof: RecoverabilityProof,
+    },
+    Unproven {
+        obstacles: Vec<RecoverabilityObstacle>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,24 +110,24 @@ pub enum RecoverabilityProof {
     /// attempt can bear the key.
     NoAdmittedInvocations { input: Id },
 
-    /// Every admitted flow resumes from every failing prefix.
-    Resumable { flows: Vec<FlowResumption> },
+    /// Every admitted path resumes from every failing prefix.
+    Resumable { paths: Vec<PathResumption> },
 
     /// Resumable, and a modeled driver re-drives interrupted
     /// invocations.
     Guaranteed {
         driver: RetryDriver,
-        flows: Vec<FlowResumption>,
+        paths: Vec<PathResumption>,
     },
 }
 
-/// The same-flow continuation argument for one admitted flow.
+/// The same-path continuation argument for one admitted path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FlowResumption {
-    pub flow: Id,
+pub struct PathResumption {
+    pub path: PathRef,
 
-    /// Re-encounter resolution per transaction step, in flow order.
+    /// Re-encounter resolution per transaction step, in path order.
     pub transactions: Vec<TransactionResolution>,
 
     /// Every artifact a later step consumes, with its replay route.
@@ -143,9 +152,9 @@ pub enum Resolution {
     /// replayable body.
     NaturalReplay,
 
-    /// The transaction is the final step of a response-less flow: no
-    /// failing prefix follows its commit, so it is never
-    /// re-encountered by a resumption.
+    /// The transaction is the final step of a path ending at
+    /// `complete`: no failing prefix follows its commit, so it is
+    /// never re-encountered by a resumption.
     TerminalStep,
 }
 
@@ -183,14 +192,18 @@ pub enum RecoverabilityObstacle {
     /// (§12).
     GoverningKeyInadmissible { defect: GoverningKeyDefect },
 
-    /// No declared flow is completable by invocations of the
+    /// No path of the program is completable by invocations of the
     /// triggering input.
-    NoAdmittedFlow { input: Id },
+    NoAdmittedPath { input: Id },
+
+    /// The path falls off the end of the program without a terminal.
+    /// Validation rejects the shape; verification records it.
+    PathNotTerminated { path: PathRef },
 
     /// A committed transaction the resumption re-encounters resolves
     /// by neither route.
     TransactionNotResolvable {
-        flow: Id,
+        path: PathRef,
         transaction: Id,
         recovery: Vec<ReplayGap>,
         reconstruction: Vec<ReplayGap>,
@@ -198,14 +211,14 @@ pub enum RecoverabilityObstacle {
 
     /// A later step consumes an artifact no earlier step establishes.
     ArtifactNotEstablished {
-        flow: Id,
+        path: PathRef,
         artifact: Id,
         consumer: Id,
     },
 
     /// A consumed artifact is replay-available through neither route.
     ArtifactNotReplayAvailable {
-        flow: Id,
+        path: PathRef,
         artifact: Id,
         transaction: Id,
         recovery: Vec<ReplayGap>,
@@ -237,7 +250,10 @@ pub enum RecoverabilityNote {
 }
 
 /// Checks every recoverability requirement declared by the model.
-pub fn check(model: &Model) -> Vec<RecoverabilityCheck> {
+/// `consistent` names the `(operation, input)` pairs whose result
+/// replay is proven, which a commit key or mutation resting on a
+/// request effect's result depends on.
+pub fn check(model: &Model, consistent: &BTreeSet<(Id, Id)>) -> Vec<RecoverabilityCheck> {
     let mut checks = Vec::new();
 
     for (operation_id, operation) in &model.operations {
@@ -248,6 +264,7 @@ pub fn check(model: &Model) -> Vec<RecoverabilityCheck> {
                 operation,
                 &requirement.key,
                 requirement.completion,
+                consistent,
             );
 
             checks.push(RecoverabilityCheck {
@@ -270,8 +287,9 @@ fn check_requirement(
     operation: &Operation,
     key: &IdempotencyKey,
     completion: CompletionRequirement,
+    consistent: &BTreeSet<(Id, Id)>,
 ) -> (RecoverabilityVerdict, Vec<RecoverabilityNote>) {
-    let analysis = match ReplayAnalysis::new(model, operation, key) {
+    let analysis = match ReplayAnalysis::new(model, operation, key, consistent) {
         Ok(analysis) => analysis,
 
         Err(defect) => {
@@ -295,34 +313,27 @@ fn check_requirement(
         );
     }
 
-    // Flows an invocation of the triggering input can complete.
-    let admitted: Vec<_> = operation
-        .flows
-        .iter()
-        .filter(|(_, flow)| match &flow.response {
-            None => true,
+    // Paths an invocation of the triggering input can complete.
+    let all = paths(&operation.program);
 
-            Some(response) => operation
-                .responses
-                .get(response)
-                .is_none_or(|response| &response.request == analysis.input()),
-        })
+    let admitted: Vec<&Path<'_>> = all
+        .iter()
+        .filter(|path| path.admitted_for(analysis.input()))
         .collect();
 
     let mut obstacles = Vec::new();
 
     if admitted.is_empty() {
-        obstacles.push(RecoverabilityObstacle::NoAdmittedFlow {
+        obstacles.push(RecoverabilityObstacle::NoAdmittedPath {
             input: analysis.input().clone(),
         });
     }
 
-    let mut flows = Vec::new();
+    let mut resumptions = Vec::new();
 
-    for (flow_id, flow) in admitted {
-        if let Some(resumption) = analyze_flow(&analysis, operation, flow_id, flow, &mut obstacles)
-        {
-            flows.push(resumption);
+    for path in admitted {
+        if let Some(resumption) = analyze_path(&analysis, path, &mut obstacles) {
+            resumptions.push(resumption);
         }
     }
 
@@ -346,7 +357,12 @@ fn check_requirement(
     };
 
     if !obstacles.is_empty() {
-        return (RecoverabilityVerdict::Unproven { obstacles }, Vec::new());
+        return (
+            RecoverabilityVerdict::Unproven {
+                obstacles: super::idempotency::dedupe(obstacles, RecoverabilityObstacle::site),
+            },
+            Vec::new(),
+        );
     }
 
     // A driver makes retries expected. Recoverability says nothing
@@ -363,91 +379,94 @@ fn check_requirement(
     (
         RecoverabilityVerdict::Proven {
             proof: match driver {
-                None => RecoverabilityProof::Resumable { flows },
-                Some(driver) => RecoverabilityProof::Guaranteed { driver, flows },
+                None => RecoverabilityProof::Resumable { paths: resumptions },
+                Some(driver) => RecoverabilityProof::Guaranteed {
+                    driver,
+                    paths: resumptions,
+                },
             },
         },
         notes,
     )
 }
 
-/// The same-flow continuation analysis for one admitted flow. Returns
-/// the resumption argument, or `None` after pushing the flow's
+/// The same-path continuation analysis for one admitted path. Returns
+/// the resumption argument, or `None` after pushing the path's
 /// obstacles.
-fn analyze_flow(
+fn analyze_path(
     analysis: &ReplayAnalysis<'_>,
-    operation: &Operation,
-    flow_id: &Id,
-    flow: &InvocationFlow,
+    path: &Path<'_>,
     obstacles: &mut Vec<RecoverabilityObstacle>,
-) -> Option<FlowResumption> {
+) -> Option<PathResumption> {
     let before = obstacles.len();
 
-    let mut context: BTreeMap<Id, ArtifactReplay> = BTreeMap::new();
+    let reference = path.reference();
+    let trace = analysis.trace(path);
+
     let mut transactions = Vec::new();
     let mut artifacts = Vec::new();
     let mut reported: BTreeSet<Id> = BTreeSet::new();
 
-    let response = flow
-        .response
-        .as_ref()
-        .and_then(|id| operation.responses.get(id).map(|response| (id, response)));
+    let last = trace.steps.len().saturating_sub(1);
 
-    let last = flow.steps.len().saturating_sub(1);
+    // A transaction that is the final step of a path ending at
+    // `complete` has no failing prefix after it. A `return` follows its
+    // last transaction: the result must still be constructed and
+    // returned, so every transaction before it may be re-encountered.
+    let completes = matches!(trace.terminal, Terminal::Complete { .. });
 
-    for (position, step) in flow.steps.iter().enumerate() {
+    for (position, step) in trace.steps.iter().enumerate() {
         match step {
-            FlowStep::Transaction { transaction } => {
-                let Some(body) = operation.transactions.get(transaction) else {
-                    continue;
-                };
-
+            TracedStep::Transaction {
+                transaction,
+                before: context,
+                recovery,
+                natural,
+                ..
+            } => {
                 // Cross-step consumption is judged against the
                 // context before this transaction; same-transaction
                 // references are exempt by atomicity.
-                let mut established_here: BTreeSet<&Id> = BTreeSet::new();
+                if let Some(body) = analysis_transaction(analysis, transaction) {
+                    let mut established_here: BTreeSet<&Id> = BTreeSet::new();
 
-                for inner in &body.steps {
-                    for root in step_value_refs(inner) {
-                        let ValueSource::InvocationResult(artifact) = &root.source else {
-                            continue;
-                        };
+                    for inner in &body.steps {
+                        for root in inner.roots() {
+                            let ValueSource::TransactionOutput(artifact) = &root.source else {
+                                continue;
+                            };
 
-                        if !established_here.contains(artifact) {
-                            require_artifact(
-                                flow_id,
-                                transaction,
-                                artifact,
-                                &context,
-                                &mut artifacts,
-                                &mut reported,
-                                obstacles,
-                            );
+                            if !established_here.contains(artifact) {
+                                require_artifact(
+                                    &reference,
+                                    transaction,
+                                    artifact,
+                                    &context.artifacts,
+                                    &mut artifacts,
+                                    &mut reported,
+                                    obstacles,
+                                );
+                            }
                         }
-                    }
 
-                    if let TransactionStep::EstablishInvocationResult(establish) = inner {
-                        established_here.insert(&establish.result);
+                        if let TransactionStep::EstablishTransactionOutput(establish) = inner {
+                            established_here.insert(&establish.output);
+                        }
                     }
                 }
 
-                let (recovery, natural) =
-                    analysis.apply_transaction(&mut context, transaction, body);
-
-                // A transaction that is the final step of a
-                // response-less flow has no failing prefix after it.
-                if position < last || response.is_some() {
+                if position < last || !completes {
                     let resolution = match (recovery, natural) {
-                        (Ok(key), _) => Some(Resolution::KeyedCommit { key }),
+                        (Ok(key), _) => Some(Resolution::KeyedCommit { key: key.clone() }),
 
                         (Err(_), Ok(())) => Some(Resolution::NaturalReplay),
 
                         (Err(recovery), Err(reconstruction)) => {
                             obstacles.push(RecoverabilityObstacle::TransactionNotResolvable {
-                                flow: flow_id.clone(),
-                                transaction: transaction.clone(),
-                                recovery,
-                                reconstruction,
+                                path: reference.clone(),
+                                transaction: (*transaction).clone(),
+                                recovery: recovery.clone(),
+                                reconstruction: reconstruction.clone(),
                             });
 
                             None
@@ -456,78 +475,102 @@ fn analyze_flow(
 
                     if let Some(resolution) = resolution {
                         transactions.push(TransactionResolution {
-                            transaction: transaction.clone(),
+                            transaction: (*transaction).clone(),
                             resolution,
                         });
                     }
                 } else {
                     transactions.push(TransactionResolution {
-                        transaction: transaction.clone(),
+                        transaction: (*transaction).clone(),
                         resolution: Resolution::TerminalStep,
                     });
                 }
             }
 
-            FlowStep::ExecuteEffect { effect, values } => {
-                let Derivation::Deterministic { from } = values else {
-                    continue;
-                };
-
-                for root in from {
-                    if let ValueSource::InvocationResult(artifact) = &root.source {
-                        require_artifact(
-                            flow_id,
-                            effect,
-                            artifact,
-                            &context,
-                            &mut artifacts,
-                            &mut reported,
-                            obstacles,
-                        );
+            TracedStep::Effect {
+                site,
+                before: context,
+                ..
+            } => match site {
+                EffectSite::Direct { effect, values } => {
+                    for root in values.roots() {
+                        if let ValueSource::TransactionOutput(artifact) = &root.source {
+                            require_artifact(
+                                &reference,
+                                effect,
+                                artifact,
+                                &context.artifacts,
+                                &mut artifacts,
+                                &mut reported,
+                                obstacles,
+                            );
+                        }
                     }
                 }
-            }
 
-            FlowStep::ExecuteEffectIntent { intent } => {
-                require_artifact(
-                    flow_id,
-                    intent,
-                    intent,
-                    &context,
-                    &mut artifacts,
-                    &mut reported,
-                    obstacles,
-                );
-            }
+                EffectSite::Intent { intent, .. } => {
+                    require_artifact(
+                        &reference,
+                        intent,
+                        intent,
+                        &context.artifacts,
+                        &mut artifacts,
+                        &mut reported,
+                        obstacles,
+                    );
+                }
+            },
+
+            TracedStep::Decision { .. } => {}
         }
     }
 
-    if let Some((response_id, response)) = response
-        && let ResponseSource::InvocationResult { result } = &response.source
-    {
-        require_artifact(
-            flow_id,
-            response_id,
-            result,
-            &context,
-            &mut artifacts,
-            &mut reported,
-            obstacles,
-        );
+    match &trace.terminal {
+        Terminal::Return {
+            request, outcome, ..
+        } => {
+            for root in outcome.values().roots() {
+                if let ValueSource::TransactionOutput(artifact) = &root.source {
+                    require_artifact(
+                        &reference,
+                        request,
+                        artifact,
+                        &trace.end.artifacts,
+                        &mut artifacts,
+                        &mut reported,
+                        obstacles,
+                    );
+                }
+            }
+        }
+
+        Terminal::Complete { .. } => {}
+
+        Terminal::None => obstacles.push(RecoverabilityObstacle::PathNotTerminated {
+            path: reference.clone(),
+        }),
     }
 
-    (obstacles.len() == before).then_some(FlowResumption {
-        flow: flow_id.clone(),
+    (obstacles.len() == before).then_some(PathResumption {
+        path: reference,
         transactions,
         artifacts,
     })
 }
 
+/// The transaction body a traced step executed.
+fn analysis_transaction<'a>(
+    analysis: &ReplayAnalysis<'a>,
+    transaction: &Id,
+) -> Option<&'a crate::spec::Transaction> {
+    analysis.operation().transactions.get(transaction)
+}
+
 /// Records a consumed artifact's availability, or the obstacle
 /// explaining why the resumption cannot supply it. Each artifact is
-/// judged once per flow.
+/// judged once per path.
 fn require_artifact(
-    flow: &Id,
+    path: &PathRef,
     consumer: &Id,
     artifact: &Id,
     context: &BTreeMap<Id, ArtifactReplay>,
@@ -541,7 +584,7 @@ fn require_artifact(
 
     match context.get(artifact) {
         None => obstacles.push(RecoverabilityObstacle::ArtifactNotEstablished {
-            flow: flow.clone(),
+            path: path.clone(),
             artifact: artifact.clone(),
             consumer: consumer.clone(),
         }),
@@ -551,7 +594,7 @@ fn require_artifact(
             recovery,
             reconstruction,
         }) => obstacles.push(RecoverabilityObstacle::ArtifactNotReplayAvailable {
-            flow: flow.clone(),
+            path: path.clone(),
             artifact: artifact.clone(),
             transaction: transaction.clone(),
             recovery: recovery.clone(),
@@ -562,51 +605,6 @@ fn require_artifact(
             artifact: artifact.clone(),
             replay: replay.clone(),
         }),
-    }
-}
-
-/// Every `ValueRef` a transaction step evaluates, except the commit
-/// key, which the re-encounter analysis judges.
-fn step_value_refs(step: &TransactionStep) -> Vec<&ValueRef> {
-    match step {
-        TransactionStep::Read(read) => predicate_roots(&read.target.predicate),
-
-        TransactionStep::Write(write) => {
-            let mut refs = predicate_roots(&write.target.predicate);
-
-            refs.extend(derivation_refs(&write.values));
-
-            refs
-        }
-
-        TransactionStep::Insert(insert) => derivation_refs(&insert.values),
-
-        TransactionStep::Delete(delete) => predicate_roots(&delete.target.predicate),
-
-        TransactionStep::Lock(lock) => predicate_roots(&lock.target.predicate),
-
-        TransactionStep::Transition(transition) => {
-            let mut refs = predicate_roots(&transition.subject.predicate);
-
-            for values in transition.effect_values.values() {
-                refs.extend(derivation_refs(values));
-            }
-
-            refs
-        }
-
-        TransactionStep::EstablishEffectIntent(establish) => derivation_refs(&establish.values),
-
-        TransactionStep::EstablishInvocationResult(establish) => {
-            derivation_refs(&establish.values)
-        }
-    }
-}
-
-fn derivation_refs(derivation: &Derivation) -> Vec<&ValueRef> {
-    match derivation {
-        Derivation::Unspecified => Vec::new(),
-        Derivation::Deterministic { from } => from.iter().collect(),
     }
 }
 
@@ -738,8 +736,8 @@ impl RecoverabilityCheck {
             message: format!(
                 "Recoverability requirement {requirement} of `{operation}` \
                  (`{completion}`) is not established: interrupted invocations \
-                 sharing the declared key are not proven to reach terminal \
-                 execution of a declared flow."
+                 sharing the declared key are not proven to reach a terminal of \
+                 the operation program."
             ),
             evidence: obstacles
                 .iter()
@@ -750,48 +748,79 @@ impl RecoverabilityCheck {
 }
 
 impl RecoverabilityObstacle {
+    /// The obstacle with its path forgotten, so the same fact on two
+    /// paths compares equal. Whether a path terminates is the path's
+    /// own fact and is kept apart.
+    fn site(&self) -> Self {
+        let mut site = self.clone();
+
+        match &mut site {
+            Self::GoverningKeyInadmissible { .. }
+            | Self::NoAdmittedPath { .. }
+            | Self::PathNotTerminated { .. }
+            | Self::NoModeledRetryDriver { .. } => {}
+
+            Self::TransactionNotResolvable { path, .. }
+            | Self::ArtifactNotEstablished { path, .. }
+            | Self::ArtifactNotReplayAvailable { path, .. } => *path = PathRef::default(),
+        }
+
+        site
+    }
+
     fn evidence(&self) -> Evidence {
         match self {
             Self::GoverningKeyInadmissible { defect } => governing_key_evidence(defect),
 
-            Self::NoAdmittedFlow { input } => Evidence {
+            Self::NoAdmittedPath { input } => Evidence {
                 subject: Some(input.clone()),
                 message: format!(
-                    "No declared flow is completable by invocations of `{input}`: \
-                     every flow terminates with another input's response."
+                    "No path of the program is completable by invocations of \
+                     `{input}`: every path returns another input's result."
+                ),
+            },
+
+            Self::PathNotTerminated { path } => Evidence {
+                subject: None,
+                message: format!(
+                    "{} falls off the end of the program without reaching a \
+                     `return` or `complete` terminal.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
             Self::TransactionNotResolvable {
-                flow,
+                path,
                 transaction,
                 recovery,
                 reconstruction,
             } => Evidence {
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Resuming flow `{flow}` re-encounters `{transaction}` after \
-                     it may have committed, but the commit resolves by neither \
-                     route. Recovery: {}. Reconstruction: {}.",
+                    "Resuming {} re-encounters `{transaction}` after it may have \
+                     committed, but the commit resolves by neither route. \
+                     Recovery: {}. Reconstruction: {}.",
+                    describe_path(path),
                     gap_sentences(recovery),
                     gap_sentences(reconstruction),
                 ),
             },
 
             Self::ArtifactNotEstablished {
-                flow,
+                path,
                 artifact,
                 consumer,
             } => Evidence {
                 subject: Some(artifact.clone()),
                 message: format!(
-                    "Flow `{flow}` consumes artifact `{artifact}` at `{consumer}`, \
-                     but no earlier step establishes it."
+                    "{} consumes artifact `{artifact}` at `{consumer}`, but no \
+                     earlier step establishes it.",
+                    capitalize(&describe_path(path))
                 ),
             },
 
             Self::ArtifactNotReplayAvailable {
-                flow,
+                path,
                 artifact,
                 transaction,
                 recovery,
@@ -799,9 +828,10 @@ impl RecoverabilityObstacle {
             } => Evidence {
                 subject: Some(transaction.clone()),
                 message: format!(
-                    "Flow `{flow}` consumes artifact `{artifact}`, established by \
+                    "{} consumes artifact `{artifact}`, established by \
                      `{transaction}`, but a resumption can supply it through \
                      neither route. Recovery: {}. Reconstruction: {}.",
+                    capitalize(&describe_path(path)),
                     gap_sentences(recovery),
                     gap_sentences(reconstruction),
                 ),
@@ -831,5 +861,14 @@ impl RecoverabilityObstacle {
                 },
             },
         }
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut characters = text.chars();
+
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }

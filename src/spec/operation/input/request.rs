@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{FieldPath, Id};
+use crate::spec::{FieldPath, Id, ResultType};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,6 +9,16 @@ pub struct RequestInput {
 
     /// Identity of one logical request at this boundary.
     pub identity: RequestIdentity,
+
+    /// The `Result<Ok, Err>` contract a request through this input
+    /// returns.
+    ///
+    /// The contract belongs to the input rather than the operation: an
+    /// operation may expose several request inputs, and a request
+    /// effect already targets one specific input, from which it
+    /// inherits this contract. Subscription inputs have no synchronous
+    /// result.
+    pub result: ResultType,
 }
 
 /// Where the identity of one logical request lives in the payload.

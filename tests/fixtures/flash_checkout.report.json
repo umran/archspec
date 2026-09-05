@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "model_revision": 1,
   "obligations": [
     {
@@ -74,7 +74,7 @@
         "requirement": 0
       },
       "status": "proven",
-      "summary": "An interrupted invocation of operation.apply_payment is re-driven until it reaches a declared flow's terminal step.",
+      "summary": "An interrupted invocation of operation.apply_payment is re-driven until it reaches a terminal of its program.",
       "assumptions": [
         "input.apply_payment.captured redelivers via topic.order_events at least once, re-driving interrupted invocations",
         "tx.apply_payment resolves on re-encounter through its keyed commit (input.apply_payment.captured.event_id)",
@@ -141,7 +141,14 @@
       "evidence": [
         {
           "subject": "effect.charge_payment.card",
-          "message": "Flow `flow.charge_payment` executes external effect `effect.charge_payment.card`, which is explicitly `not_deduplicated`: a duplicate execution is distinguishable duplicate work at that boundary."
+          "message": "The path `ok(result.charge_payment.card)` executes external effect `effect.charge_payment.card`, which is explicitly `not_deduplicated`: a duplicate execution is distinguishable duplicate work at that boundary."
+        },
+        {
+          "message": "On the path `ok(result.charge_payment.card)`, the match on `result.charge_payment.card` at step `2`, taking its `ok` arm is not established to replay, so a retry may do different work: result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: no declared fact makes an external boundary's returned result replay-consistent."
+        },
+        {
+          "subject": "effect.charge_payment.publish_failed",
+          "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: no declared fact makes an external boundary's returned result replay-consistent)."
         }
       ]
     },
@@ -161,14 +168,14 @@
       "evidence": [
         {
           "subject": "operation.reserve_inventory",
-          "message": "Flow `flow.create_order.new` publishes `schema.OrderCreated` to `topic.order_events` through `effect.create_order.publish_created`, and `operation.reserve_inventory` consumes it through `input.reserve_inventory.created`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
+          "message": "The program publishes `schema.OrderCreated` to `topic.order_events` through `effect.create_order.publish_created`, and `operation.reserve_inventory` consumes it through `input.reserve_inventory.created`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
         }
       ]
     },
     {
-      "id": "oblig.operation.create_order.response_replay.0",
+      "id": "oblig.operation.create_order.result_replay.0",
       "property": {
-        "kind": "response_replay"
+        "kind": "result_replay"
       },
       "subject": {
         "kind": "operation",
@@ -176,9 +183,10 @@
         "requirement": 0
       },
       "status": "proven",
-      "summary": "Every attempt at operation.create_order sharing the declared key observes an equivalent response.",
+      "summary": "Every attempt at operation.create_order sharing the declared key returns an equivalent result.",
       "assumptions": [
-        "the response resolves result.create_order, retained by tx.create_order.new's keyed commit and recovered on every retry"
+        "the returned ok payload is derived deterministically from output.create_order.order_id, output.create_order.status",
+        "output.create_order is recovered from tx.create_order.new's keyed commit on every retry"
       ],
       "evidence": []
     },
@@ -193,11 +201,11 @@
         "requirement": 0
       },
       "status": "proven",
-      "summary": "An interrupted invocation of operation.create_order can be resumed to reach a declared flow's terminal step.",
+      "summary": "An interrupted invocation of operation.create_order can be resumed to reach a terminal of its program.",
       "assumptions": [
         "tx.create_order.new resolves on re-encounter through its keyed commit (input.create_order.request.idempotency_key)",
         "artifact intent.create_order.publish_created is recovered from tx.create_order.new's keyed commit on resumption",
-        "artifact result.create_order is recovered from tx.create_order.new's keyed commit on resumption"
+        "artifact output.create_order is recovered from tx.create_order.new's keyed commit on resumption"
       ],
       "evidence": []
     },
@@ -260,15 +268,15 @@
       "evidence": [
         {
           "subject": "tx.reserve_inventory",
-          "message": "A duplicate attempt re-drives flow `flow.reserve_inventory` and re-encounters `tx.reserve_inventory`, which is retry-safe by neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
+          "message": "A duplicate attempt re-drives the program and re-encounters `tx.reserve_inventory`, which is retry-safe by neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         },
         {
           "subject": "operation.charge_payment",
-          "message": "Flow `flow.reserve_inventory` publishes `schema.InventoryReserved` to `topic.order_events` through `effect.reserve_inventory.publish_reserved`, and `operation.charge_payment` consumes it through `input.charge_payment.reserved`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
+          "message": "The program publishes `schema.InventoryReserved` to `topic.order_events` through `effect.reserve_inventory.publish_reserved`, and `operation.charge_payment` consumes it through `input.charge_payment.reserved`, whose idempotency requirement is not proven in this analysis, so the duplicate work a duplicate delivery causes there is not established to collapse."
         },
         {
           "subject": "tx.reserve_inventory",
-          "message": "Intent `intent.reserve_inventory.publish_reserved` in flow `flow.reserve_inventory` is established by `tx.reserve_inventory` but replay-available through neither route, so a retry's instance may differ. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
+          "message": "Intent `intent.reserve_inventory.publish_reserved` on the program is established by `tx.reserve_inventory` but replay-available through neither route, so a retry's instance may differ. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         }
       ]
     },
@@ -283,54 +291,16 @@
         "requirement": 0
       },
       "status": "unknown",
-      "summary": "An interrupted invocation of operation.reserve_inventory is re-driven until it reaches a declared flow's terminal step.",
+      "summary": "An interrupted invocation of operation.reserve_inventory is re-driven until it reaches a terminal of its program.",
       "assumptions": [],
       "evidence": [
         {
           "subject": "tx.reserve_inventory",
-          "message": "Resuming flow `flow.reserve_inventory` re-encounters `tx.reserve_inventory` after it may have committed, but the commit resolves by neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
+          "message": "Resuming the program re-encounters `tx.reserve_inventory` after it may have committed, but the commit resolves by neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         },
         {
           "subject": "tx.reserve_inventory",
-          "message": "Flow `flow.reserve_inventory` consumes artifact `intent.reserve_inventory.publish_reserved`, established by `tx.reserve_inventory`, but a resumption can supply it through neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
-        }
-      ]
-    },
-    {
-      "id": "oblig.data.checkout.object.order.history.linearizable",
-      "property": {
-        "kind": "object_history"
-      },
-      "subject": {
-        "kind": "object",
-        "data_model": "data.checkout",
-        "object": "object.order"
-      },
-      "status": "unknown",
-      "summary": "Accesses to object.order admit a legal sequential history respecting real-time precedence.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "message": "No V1 verifier attempts object-history obligations."
-        }
-      ]
-    },
-    {
-      "id": "oblig.data.inventory.object.stock.history.linearizable",
-      "property": {
-        "kind": "object_history"
-      },
-      "subject": {
-        "kind": "object",
-        "data_model": "data.inventory",
-        "object": "object.stock"
-      },
-      "status": "unknown",
-      "summary": "Accesses to object.stock admit a legal sequential history respecting real-time precedence.",
-      "assumptions": [],
-      "evidence": [
-        {
-          "message": "No V1 verifier attempts object-history obligations."
+          "message": "The program consumes artifact `intent.reserve_inventory.publish_reserved`, established by `tx.reserve_inventory`, but a resumption can supply it through neither route. Recovery: the transaction declares no keyed commit deduplication. Reconstruction: a mutation value depends on `reserved`, which is not replay-stable (it reaches transaction read `read.reserve_inventory.stock`, which is never replay-stable)."
         }
       ]
     }

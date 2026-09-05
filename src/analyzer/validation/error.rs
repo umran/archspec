@@ -1,7 +1,7 @@
 use crate::analyzer::{
     Diagnostic, DiagnosticCode, Evidence, IdDeclaration, Severity, ValidationCode,
 };
-use crate::spec::{FieldPath, Id};
+use crate::spec::{FieldPath, Id, ResultVariant, StepLocation};
 
 use super::{InputKind, ReferenceKind};
 
@@ -151,14 +151,6 @@ pub enum ValidationError {
         actual_object: Id,
     },
 
-    /// V1 requires every transition-containing transaction to declare
-    /// durable keyed commit deduplication.
-    TransitionTransactionNotDeduplicated {
-        transaction: Id,
-        machine: Id,
-        transition: Id,
-    },
-
     /// A `StateTransition` step's `effect_values` keys do not exactly
     /// match the side effects declared by the applied transition.
     TransitionEffectValuesMismatch {
@@ -198,25 +190,103 @@ pub enum ValidationError {
         object: Id,
     },
 
-    /// An operation requires that its invocations reach terminal
-    /// execution, but declares no flow that could terminate.
-    RecoverabilityRequiresFlow {
-        operation: Id,
-    },
-
-    ResponseInvocationResultSchemaMismatch {
-        response: Id,
-        response_schema: Id,
-        result: Id,
-        result_schema: Id,
-    },
-
     InvalidInputKind {
         subject: Id,
         input: Id,
         expected: InputKind,
         actual: InputKind,
     },
+
+    /// Some reachable path through the operation program falls off the
+    /// end of its last step without reaching a `return` or `complete`
+    /// terminal.
+    ProgramNotTerminated {
+        operation: Id,
+    },
+
+    /// A program step follows a terminal — or a decision whose every
+    /// arm terminates — in its block, so no invocation reaches it.
+    UnreachableProgramStep {
+        operation: Id,
+        location: StepLocation,
+    },
+
+    /// A program point consumes a transaction artifact — a transaction
+    /// output or an effect intent — that is not definitely established
+    /// or recovered on every path reaching it.
+    TransactionArtifactNotAvailable {
+        operation: Id,
+        location: StepLocation,
+        artifact: Id,
+        consumer: ProgramUse,
+    },
+
+    /// A result binding is matched or referenced where no
+    /// effect-executing step on every path reaching the point has bound
+    /// it.
+    EffectResultNotBound {
+        operation: Id,
+        location: StepLocation,
+        result: Id,
+        consumer: ProgramUse,
+    },
+
+    /// A variant payload of a bound result is referenced outside the
+    /// arm of a `match_result` on that binding that selects the
+    /// variant.
+    EffectResultVariantOutOfScope {
+        operation: Id,
+        location: StepLocation,
+        result: Id,
+        variant: ResultVariant,
+        consumer: ProgramUse,
+    },
+
+    /// A step binds the result of an effect whose contract has no
+    /// synchronous result: a publication, or an external effect that
+    /// declares none.
+    EffectHasNoResult {
+        operation: Id,
+        location: StepLocation,
+        effect: Id,
+        result: Id,
+    },
+}
+
+/// Where a program point consumes a value, for a diagnostic to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramUse {
+    /// The body or commit key of a transaction executed at the step.
+    Transaction { transaction: Id },
+
+    /// The instance derivation or the declaration of an effect executed
+    /// at the step.
+    Effect { effect: Id },
+
+    /// The execution of an effect intent at the step.
+    EffectIntent { intent: Id },
+
+    /// The `match_result` at the step.
+    Match,
+
+    /// The branch condition at the step.
+    Condition,
+
+    /// The outcome returned at the step.
+    Return { request: Id },
+}
+
+impl std::fmt::Display for ProgramUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transaction { transaction } => write!(f, "transaction `{transaction}`"),
+            Self::Effect { effect } => write!(f, "the execution of effect `{effect}`"),
+            Self::EffectIntent { intent } => write!(f, "the execution of intent `{intent}`"),
+            Self::Match => f.write_str("the result match"),
+            Self::Condition => f.write_str("the branch condition"),
+            Self::Return { request } => write!(f, "the result returned for `{request}`"),
+        }
+    }
 }
 
 impl From<ValidationError> for Diagnostic {
@@ -411,7 +481,7 @@ impl From<ValidationError> for Diagnostic {
                     evidence: vec![Evidence {
                         subject: Some(owner),
                         message:
-                            "A value reference may only name inputs, effects, and invocation results reachable from the operation whose invocation evaluates it."
+                            "A value reference may only name inputs, effects, transaction outputs, and effect results reachable from the operation whose invocation evaluates it."
                                 .to_string(),
                     }],
                 }
@@ -813,41 +883,6 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
-            ValidationError::TransitionTransactionNotDeduplicated {
-                transaction,
-                machine,
-                transition,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TransitionTransactionNotDeduplicated,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(transaction.clone()),
-                    message: format!(
-                        "Transaction `{transaction}` applies transition \
-                         `{transition}` but declares no durable keyed commit \
-                         deduplication."
-                    ),
-                    evidence: vec![
-                        Evidence {
-                            subject: Some(transition),
-                            message: format!(
-                                "This transition of `{machine}` changes the state \
-                                 it is evaluated against, so the transaction \
-                                 cannot be naturally replayed."
-                            ),
-                        },
-                        Evidence {
-                            subject: Some(transaction),
-                            message:
-                                "A transition-containing transaction must declare `deduplicated_by` so a later encounter can resolve the prior commit and recover its artifacts."
-                                    .to_string(),
-                        },
-                    ],
-                }
-            }
-
             ValidationError::TransitionEffectValuesMismatch {
                 transaction,
                 transition,
@@ -994,55 +1029,6 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
-            ValidationError::RecoverabilityRequiresFlow {
-                operation,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::RecoverabilityRequiresFlow,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(operation.clone()),
-                    message: format!(
-                        "Operation `{operation}` declares a recoverability \
-                         requirement but declares no invocation flow."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(operation),
-                        message:
-                            "Recoverability obliges an invocation to reach the terminal step of a declared flow, so at least one flow must exist."
-                                .to_string(),
-                    }],
-                }
-            }
-
-            ValidationError::ResponseInvocationResultSchemaMismatch {
-                response,
-                response_schema,
-                result,
-                result_schema,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::ResponseInvocationResultSchemaMismatch,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(response.clone()),
-                    message: format!(
-                        "Response `{response}` uses schema `{response_schema}`, \
-                         but its invocation-result source `{result}` uses \
-                         schema `{result_schema}`."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(result),
-                        message: format!(
-                            "This invocation result is declared with schema \
-                             `{result_schema}`."
-                        ),
-                    }],
-                }
-            }
-
             ValidationError::InvalidInputKind {
                 subject,
                 input,
@@ -1067,6 +1053,136 @@ impl From<ValidationError> for Diagnostic {
                     }],
                 }
             }
+
+            ValidationError::ProgramNotTerminated { operation } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::ProgramNotTerminated),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "The program of `{operation}` can fall off the end of its last \
+                     step without reaching a terminal."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(operation),
+                    message: "Every reachable path through an operation program must end \
+                              at an explicit `return` or `complete` step."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::UnreachableProgramStep {
+                operation,
+                location,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::UnreachableProgramStep),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` is unreachable: it \
+                     follows a terminal in its block."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(operation),
+                    message: "A `return` or `complete` step, or a decision whose every arm \
+                              terminates, ends its block; no step may follow it there."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::TransactionArtifactNotAvailable {
+                operation,
+                location,
+                artifact,
+                consumer,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::TransactionArtifactNotAvailable,
+                ),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` consumes transaction \
+                     artifact `{artifact}` in {consumer}, but no transaction on every \
+                     path reaching that step establishes or recovers it."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(artifact),
+                    message: "A transaction output or effect intent may be consumed only \
+                              where control flow definitely establishes it: after a \
+                              transaction that establishes it on every incoming path."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EffectResultNotBound {
+                operation,
+                location,
+                result,
+                consumer,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EffectResultNotBound),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` uses effect result \
+                     `{result}` in {consumer}, but no effect-executing step on every \
+                     path reaching it binds that result."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(result),
+                    message: "A result binding is available only after the step that binds \
+                              it, on every path reaching the use."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EffectResultVariantOutOfScope {
+                operation,
+                location,
+                result,
+                variant,
+                consumer,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(
+                    ValidationCode::EffectResultVariantOutOfScope,
+                ),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` references the `{variant}` \
+                     payload of `{result}` in {consumer}, outside the `{variant}` arm of \
+                     a match on that result."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(result),
+                    message: "A variant payload is arm-local: `effect_result_ok` is available \
+                              only inside the `ok` arm of a `match_result` on the binding, \
+                              and `effect_result_err` only inside the `err` arm."
+                        .to_string(),
+                }],
+            },
+
+            ValidationError::EffectHasNoResult {
+                operation,
+                location,
+                effect,
+                result,
+            } => Diagnostic {
+                code: DiagnosticCode::Validation(ValidationCode::EffectHasNoResult),
+                severity: Severity::Error,
+                subject: Some(operation.clone()),
+                message: format!(
+                    "Program step `{location}` of `{operation}` binds result `{result}` of \
+                     effect `{effect}`, whose contract has no synchronous result."
+                ),
+                evidence: vec![Evidence {
+                    subject: Some(effect),
+                    message: "A publication produces no synchronous result, and an external \
+                              effect produces one only when it declares a `result` contract; \
+                              a request inherits its target input's contract."
+                        .to_string(),
+                }],
+            },
         }
     }
 }

@@ -5,18 +5,61 @@ use std::{
 };
 
 use archspec::{
-    analyzer::validation::{self, ReferenceKind, ValidationError},
+    analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        CompletionRequirement, Derivation, EffectIntent, EstablishEffectIntent, FieldPath,
-        FlowStep, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
-        MessageSelector, Model, RecoverabilityRequirement, RequestIdentity, Schema,
-        SchemaFragment, StateTransition, TopicOrdering, TransactionStep, ValueRef, ValueSource,
+        Arm, Branch, Condition, Derivation, EffectIntent, EstablishEffectIntent,
+        EstablishTransactionOutput, ExecuteEffect, FieldPath, Id, IdempotencyGuarantee, Input,
+        Literal, MessageIdentity, MessageSelector, Model, OperationBlock, OperationStep,
+        RequestIdentity, ResultOutcome, ResultVariant, Return, RunTransaction, Schema,
+        SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation, TopicOrdering,
+        Transaction, TransactionIsolation, TransactionOutput, TransactionStep, ValueRef,
+        ValueSource,
     },
 };
 
 fn id(value: &str) -> Id {
     Id(value.to_owned())
+}
+
+fn path(components: &[&str]) -> FieldPath {
+    FieldPath(components.iter().map(|part| (*part).to_owned()).collect())
+}
+
+fn input_ref(input: &str, components: &[&str]) -> ValueRef {
+    ValueRef {
+        source: ValueSource::Input(id(input)),
+        path: path(components),
+    }
+}
+
+/// A step location from `(index, arm entered beneath it)` hops.
+fn at(hops: &[(usize, Option<Arm>)]) -> StepLocation {
+    StepLocation(
+        hops.iter()
+            .map(|(step, arm)| StepHop {
+                step: *step,
+                arm: *arm,
+            })
+            .collect(),
+    )
+}
+
+fn program_mut<'a>(model: &'a mut Model, operation: &str) -> &'a mut OperationBlock {
+    &mut model.operations.get_mut(&id(operation)).unwrap().program
+}
+
+fn run(transaction: &str) -> OperationStep {
+    OperationStep::Transaction(RunTransaction {
+        transaction: id(transaction),
+    })
+}
+
+fn return_ok(request: &str, values: Derivation) -> OperationStep {
+    OperationStep::Return(Return {
+        request: id(request),
+        outcome: ResultOutcome::Ok { values },
+    })
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -117,29 +160,17 @@ fn rejects_reference_with_wrong_kind() {
 }
 
 #[test]
-fn rejects_flow_using_transaction_owned_by_another_operation() {
+fn rejects_program_using_transaction_owned_by_another_operation() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap();
-
-    let flow = operation
-        .flows
-        .get_mut(&id("flow.reserve_inventory"))
-        .unwrap();
-
-    flow.steps[0] = FlowStep::Transaction {
-        transaction: id("tx.create_order.new"),
-    };
+    program_mut(&mut model, "operation.reserve_inventory").steps[0] = run("tx.create_order.new");
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
         vec![ValidationError::InvalidReferenceOwner {
-            subject: id("flow.reserve_inventory"),
+            subject: id("operation.reserve_inventory"),
             reference: id("tx.create_order.new"),
             expected_owner: id("operation.reserve_inventory"),
             actual_owner: Some(id("operation.create_order")),
@@ -414,33 +445,6 @@ fn rejects_state_transition_with_wrong_subject_object() {
 }
 
 #[test]
-fn rejects_response_and_invocation_result_schema_mismatch() {
-    let mut model = load_flash_checkout();
-
-    let response = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .responses
-        .get_mut(&id("response.create_order"))
-        .unwrap();
-
-    response.schema = id("schema.CancelOrderResponse");
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::ResponseInvocationResultSchemaMismatch {
-            response: id("response.create_order"),
-            response_schema: id("schema.CancelOrderResponse"),
-            result: id("result.create_order"),
-            result_schema: id("schema.CreateOrderResponse"),
-        }]
-    );
-}
-
-#[test]
 fn rejects_invalid_value_ref_field_path() {
     let mut model = load_flash_checkout();
 
@@ -487,7 +491,33 @@ fn rejects_field_reference_into_untyped_external_effect() {
 }
 
 #[test]
-fn rejects_transition_transaction_without_keyed_idempotency() {
+fn transition_transactions_accept_any_idempotency_guarantee() {
+    // Amendment A: a transition blocks the natural-replay proof route,
+    // but the missing proof fact is the solver's concern, never a
+    // structural error. The keyed form is the fixture as declared.
+    for idempotency in [
+        IdempotencyGuarantee::Unspecified,
+        IdempotencyGuarantee::NotDeduplicated,
+    ] {
+        let mut model = load_flash_checkout();
+
+        model
+            .operations
+            .get_mut(&id("operation.apply_payment"))
+            .unwrap()
+            .transactions
+            .get_mut(&id("tx.apply_payment"))
+            .unwrap()
+            .idempotency = idempotency;
+
+        let errors = validation::validate(&model);
+
+        assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+    }
+}
+
+#[test]
+fn transition_effect_values_coverage_is_independent_of_the_guarantee() {
     let mut model = load_flash_checkout();
 
     let transaction = model
@@ -500,14 +530,21 @@ fn rejects_transition_transaction_without_keyed_idempotency() {
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
+    let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
+        panic!("expected the mark_paid transition step");
+    };
+
+    transition.effect_values.clear();
+
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransitionTransactionNotDeduplicated {
+        vec![ValidationError::TransitionEffectValuesMismatch {
             transaction: id("tx.apply_payment"),
-            machine: id("machine.order_lifecycle"),
             transition: id("transition.order.mark_paid"),
+            missing: vec![id("effect.order.paid")],
+            unexpected: vec![],
         }]
     );
 }
@@ -551,25 +588,19 @@ fn rejects_explicit_establishment_of_transition_effect_intent() {
 fn rejects_direct_execution_of_transition_side_effect() {
     let mut model = load_flash_checkout();
 
-    let flow = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .flows
-        .get_mut(&id("flow.apply_payment"))
-        .unwrap();
-
-    flow.steps[1] = FlowStep::ExecuteEffect {
-        effect: id("effect.order.paid"),
-        values: Derivation::Unspecified,
-    };
+    program_mut(&mut model, "operation.apply_payment").steps[1] =
+        OperationStep::ExecuteEffect(ExecuteEffect {
+            effect: id("effect.order.paid"),
+            values: Derivation::Unspecified,
+            result: None,
+        });
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
         vec![ValidationError::InvalidReferenceOwner {
-            subject: id("flow.apply_payment"),
+            subject: id("operation.apply_payment"),
             reference: id("effect.order.paid"),
             expected_owner: id("operation.apply_payment"),
             actual_owner: Some(id("transition.order.mark_paid")),
@@ -751,34 +782,39 @@ fn rejects_data_object_without_identity() {
 }
 
 #[test]
-fn rejects_recoverability_requirement_with_no_flow() {
+fn rejects_a_program_that_falls_through_without_a_terminal() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap();
-
-    operation
-        .requirements
-        .recoverability
-        .push(RecoverabilityRequirement {
-            key: IdempotencyKey {
-                components: vec![ValueRef {
-                    source: ValueSource::Input(id("input.charge_payment.reserved")),
-                    path: FieldPath(vec!["event_id".to_owned()]),
-                }],
-            },
-            completion: CompletionRequirement::Guaranteed,
-        });
-
-    operation.flows.clear();
+    program_mut(&mut model, "operation.charge_payment")
+        .steps
+        .clear();
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::RecoverabilityRequiresFlow {
+        vec![ValidationError::ProgramNotTerminated {
+            operation: id("operation.charge_payment"),
+        }]
+    );
+
+    // A path that falls through one arm of a decision and then off the
+    // end of the program is the same defect.
+    let mut model = load_flash_checkout();
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the card match");
+    };
+
+    matched.err.steps.pop();
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ProgramNotTerminated {
             operation: id("operation.charge_payment"),
         }]
     );
@@ -903,12 +939,12 @@ fn rejects_value_ref_to_another_operations_input() {
 }
 
 #[test]
-fn rejects_value_ref_to_another_operations_invocation_result() {
+fn rejects_value_ref_to_another_operations_transaction_output() {
     let mut model = load_flash_checkout();
 
     set_reserve_write_source(
         &mut model,
-        ValueSource::InvocationResult(id("result.create_order")),
+        ValueSource::TransactionOutput(id("output.create_order")),
         &["order_id"],
     );
 
@@ -918,8 +954,30 @@ fn rejects_value_ref_to_another_operations_invocation_result() {
         errors,
         vec![ValidationError::ValueSourceOutOfScope {
             subject: id("tx.reserve_inventory"),
-            source: id("result.create_order"),
+            source: id("output.create_order"),
             owner: id("operation.create_order"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_value_ref_to_another_operations_effect_result() {
+    let mut model = load_flash_checkout();
+
+    set_reserve_write_source(
+        &mut model,
+        ValueSource::EffectResultOk(id("result.charge_payment.card")),
+        &["authorization_id"],
+    );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("tx.reserve_inventory"),
+            source: id("result.charge_payment.card"),
+            owner: id("operation.charge_payment"),
         }]
     );
 }
@@ -1082,26 +1140,16 @@ fn rejects_transition_effect_intent_the_operation_cannot_establish() {
     );
 }
 
-/// Retarget the card-charge flow step's derivation, which is the
+/// Retarget the card-charge program step's derivation, which is the
 /// fixture's direct-execution provenance site.
 fn set_charge_card_values(model: &mut Model, values: Derivation) {
-    let flow = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .flows
-        .get_mut(&id("flow.charge_payment"))
-        .unwrap();
-
-    let FlowStep::ExecuteEffect {
-        values: step_values,
-        ..
-    } = &mut flow.steps[0]
+    let OperationStep::ExecuteEffect(step) =
+        &mut program_mut(model, "operation.charge_payment").steps[0]
     else {
         panic!("expected the card-charge execute_effect step");
     };
 
-    *step_values = values;
+    step.values = values;
 }
 
 #[test]
@@ -1138,7 +1186,7 @@ fn accepts_unspecified_execute_effect_values() {
 fn rejects_transaction_read_in_execute_effect_values() {
     let mut model = load_flash_checkout();
 
-    // No transaction context exists at flow level, so a transaction
+    // No transaction context exists at program level, so a transaction
     // read can never be a direct-execution provenance root.
     set_charge_card_values(
         &mut model,
@@ -1155,7 +1203,7 @@ fn rejects_transaction_read_in_execute_effect_values() {
     assert_eq!(
         errors,
         vec![ValidationError::TransactionReadOutsideTransaction {
-            subject: id("flow.charge_payment"),
+            subject: id("operation.charge_payment"),
             read: id("read.reserve_inventory.stock"),
         }]
     );
@@ -1180,7 +1228,7 @@ fn rejects_invalid_field_path_in_execute_effect_values() {
     assert_eq!(
         errors,
         vec![ValidationError::InvalidFieldPath {
-            subject: id("flow.charge_payment"),
+            subject: id("operation.charge_payment"),
             schema: id("schema.InventoryReserved"),
             path: FieldPath(vec!["does_not_exist".to_owned()]),
         }]
@@ -1577,4 +1625,906 @@ fn rejects_unresolvable_message_identity_field() {
             path: FieldPath(vec!["does_not_exist".to_owned()]),
         }]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Request results, effect results, and the operation program
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rejects_request_result_schema_that_does_not_exist() {
+    let mut model = load_flash_checkout();
+
+    let Some(Input::Request(request)) = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .inputs
+        .get_mut(&id("input.create_order.request"))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    request.result.err = id("schema.missing");
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnknownReference {
+            subject: id("input.create_order.request"),
+            reference: id("schema.missing"),
+            expected: ReferenceKind::Schema,
+        }]
+    );
+}
+
+#[test]
+fn rejects_external_result_schema_that_does_not_exist() {
+    let mut model = load_flash_checkout();
+
+    let Some(archspec::spec::Effect::External(card)) = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.charge_payment.card"))
+    else {
+        panic!("card charge should be an external effect");
+    };
+
+    card.result.as_mut().unwrap().ok = id("schema.missing");
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnknownReference {
+            subject: id("effect.charge_payment.card"),
+            reference: id("schema.missing"),
+            expected: ReferenceKind::Schema,
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_result_binding_on_a_publication() {
+    let mut model = load_flash_checkout();
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(captured) = &mut matched.ok.steps[0] else {
+        panic!("expected the capture publication");
+    };
+
+    captured.result = Some(id("result.charge_payment.captured"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EffectHasNoResult {
+            operation: id("operation.charge_payment"),
+            location: at(&[(1, Some(Arm::Ok)), (0, None)]),
+            effect: id("effect.charge_payment.publish_captured"),
+            result: id("result.charge_payment.captured"),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_result_binding_on_an_external_effect_without_a_contract() {
+    let mut model = load_flash_checkout();
+
+    let Some(archspec::spec::Effect::External(card)) = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.charge_payment.card"))
+    else {
+        panic!("card charge should be an external effect");
+    };
+
+    card.result = None;
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EffectHasNoResult {
+            operation: id("operation.charge_payment"),
+            location: at(&[(0, None)]),
+            effect: id("effect.charge_payment.card"),
+            result: id("result.charge_payment.card"),
+        }]
+    );
+}
+
+#[test]
+fn accepts_an_ignored_result() {
+    let mut model = load_flash_checkout();
+
+    // The provider's result may be ignored: the card charge executes
+    // without binding it, and with nothing to match on the program
+    // completes directly.
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::ExecuteEffect(card) = &mut program.steps[0] else {
+        panic!("expected the card charge");
+    };
+
+    card.result = None;
+
+    program.steps[1] = OperationStep::Complete;
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_a_match_on_a_result_no_step_declares() {
+    let mut model = load_flash_checkout();
+
+    let OperationStep::ExecuteEffect(card) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[0]
+    else {
+        panic!("expected the card charge");
+    };
+
+    card.result = None;
+
+    let errors = validation::validate(&model);
+
+    // The match and the err arm's payload reference both name a binding
+    // nothing declares.
+    assert_eq!(
+        errors,
+        vec![
+            ValidationError::UnknownReference {
+                subject: id("operation.charge_payment"),
+                reference: id("result.charge_payment.card"),
+                expected: ReferenceKind::EffectResult,
+            },
+            ValidationError::UnknownReference {
+                subject: id("operation.charge_payment"),
+                reference: id("result.charge_payment.card"),
+                expected: ReferenceKind::EffectResult,
+            },
+        ]
+    );
+}
+
+#[test]
+fn rejects_a_match_before_the_binding_step() {
+    let mut model = load_flash_checkout();
+
+    program_mut(&mut model, "operation.charge_payment")
+        .steps
+        .swap(0, 1);
+
+    let errors = validation::validate(&model);
+
+    // The match runs before the card charge binds its result, and the
+    // charge itself follows a decision whose every arm terminates.
+    assert_eq!(
+        errors,
+        vec![
+            ValidationError::EffectResultNotBound {
+                operation: id("operation.charge_payment"),
+                location: at(&[(0, None)]),
+                result: id("result.charge_payment.card"),
+                consumer: ProgramUse::Match,
+            },
+            ValidationError::UnreachableProgramStep {
+                operation: id("operation.charge_payment"),
+                location: at(&[(1, None)]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn rejects_a_variant_payload_outside_its_arm() {
+    let mut model = load_flash_checkout();
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the card match");
+    };
+
+    // The failure publication reads the err payload; moving it into the
+    // ok arm puts that reference out of scope.
+    let failed = matched.err.steps.remove(0);
+
+    matched.ok.steps.insert(0, failed);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EffectResultVariantOutOfScope {
+            operation: id("operation.charge_payment"),
+            location: at(&[(1, Some(Arm::Ok)), (0, None)]),
+            result: id("result.charge_payment.card"),
+            variant: ResultVariant::Err,
+            consumer: ProgramUse::Effect {
+                effect: id("effect.charge_payment.publish_failed"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_variant_payload_after_the_join() {
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::MatchResult(matched) = &mut program.steps[1] else {
+        panic!("expected the card match");
+    };
+
+    // Both arms fall through; the failure publication follows the join.
+    let failed = matched.err.steps.remove(0);
+
+    matched.ok.steps.clear();
+    matched.err.steps.clear();
+
+    program.steps.push(failed);
+    program.steps.push(OperationStep::Complete);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EffectResultVariantOutOfScope {
+            operation: id("operation.charge_payment"),
+            location: at(&[(2, None)]),
+            result: id("result.charge_payment.card"),
+            variant: ResultVariant::Err,
+            consumer: ProgramUse::Effect {
+                effect: id("effect.charge_payment.publish_failed"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_intent_executed_where_no_path_establishes_it() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.create_order.new"))
+        .unwrap()
+        .steps
+        .retain(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionArtifactNotAvailable {
+            operation: id("operation.create_order"),
+            location: at(&[(1, None)]),
+            artifact: id("intent.create_order.publish_created"),
+            consumer: ProgramUse::EffectIntent {
+                intent: id("intent.create_order.publish_created"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn rejects_an_output_consumed_where_no_path_establishes_it() {
+    let mut model = load_flash_checkout();
+
+    model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.create_order.new"))
+        .unwrap()
+        .steps
+        .retain(|step| !matches!(step, TransactionStep::EstablishTransactionOutput(_)));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionArtifactNotAvailable {
+            operation: id("operation.create_order"),
+            location: at(&[(2, None)]),
+            artifact: id("output.create_order"),
+            consumer: ProgramUse::Return {
+                request: id("input.create_order.request"),
+            },
+        }]
+    );
+}
+
+/// Wraps the first step of create_order's program in a branch on the
+/// request's `sku`, with the given arms.
+fn branch_create_order(
+    model: &mut Model,
+    then: Vec<OperationStep>,
+    otherwise: Option<Vec<OperationStep>>,
+) {
+    let program = program_mut(model, "operation.create_order");
+
+    program.steps.remove(0);
+
+    program.steps.insert(
+        0,
+        OperationStep::Branch(Branch {
+            condition: Condition::Eq {
+                value: input_ref("input.create_order.request", &["sku"]),
+                equals: SelectorValue::Literal(Literal::String("bundle".into())),
+            },
+            then: OperationBlock { steps: then },
+            otherwise: otherwise.map(|steps| OperationBlock { steps }),
+        }),
+    );
+}
+
+#[test]
+fn accepts_an_artifact_established_on_every_arm() {
+    let mut model = load_flash_checkout();
+
+    branch_create_order(
+        &mut model,
+        vec![run("tx.create_order.new")],
+        Some(vec![run("tx.create_order.new")]),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_an_artifact_established_on_one_arm_only() {
+    let mut model = load_flash_checkout();
+
+    branch_create_order(&mut model, vec![run("tx.create_order.new")], None);
+
+    let errors = validation::validate(&model);
+
+    // Falling through the branch establishes nothing, so neither the
+    // intent execution nor the returned payload is definitely supplied.
+    assert_eq!(
+        errors,
+        vec![
+            ValidationError::TransactionArtifactNotAvailable {
+                operation: id("operation.create_order"),
+                location: at(&[(1, None)]),
+                artifact: id("intent.create_order.publish_created"),
+                consumer: ProgramUse::EffectIntent {
+                    intent: id("intent.create_order.publish_created"),
+                },
+            },
+            ValidationError::TransactionArtifactNotAvailable {
+                operation: id("operation.create_order"),
+                location: at(&[(2, None)]),
+                artifact: id("output.create_order"),
+                consumer: ProgramUse::Return {
+                    request: id("input.create_order.request"),
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn rejects_a_step_after_a_terminal() {
+    let mut model = load_flash_checkout();
+
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .push(OperationStep::Complete);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::UnreachableProgramStep {
+            operation: id("operation.create_order"),
+            location: at(&[(3, None)]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_return_on_a_subscription_input() {
+    let mut model = load_flash_checkout();
+
+    program_mut(&mut model, "operation.reserve_inventory").steps[2] =
+        return_ok("input.reserve_inventory.created", Derivation::Unspecified);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidInputKind {
+            subject: id("operation.reserve_inventory"),
+            input: id("input.reserve_inventory.created"),
+            expected: validation::InputKind::Request,
+            actual: validation::InputKind::Subscription,
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_return_for_another_operations_request() {
+    let mut model = load_flash_checkout();
+
+    program_mut(&mut model, "operation.reserve_inventory").steps[2] =
+        return_ok("input.create_order.request", Derivation::Unspecified);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidReferenceOwner {
+            subject: id("operation.reserve_inventory"),
+            reference: id("input.create_order.request"),
+            expected_owner: id("operation.reserve_inventory"),
+            actual_owner: Some(id("operation.create_order")),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_variant_field_path_that_does_not_resolve() {
+    let mut model = load_flash_checkout();
+
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(failed) = &mut matched.err.steps[0] else {
+        panic!("expected the failure publication");
+    };
+
+    let Derivation::Deterministic { from } = &mut failed.values else {
+        panic!("expected a deterministic derivation");
+    };
+
+    from[2].path = path(&["does_not_exist"]);
+
+    let errors = validation::validate(&model);
+
+    // The err payload resolves against the provider's err schema.
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("operation.charge_payment"),
+            schema: id("schema.ChargeDeclined"),
+            path: path(&["does_not_exist"]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_a_transaction_output_field_path_that_does_not_resolve() {
+    let mut model = load_flash_checkout();
+
+    let OperationStep::Return(returned) =
+        &mut program_mut(&mut model, "operation.create_order").steps[2]
+    else {
+        panic!("expected the return");
+    };
+
+    let ResultOutcome::Ok {
+        values: Derivation::Deterministic { from },
+    } = &mut returned.outcome
+    else {
+        panic!("expected a deterministic ok outcome");
+    };
+
+    from[0].path = path(&["does_not_exist"]);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::InvalidFieldPath {
+            subject: id("operation.create_order"),
+            schema: id("schema.CreateOrderResponse"),
+            path: path(&["does_not_exist"]),
+        }]
+    );
+}
+
+#[test]
+fn rejects_duplicate_result_bindings() {
+    let mut model = load_flash_checkout();
+
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let first = program.steps[0].clone();
+
+    program.steps.insert(0, first);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("result.charge_payment.card")
+    ));
+}
+
+#[test]
+fn rejects_a_condition_root_out_of_scope() {
+    let mut model = load_flash_checkout();
+
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(
+            0,
+            OperationStep::Branch(Branch {
+                condition: Condition::Eq {
+                    value: input_ref("input.cancel_order.request", &["order_id"]),
+                    equals: SelectorValue::Literal(Literal::Int(1)),
+                },
+                then: OperationBlock::default(),
+                otherwise: None,
+            }),
+        );
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::ValueSourceOutOfScope {
+            subject: id("operation.create_order"),
+            source: id("input.cancel_order.request"),
+            owner: id("operation.cancel_order"),
+        }]
+    );
+}
+
+/// Adds a second output to create_order, established by a new keyed
+/// transaction whose derivation reads the first output.
+fn add_receipt_transaction(model: &mut Model) {
+    let operation = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap();
+
+    operation.transaction_outputs.insert(
+        id("output.create_order.receipt"),
+        TransactionOutput {
+            schema: id("schema.CreateOrderResponse"),
+        },
+    );
+
+    operation.transactions.insert(
+        id("tx.create_order.receipt"),
+        Transaction {
+            data_model: None,
+            isolation: TransactionIsolation::Unspecified,
+            idempotency: IdempotencyGuarantee::Unspecified,
+            steps: vec![TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    output: id("output.create_order.receipt"),
+                    values: Derivation::Deterministic {
+                        from: vec![ValueRef {
+                            source: ValueSource::TransactionOutput(id("output.create_order")),
+                            path: path(&["order_id"]),
+                        }],
+                    },
+                },
+            )],
+        },
+    );
+}
+
+#[test]
+fn accepts_an_output_consumed_by_a_later_transaction() {
+    let mut model = load_flash_checkout();
+
+    add_receipt_transaction(&mut model);
+
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(1, run("tx.create_order.receipt"));
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+}
+
+#[test]
+fn rejects_an_output_consumed_by_a_transaction_before_it_is_available() {
+    let mut model = load_flash_checkout();
+
+    add_receipt_transaction(&mut model);
+
+    program_mut(&mut model, "operation.create_order")
+        .steps
+        .insert(0, run("tx.create_order.receipt"));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionArtifactNotAvailable {
+            operation: id("operation.create_order"),
+            location: at(&[(0, None)]),
+            artifact: id("output.create_order"),
+            consumer: ProgramUse::Transaction {
+                transaction: id("tx.create_order.receipt"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn a_same_transaction_output_reference_needs_only_step_order() {
+    let mut model = load_flash_checkout();
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap();
+
+    operation.transaction_outputs.insert(
+        id("output.create_order.receipt"),
+        TransactionOutput {
+            schema: id("schema.CreateOrderResponse"),
+        },
+    );
+
+    let establish = TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
+        output: id("output.create_order.receipt"),
+        values: Derivation::Deterministic {
+            from: vec![ValueRef {
+                source: ValueSource::TransactionOutput(id("output.create_order")),
+                path: path(&["order_id"]),
+            }],
+        },
+    });
+
+    // After the step that establishes the first output: satisfied by
+    // atomicity, whatever the program guarantees at entry.
+    let transaction = operation
+        .transactions
+        .get_mut(&id("tx.create_order.new"))
+        .unwrap();
+
+    transaction.steps.push(establish.clone());
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+
+    // Before it: the reference reads an output no step has produced.
+    let transaction = model
+        .operations
+        .get_mut(&id("operation.create_order"))
+        .unwrap()
+        .transactions
+        .get_mut(&id("tx.create_order.new"))
+        .unwrap();
+
+    transaction.steps.pop();
+    transaction.steps.insert(0, establish);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionArtifactNotAvailable {
+            operation: id("operation.create_order"),
+            location: at(&[(0, None)]),
+            artifact: id("output.create_order"),
+            consumer: ProgramUse::Transaction {
+                transaction: id("tx.create_order.new"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
+    let mut model = load_flash_checkout();
+
+    // A transaction reading the provider's ok payload, executed only
+    // inside the ok arm.
+    let operation = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap();
+
+    operation.transaction_outputs.insert(
+        id("output.charge_payment.authorization"),
+        TransactionOutput {
+            schema: id("schema.ChargeAccepted"),
+        },
+    );
+
+    operation.transactions.insert(
+        id("tx.charge_payment.record"),
+        Transaction {
+            data_model: None,
+            isolation: TransactionIsolation::Unspecified,
+            idempotency: IdempotencyGuarantee::Unspecified,
+            steps: vec![TransactionStep::EstablishTransactionOutput(
+                EstablishTransactionOutput {
+                    output: id("output.charge_payment.authorization"),
+                    values: Derivation::Deterministic {
+                        from: vec![ValueRef {
+                            source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
+                            path: path(&["authorization_id"]),
+                        }],
+                    },
+                },
+            )],
+        },
+    );
+
+    let OperationStep::MatchResult(matched) = &mut operation.program.steps[1] else {
+        panic!("expected the card match");
+    };
+
+    matched.ok.steps.insert(0, run("tx.charge_payment.record"));
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
+
+    // Executed after the join, the same transaction reads a payload no
+    // arm selects.
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let OperationStep::MatchResult(matched) = &mut program.steps[1] else {
+        panic!("expected the card match");
+    };
+
+    matched.ok.steps.remove(0);
+    matched.ok.steps.pop();
+    matched.err.steps.pop();
+
+    program.steps.push(run("tx.charge_payment.record"));
+    program.steps.push(OperationStep::Complete);
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::EffectResultVariantOutOfScope {
+            operation: id("operation.charge_payment"),
+            location: at(&[(2, None)]),
+            result: id("result.charge_payment.card"),
+            variant: ResultVariant::Ok,
+            consumer: ProgramUse::Transaction {
+                transaction: id("tx.charge_payment.record"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn intent_execution_evaluates_the_effect_declarations_roots() {
+    let mut model = load_flash_checkout();
+
+    // The transition-owned effect gains a propagation rooted in an
+    // output the operation declares but never establishes; the intent
+    // execution is where the declaration is evaluated.
+    let operation = model
+        .operations
+        .get_mut(&id("operation.apply_payment"))
+        .unwrap();
+
+    operation.transaction_outputs.insert(
+        id("output.apply_payment.receipt"),
+        TransactionOutput {
+            schema: id("schema.OrderPaid"),
+        },
+    );
+
+    let machine = model
+        .state_machines
+        .get_mut(&id("machine.order_lifecycle"))
+        .unwrap();
+
+    let transition = machine
+        .transitions
+        .get_mut(&id("transition.order.mark_paid"))
+        .unwrap();
+
+    let archspec::spec::TransitionSideEffect::Publication(paid) = transition
+        .side_effects
+        .get_mut(&id("effect.order.paid"))
+        .unwrap()
+    else {
+        panic!("effect.order.paid should be a publication");
+    };
+
+    paid.idempotency_key_propagation
+        .push(archspec::spec::IdempotencyKeyPropagation {
+            source: archspec::spec::IdempotencyKey {
+                components: vec![ValueRef {
+                    source: ValueSource::TransactionOutput(id("output.apply_payment.receipt")),
+                    path: path(&["order_id"]),
+                }],
+            },
+            target: archspec::spec::IdempotencyKey {
+                components: vec![ValueRef {
+                    source: ValueSource::Effect(id("effect.order.paid")),
+                    path: path(&["event_id"]),
+                }],
+            },
+        });
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(
+        errors,
+        vec![ValidationError::TransactionArtifactNotAvailable {
+            operation: id("operation.apply_payment"),
+            location: at(&[(1, None)]),
+            artifact: id("output.apply_payment.receipt"),
+            consumer: ProgramUse::EffectIntent {
+                intent: id("intent.apply_payment.order_paid"),
+            },
+        }]
+    );
+}
+
+#[test]
+fn a_nested_match_keeps_the_enclosing_arms_variant_selection() {
+    let mut model = load_flash_checkout();
+
+    // A redundant nested match on the same binding inside the ok arm;
+    // the step after its join is still inside the outer ok arm, so the
+    // ok payload stays in scope there.
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(captured) = &mut matched.ok.steps[0] else {
+        panic!("expected the capture publication");
+    };
+
+    let Derivation::Deterministic { from } = &mut captured.values else {
+        panic!("expected a deterministic derivation");
+    };
+
+    from.push(ValueRef {
+        source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
+        path: path(&["authorization_id"]),
+    });
+
+    matched.ok.steps.insert(
+        0,
+        OperationStep::MatchResult(archspec::spec::MatchResult {
+            result: id("result.charge_payment.card"),
+            ok: OperationBlock::default(),
+            err: OperationBlock::default(),
+        }),
+    );
+
+    let errors = validation::validate(&model);
+
+    assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
 }

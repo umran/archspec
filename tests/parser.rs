@@ -6,11 +6,11 @@ use std::{
 use archspec::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Derivation, Effect, Field, FlowStep, Id, IdempotencyGuarantee,
-        Input, LaneConcurrency, Literal, MessageIdentity, RequestIdentity, ScalarType, Schema,
-        SelectorValue,
-        FieldPath, SchemaCompleteness, ServiceKind, TopicOrdering, TransactionStep,
-        TransitionSideEffect, TypeRef, ValueSource,
+        CompletionRequirement, Condition, Derivation, Effect, Field, FieldPath, Id,
+        IdempotencyGuarantee, Input, LaneConcurrency, Literal, MessageIdentity, OperationStep,
+        RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
+        SelectorValue, ServiceKind, TopicOrdering, TransactionStep, TransitionSideEffect, TypeRef,
+        ValueSource,
     },
 };
 
@@ -205,7 +205,7 @@ fn flash_checkout_parses_stimulus_identities() {
     };
 
     // Every carried schema is identified by its event_id.
-    assert_eq!(mapping.len(), 5);
+    assert_eq!(mapping.len(), 6);
 
     for identity in mapping.values() {
         assert_eq!(identity.len(), 1);
@@ -280,7 +280,7 @@ fn parses_flash_checkout_model() {
     assert_eq!(model.revision.0, 1);
 
     assert_eq!(model.services.len(), 3);
-    assert_eq!(model.schemas.len(), 13);
+    assert_eq!(model.schemas.len(), 17);
     assert_eq!(model.data_models.len(), 2);
     assert_eq!(model.topics.len(), 1);
     assert_eq!(model.state_machines.len(), 1);
@@ -453,15 +453,15 @@ fn flash_checkout_parses_keyed_transaction_idempotency() {
 
     // The artifact carries no key of its own; durable identity comes
     // from the committing transaction.
-    let result = model
+    let output = model
         .operations
         .get(&Id("operation.create_order".into()))
         .unwrap()
-        .invocation_results
-        .get(&Id("result.create_order".into()))
-        .expect("create_order result should exist");
+        .transaction_outputs
+        .get(&Id("output.create_order".into()))
+        .expect("create_order output should exist");
 
-    assert_eq!(result.schema, Id("schema.CreateOrderResponse".into()));
+    assert_eq!(output.schema, Id("schema.CreateOrderResponse".into()));
 }
 
 #[test]
@@ -523,8 +523,8 @@ fn flash_checkout_parses_transition_side_effect_intent() {
 
     assert!(matches!(effect, TransitionSideEffect::Publication(_)));
 
-    // The operation names that implicitly established intent so a flow
-    // step can execute it.
+    // The operation names that implicitly established intent so a
+    // program step can execute it.
     let apply_payment = model
         .operations
         .get(&Id("operation.apply_payment".into()))
@@ -631,35 +631,45 @@ fn flash_checkout_parses_recoverability_requirements() {
 }
 
 #[test]
-fn flash_checkout_parses_execute_effect_values() {
+fn flash_checkout_parses_execute_effect_values_and_result_bindings() {
     let source = read_fixture("flash_checkout.yaml");
 
     let model = yaml::parse(&source).expect("flash checkout fixture should parse");
 
-    let flow = model
+    let program = &model
         .operations
         .get(&Id("operation.charge_payment".into()))
         .expect("charge_payment should exist")
-        .flows
-        .get(&Id("flow.charge_payment".into()))
-        .expect("charge_payment flow should exist");
+        .program;
 
-    // Unknown provenance is declared explicitly, never omitted.
-    let FlowStep::ExecuteEffect { effect, values } = &flow.steps[0] else {
+    // Unknown provenance is declared explicitly, never omitted; the
+    // card charge binds the provider's result.
+    let OperationStep::ExecuteEffect(card) = &program.steps[0] else {
         panic!("first step should execute the card charge");
     };
 
-    assert_eq!(effect, &Id("effect.charge_payment.card".into()));
+    assert_eq!(card.effect, Id("effect.charge_payment.card".into()));
+    assert_eq!(card.values, Derivation::Unspecified);
+    assert_eq!(card.result, Some(Id("result.charge_payment.card".into())));
 
-    assert_eq!(values, &Derivation::Unspecified);
-
-    let FlowStep::ExecuteEffect { effect, values } = &flow.steps[1] else {
-        panic!("second step should execute the capture publication");
+    let OperationStep::MatchResult(matched) = &program.steps[1] else {
+        panic!("second step should match the card result");
     };
 
-    assert_eq!(effect, &Id("effect.charge_payment.publish_captured".into()));
+    assert_eq!(matched.result, Id("result.charge_payment.card".into()));
 
-    let Derivation::Deterministic { from } = values else {
+    let OperationStep::ExecuteEffect(captured) = &matched.ok.steps[0] else {
+        panic!("the ok arm should publish the capture");
+    };
+
+    assert_eq!(
+        captured.effect,
+        Id("effect.charge_payment.publish_captured".into())
+    );
+
+    assert_eq!(captured.result, None);
+
+    let Derivation::Deterministic { from } = &captured.values else {
         panic!("publication values should declare deterministic provenance");
     };
 
@@ -671,6 +681,199 @@ fn flash_checkout_parses_execute_effect_values() {
     );
 
     assert_eq!(from[0].path.0, vec!["event_id".to_string()]);
+
+    // The err arm reads the provider's err payload.
+    let OperationStep::ExecuteEffect(failed) = &matched.err.steps[0] else {
+        panic!("the err arm should publish the failure");
+    };
+
+    let Derivation::Deterministic { from } = &failed.values else {
+        panic!("failure values should declare deterministic provenance");
+    };
+
+    assert_eq!(
+        from[2].source,
+        ValueSource::EffectResultErr(Id("result.charge_payment.card".into()))
+    );
+
+    assert_eq!(from[2].path.0, vec!["reason".to_string()]);
+
+    assert!(matches!(matched.ok.steps[1], OperationStep::Complete));
+    assert!(matches!(matched.err.steps[1], OperationStep::Complete));
+}
+
+#[test]
+fn flash_checkout_parses_request_results_and_return_terminals() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let create_order = model
+        .operations
+        .get(&Id("operation.create_order".into()))
+        .expect("create_order should exist");
+
+    let Some(Input::Request(request)) = create_order
+        .inputs
+        .get(&Id("input.create_order.request".into()))
+    else {
+        panic!("create_order input should be a request");
+    };
+
+    assert_eq!(request.result.ok, Id("schema.CreateOrderResponse".into()));
+    assert_eq!(request.result.err, Id("schema.RequestRejected".into()));
+    assert_eq!(
+        request.result.schema(ResultVariant::Err),
+        &Id("schema.RequestRejected".into())
+    );
+
+    let OperationStep::Return(returned) = &create_order.program.steps[2] else {
+        panic!("the program should end by returning the request's result");
+    };
+
+    assert_eq!(returned.request, Id("input.create_order.request".into()));
+    assert_eq!(returned.outcome.variant(), ResultVariant::Ok);
+
+    let ResultOutcome::Ok { values } = &returned.outcome else {
+        panic!("create_order returns ok");
+    };
+
+    let Derivation::Deterministic { from } = values else {
+        panic!("the returned payload declares provenance");
+    };
+
+    assert_eq!(
+        from[0].source,
+        ValueSource::TransactionOutput(Id("output.create_order".into()))
+    );
+
+    // The output is established by the transaction; the return only
+    // reads it.
+    let transaction = create_order
+        .transactions
+        .get(&Id("tx.create_order.new".into()))
+        .expect("create_order transaction should exist");
+
+    assert!(matches!(
+        &transaction.steps[2],
+        TransactionStep::EstablishTransactionOutput(establish)
+            if establish.output == Id("output.create_order".into())
+    ));
+}
+
+#[test]
+fn external_effects_declare_their_result_contract() {
+    let source = read_fixture("flash_checkout.yaml");
+
+    let model = yaml::parse(&source).expect("flash checkout fixture should parse");
+
+    let Some(Effect::External(card)) = model
+        .operations
+        .get(&Id("operation.charge_payment".into()))
+        .unwrap()
+        .effects
+        .get(&Id("effect.charge_payment.card".into()))
+    else {
+        panic!("card charge should be an external effect");
+    };
+
+    let result = card.result.as_ref().expect("the provider returns a result");
+
+    assert_eq!(result.ok, Id("schema.ChargeAccepted".into()));
+    assert_eq!(result.err, Id("schema.ChargeDeclined".into()));
+
+    // A boundary modeling no synchronous result says so.
+    let source = read_fixture("video_streaming.yaml");
+
+    let model = yaml::parse(&source).expect("video streaming fixture should parse");
+
+    let Some(Effect::External(push)) = model
+        .operations
+        .get(&Id("operation.notify_published".into()))
+        .unwrap()
+        .effects
+        .get(&Id("effect.notify_published.push".into()))
+    else {
+        panic!("push should be an external effect");
+    };
+
+    assert_eq!(push.result, None);
+}
+
+#[test]
+fn a_result_binding_may_be_omitted() {
+    let step: OperationStep = serde_yaml::from_str(
+        "kind: execute_effect
+effect: effect.x
+values:
+  kind: unspecified",
+    )
+    .expect("a step without a binding should parse");
+
+    let OperationStep::ExecuteEffect(step) = step else {
+        panic!("expected an execute_effect step");
+    };
+
+    assert_eq!(step.result, None);
+
+    let step: OperationStep = serde_yaml::from_str(
+        "kind: execute_effect_intent
+intent: intent.x",
+    )
+    .expect("an intent execution without a binding should parse");
+
+    assert!(matches!(
+        step,
+        OperationStep::ExecuteEffectIntent(step) if step.result.is_none()
+    ));
+}
+
+#[test]
+fn a_branch_condition_accepts_the_selector_value_surface() {
+    let condition: Condition = serde_yaml::from_str(
+        "kind: eq
+value:
+  source: input:input.checkout
+  path: region
+equals: CA",
+    )
+    .expect("a literal comparison should parse");
+
+    let Condition::Eq { value, equals } = &condition else {
+        panic!("expected an equality");
+    };
+
+    assert_eq!(
+        value.source,
+        ValueSource::Input(Id("input.checkout".into()))
+    );
+    assert_eq!(
+        equals,
+        &SelectorValue::Literal(Literal::String("CA".into()))
+    );
+    assert!(condition.is_deterministic());
+    assert_eq!(condition.roots().len(), 1);
+
+    let condition: Condition = serde_yaml::from_str(
+        "kind: not
+condition:
+  kind: and
+  conditions:
+    - kind: eq
+      value:
+        source: input:input.checkout
+        path: region
+      equals:
+        source: transaction_output:output.routing
+        path: region
+    - kind: unspecified",
+    )
+    .expect("a nested condition should parse");
+
+    // Both sides of a reference comparison are roots; `unspecified`
+    // anywhere makes the whole decision non-deterministic.
+    assert_eq!(condition.roots().len(), 2);
+    assert!(!condition.is_deterministic());
 }
 
 #[test]
@@ -1048,11 +1251,14 @@ id: input.create_order.request",
 fn every_value_source_kind_has_a_shorthand() {
     assert_eq!(parse_source("input:x"), ValueSource::Input(Id("x".into())));
 
-    assert_eq!(parse_source("effect:x"), ValueSource::Effect(Id("x".into())));
+    assert_eq!(
+        parse_source("effect:x"),
+        ValueSource::Effect(Id("x".into()))
+    );
 
     assert_eq!(
-        parse_source("invocation_result:x"),
-        ValueSource::InvocationResult(Id("x".into()))
+        parse_source("transaction_output:x"),
+        ValueSource::TransactionOutput(Id("x".into()))
     );
 
     assert_eq!(
@@ -1064,12 +1270,31 @@ fn every_value_source_kind_has_a_shorthand() {
         parse_source("transaction_read:x"),
         ValueSource::TransactionRead(Id("x".into()))
     );
+
+    assert_eq!(
+        parse_source("effect_result_ok:x"),
+        ValueSource::EffectResultOk(Id("x".into()))
+    );
+
+    assert_eq!(
+        parse_source("effect_result_err:x"),
+        ValueSource::EffectResultErr(Id("x".into()))
+    );
+
+    // The retired kind is refused rather than read as anything else.
+    let message = source_error("invocation_result:x");
+
+    assert!(
+        message.contains("is not a value source kind"),
+        "error should reject the retired kind, got: {message}"
+    );
 }
 
 #[test]
 fn a_value_source_always_names_its_kind() {
-    // The kind is never inferred from the id: the five variants index
-    // five namespaces, and an id may be declared in more than one.
+    // The kind is never inferred from the id: the seven variants index
+    // six namespaces (the two result-payload kinds share the binding
+    // namespace), and an id may be declared in more than one.
     let message = source_error("input.create_order.request");
 
     assert!(
