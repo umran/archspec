@@ -48,7 +48,9 @@ pub enum MessageIdentity {
     /// cover a subset of the carried schemas — identity is meaningful
     /// knowledge per schema, unlike the ordering key, which must route
     /// every carried message.
-    Keyed { mapping: BTreeMap<Id, Vec<FieldPath>> },
+    Keyed {
+        mapping: BTreeMap<Id, Vec<FieldPath>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

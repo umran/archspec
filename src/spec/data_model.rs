@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,15 @@ pub struct DataModel {
     pub objects: BTreeMap<Id, DataObject>,
 }
 
+/// A logical class of persistent object instances.
+///
+/// Object-history requirements (a `linearizable` flag on the object)
+/// are deliberately absent: Archspec does not yet model the
+/// replication, routing, and availability facts from which such a
+/// requirement could be proved, so the DSL currently models transaction
+/// and operation correctness without declaring end-to-end persistent
+/// object history consistency. They are to be reconsidered, as a
+/// coherent family, alongside a future model of distributed persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataObject {
@@ -27,23 +36,9 @@ pub struct DataObject {
     /// or a composite identity:
     ///
     /// TenantAccount[tenant_id, account_id]
+    ///
+    /// Identity is what selector precision, insert uniqueness,
+    /// alias and interference analysis, locking, state-machine subject
+    /// identity, and transaction reasoning rest on.
     pub identity: Vec<FieldPath>,
-
-    /// History-level correctness properties required of this object.
-    pub requirements: ObjectRequirements,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ObjectRequirements {
-    pub history: BTreeSet<ObjectHistoryRequirement>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ObjectHistoryRequirement {
-    /// Operations observing or mutating instances of this object
-    /// must collectively admit a legal sequential history that
-    /// respects real-time precedence.
-    Linearizable,
 }

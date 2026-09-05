@@ -5,20 +5,19 @@ import { Collapsible } from "@cloudflare/kumo/components/collapsible";
 import { Empty } from "@cloudflare/kumo/components/empty";
 import { Flow } from "@cloudflare/kumo/components/flow";
 import { Table } from "@cloudflare/kumo/components/table";
-import { Tabs } from "@cloudflare/kumo/components/tabs";
 import { Text } from "@cloudflare/kumo/components/text";
 import { ArrowSquareOutIcon, CaretRightIcon, GraphIcon } from "@phosphor-icons/react";
 import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
-import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, responseSource, routing } from "../lib/explain";
+import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, routing } from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
-import { effectDef, effectSummary } from "../lib/index";
+import { effectDef, effectSummary, locationLabel, walkProgram, type StepHop } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
-import { concurrencyText, predicateText } from "../lib/text";
+import { concurrencyText, conditionText, predicateText } from "../lib/text";
 import { useApp, type DetailContext } from "../state/AppState";
 import { Fact, FactBadge, IdLink, KeyComponents, Mono, Muted, RefText, SectionCard, StatusBadge, StatusChips, selectableRow } from "../panels/parts";
-import type { Effect, Id, InvocationFlow, Operation, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
+import type { Effect, Id, Operation, OperationBlock, RequirementKind, TransactionStep, TransitionSideEffect } from "../types/model";
 
 type EffectKind = (Effect | TransitionSideEffect)["kind"];
 
@@ -34,7 +33,8 @@ const STEP_STRIPE: Record<string, string> = {
   tx: "var(--arch-edge-request)",
   effect: "var(--arch-edge-publish)",
   intent: "var(--arch-edge-publish)",
-  response: "var(--arch-edge-client)",
+  decision: "var(--arch-edge-subscribe)",
+  terminal: "var(--arch-edge-client)",
 };
 
 function EffectKindBadge({ kind }: { kind: EffectKind | null }) {
@@ -44,7 +44,7 @@ function EffectKindBadge({ kind }: { kind: EffectKind | null }) {
 }
 
 // ---------------------------------------------------------------------------
-// Flow steps
+// Program steps
 // ---------------------------------------------------------------------------
 
 type StepCardProps = Omit<ComponentPropsWithRef<"div">, "children"> & {
@@ -58,7 +58,8 @@ type StepCardProps = Omit<ComponentPropsWithRef<"div">, "children"> & {
 
 /** A selectable step card. Rendered through `Flow.Node`'s `render` prop, so
  *  it forwards the ref, position style and data attributes Kumo's layout
- *  engine clones onto it. */
+ *  engine clones onto it. Decision cards nest whole blocks, so activation
+ *  stops propagating: a click inside an arm selects the inner card only. */
 function StepCard({ selKey, detailId, ctx, stripe, dashed, children, className, style, ...rest }: StepCardProps) {
   const { selection, select } = useApp();
   const selected = selection === selKey;
@@ -68,10 +69,14 @@ function StepCard({ selKey, detailId, ctx, stripe, dashed, children, className, 
       {...rest}
       role="button"
       tabIndex={0}
-      onClick={activate}
+      onClick={(e) => {
+        e.stopPropagation();
+        activate();
+      }}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
+          e.stopPropagation();
           activate();
         }
       }}
@@ -120,8 +125,8 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
     case "establish_effect_intent":
       kind = "establish intent"; title = shortId(step.intent); note = `values: ${step.values.kind}`;
       break;
-    case "establish_invocation_result":
-      kind = "establish result"; title = shortId(step.result); note = `values: ${step.values.kind}`;
+    case "establish_transaction_output":
+      kind = "establish output"; title = shortId(step.output); note = `values: ${step.values.kind}`;
       break;
   }
 
@@ -169,173 +174,222 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
   );
 }
 
-/** One invocation flow: its selectable header strip and the step diagram.
- *  Steps are Kumo `Flow` nodes, so the connectors between them are drawn
- *  by Kumo's layout engine and follow the cards as they expand. */
-function FlowBody({ opId, op, flowId, flow }: { opId: Id; op: Operation; flowId: Id; flow: InvocationFlow }) {
-  const { model, index, expandedTx, toggleTx, selection, select } = useApp();
+/** One arm of a decision: its label and its block, rendered recursively. */
+function DecisionArm({ opId, op, label, block, hops }: { opId: Id; op: Operation; label: string; block: OperationBlock | null; hops: StepHop[] }) {
+  return (
+    <div className="min-w-0 space-y-2 rounded-md border border-kumo-hairline bg-kumo-elevated/30 p-2">
+      <Badge variant="outline">{label}</Badge>
+      {block ? (
+        block.steps.length ? (
+          <ProgramBlock opId={opId} op={op} block={block} hops={hops} nested />
+        ) : (
+          <Muted>empty arm</Muted>
+        )
+      ) : (
+        <Muted>falls through</Muted>
+      )}
+    </div>
+  );
+}
+
+/** One block of the program as a vertical sequence of step cards. The
+ *  top-level block is a Kumo Flow with connectors; nested arm blocks are
+ *  plain stacks, so arbitrary nesting stays legible. */
+function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean }) {
+  const { model, index, expandedTx, toggleTx } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
   const viaTransition = (effectId: Id) => {
     const owner = index.get(effectId);
     return !!owner && owner.kind === "effect" && owner.machine !== undefined;
   };
 
-  const nodes: { key: string; element: ReactElement }[] = [];
-  flow.steps.forEach((step, si) => {
-    const key = `${flowId}/${si}`;
-    if (step.kind === "transaction") {
-      const tx = op.transactions[step.transaction];
-      const expandKey = `${flowId}/${si}`;
-      const expanded = expandedTx.has(expandKey);
-      nodes.push({
-        key,
-        element: (
-          <StepCard selKey={`tx:${step.transaction}`} detailId={step.transaction} stripe={STEP_STRIPE.tx}>
-            <div className="flex items-center justify-between gap-2">
-              <Badge variant="neutral">transaction</Badge>
-              <StatusChips obKey={`${opId}/${step.transaction}`} />
-            </div>
-            <StepTitle>{shortId(step.transaction)}</StepTitle>
-            {tx ? (
-              <>
-                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                  <FactBadge fact={commitGuarantee(tx.idempotency)} />
-                  {tx.idempotency.kind === "deduplicated_by" && (
-                    <span>by <KeyComponents value={tx.idempotency.key} /></span>
-                  )}
-                </div>
-                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                  <FactBadge fact={isolation(tx.isolation)} />
-                  {tx.data_model && <span>on {shortId(tx.data_model)}</span>}
-                </div>
-                <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(expandKey)}>
-                  <Collapsible.Trigger
-                    className="mt-2 flex w-full cursor-pointer items-center gap-1 text-xs text-kumo-link hover:underline"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <CaretRightIcon size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
-                    {tx.steps.length} step{tx.steps.length === 1 ? "" : "s"}
-                  </Collapsible.Trigger>
-                  <Collapsible.Panel>
-                    <div className="mt-1.5 space-y-0.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-1">
-                      {tx.steps.map((ts, ti) => (
-                        <TxStepRow key={ti} step={ts} index={ti} txId={step.transaction} opId={opId} />
-                      ))}
-                    </div>
-                  </Collapsible.Panel>
-                </Collapsible.Root>
-              </>
-            ) : (
-              <div className="mt-1 text-xs text-kumo-danger">unresolved transaction</div>
-            )}
-          </StepCard>
-        ),
-      });
-    } else if (step.kind === "execute_effect") {
-      nodes.push({
-        key,
-        element: (
-          <StepCard selKey={`fx:${si}:${step.effect}`} detailId={step.effect} stripe={STEP_STRIPE.effect}>
-            <div className="flex flex-wrap items-center gap-1.5">
-              <Badge variant="neutral">execute effect</Badge>
-              <EffectKindBadge kind={effectKind(step.effect)} />
-            </div>
-            <StepTitle>{shortId(step.effect)}</StepTitle>
-            <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect)}</div>
-            <div className="mt-1 text-xs text-kumo-subtle">
-              instance: <Badge variant={step.values.kind === "deterministic" ? "info" : "warning"}>{step.values.kind}</Badge>
-            </div>
-          </StepCard>
-        ),
-      });
-    } else {
-      const intent = op.effect_intents[step.intent];
-      const eff = intent?.effect;
-      nodes.push({
-        key,
-        element: (
-          <StepCard selKey={`fi:${si}:${step.intent}`} detailId={step.intent} stripe={STEP_STRIPE.intent} dashed>
-            <div className="flex flex-wrap items-center gap-1.5">
-              <Badge variant="neutral">execute intent</Badge>
-              <EffectKindBadge kind={eff ? effectKind(eff) : null} />
-              {eff && viaTransition(eff) && <Badge variant="info">via transition</Badge>}
-            </div>
-            <StepTitle>{shortId(step.intent)}</StepTitle>
-            <div className="mt-1 text-xs text-kumo-subtle">{eff ? effectSummary(model, index, eff) : "unresolved intent"}</div>
-          </StepCard>
-        ),
-      });
+  const stepCtx = (location: string): DetailContext => ({ step: { op: opId, location } });
+
+  const nodes: { key: string; element: ReactElement }[] = block.steps.map((step, si) => {
+    const ownHops: StepHop[] = [...hops, { step: si }];
+    const location = locationLabel(ownHops);
+    const under = (arm: StepHop["arm"]): StepHop[] => [...hops, { step: si, arm }];
+
+    switch (step.kind) {
+      case "transaction": {
+        const tx = op.transactions[step.transaction];
+        const expanded = expandedTx.has(location);
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`tx:${step.transaction}`} detailId={step.transaction} stripe={STEP_STRIPE.tx}>
+              <div className="flex items-center justify-between gap-2">
+                <Badge variant="neutral">transaction</Badge>
+                <StatusChips obKey={`${opId}/${step.transaction}`} />
+              </div>
+              <StepTitle>{shortId(step.transaction)}</StepTitle>
+              {tx ? (
+                <>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                    <FactBadge fact={commitGuarantee(tx.idempotency)} />
+                    {tx.idempotency.kind === "deduplicated_by" && (
+                      <span>by <KeyComponents value={tx.idempotency.key} /></span>
+                    )}
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                    <FactBadge fact={isolation(tx.isolation)} />
+                    {tx.data_model && <span>on {shortId(tx.data_model)}</span>}
+                  </div>
+                  <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(location)}>
+                    <Collapsible.Trigger
+                      className="mt-2 flex w-full cursor-pointer items-center gap-1 text-xs text-kumo-link hover:underline"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <CaretRightIcon size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
+                      {tx.steps.length} step{tx.steps.length === 1 ? "" : "s"}
+                    </Collapsible.Trigger>
+                    <Collapsible.Panel>
+                      <div className="mt-1.5 space-y-0.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-1">
+                        {tx.steps.map((ts, ti) => (
+                          <TxStepRow key={ti} step={ts} index={ti} txId={step.transaction} opId={opId} />
+                        ))}
+                      </div>
+                    </Collapsible.Panel>
+                  </Collapsible.Root>
+                </>
+              ) : (
+                <div className="mt-1 text-xs text-kumo-danger">unresolved transaction</div>
+              )}
+            </StepCard>
+          ),
+        };
+      }
+
+      case "execute_effect":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`fx:${location}:${step.effect}`} detailId={step.effect} stripe={STEP_STRIPE.effect}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="neutral">execute effect</Badge>
+                <EffectKindBadge kind={effectKind(step.effect)} />
+                {step.result && <Badge variant="info">binds {shortId(step.result)}</Badge>}
+              </div>
+              <StepTitle>{shortId(step.effect)}</StepTitle>
+              <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect)}</div>
+              <div className="mt-1 text-xs text-kumo-subtle">
+                instance: <Badge variant={step.values.kind === "deterministic" ? "info" : "warning"}>{step.values.kind}</Badge>
+              </div>
+            </StepCard>
+          ),
+        };
+
+      case "execute_effect_intent": {
+        const intent = op.effect_intents[step.intent];
+        const eff = intent?.effect;
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`fi:${location}:${step.intent}`} detailId={step.intent} stripe={STEP_STRIPE.intent} dashed>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="neutral">execute intent</Badge>
+                <EffectKindBadge kind={eff ? effectKind(eff) : null} />
+                {eff && viaTransition(eff) && <Badge variant="info">via transition</Badge>}
+                {step.result && <Badge variant="info">binds {shortId(step.result)}</Badge>}
+              </div>
+              <StepTitle>{shortId(step.intent)}</StepTitle>
+              <div className="mt-1 text-xs text-kumo-subtle">{eff ? effectSummary(model, index, eff) : "unresolved intent"}</div>
+            </StepCard>
+          ),
+        };
+      }
+
+      case "match_result":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="neutral">match result</Badge>
+                <Badge variant="outline">step {location}</Badge>
+              </div>
+              <StepTitle>{shortId(step.result)}</StepTitle>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <DecisionArm opId={opId} op={op} label="ok" block={step.ok} hops={under("ok")} />
+                <DecisionArm opId={opId} op={op} label="err" block={step.err} hops={under("err")} />
+              </div>
+            </StepCard>
+          ),
+        };
+
+      case "branch":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.decision}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="neutral">branch</Badge>
+                <Badge variant="outline">step {location}</Badge>
+                {step.condition.kind === "unspecified" && <Badge variant="warning">condition unspecified</Badge>}
+              </div>
+              <StepTitle>
+                <span className="break-words font-normal text-kumo-subtle">{conditionText(step.condition)}</span>
+              </StepTitle>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <DecisionArm opId={opId} op={op} label="then" block={step.then} hops={under("then")} />
+                <DecisionArm opId={opId} op={op} label="otherwise" block={step.otherwise} hops={under("otherwise")} />
+              </div>
+            </StepCard>
+          ),
+        };
+
+      case "return":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.terminal}>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="neutral">return</Badge>
+                <Badge variant={step.outcome.kind === "ok" ? "success" : "warning"}>{step.outcome.kind}</Badge>
+              </div>
+              <StepTitle>{shortId(step.request)}</StepTitle>
+              <div className="mt-1 text-xs text-kumo-subtle">
+                payload: <Badge variant={step.outcome.values.kind === "deterministic" ? "info" : "warning"}>{step.outcome.values.kind}</Badge>
+              </div>
+            </StepCard>
+          ),
+        };
+
+      case "complete":
+        return {
+          key: location,
+          element: (
+            <StepCard selKey={`step:${location}`} detailId={opId} ctx={stepCtx(location)} stripe={STEP_STRIPE.terminal}>
+              <Badge variant="neutral">complete</Badge>
+              <div className="mt-1 text-xs text-kumo-subtle">terminates without a returned value</div>
+            </StepCard>
+          ),
+        };
     }
   });
 
-  if (flow.response) {
-    const resp = op.responses[flow.response];
-    nodes.push({
-      key: `${flowId}/response`,
-      element: (
-        <StepCard selKey={`resp:${flow.response}`} detailId={flow.response} stripe={STEP_STRIPE.response}>
-          <Badge variant="neutral">terminal response</Badge>
-          <StepTitle>{shortId(flow.response)}</StepTitle>
-          {resp && (
-            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-              <IdLink id={resp.schema}>{shortId(resp.schema)}</IdLink>
-              <FactBadge fact={responseSource(resp.source.kind === "invocation_result" ? resp.source.result : null)} />
-              {resp.source.kind === "invocation_result" && (
-                <span>from <IdLink id={resp.source.result}>{shortId(resp.source.result)}</IdLink></span>
-              )}
-            </div>
-          )}
-        </StepCard>
-      ),
-    });
+  if (nested) {
+    // Arm blocks stack without connectors; the surrounding decision card
+    // already communicates the sequence.
+    return (
+      <div className="space-y-2" style={{ "--step-w": "100%" } as CSSProperties}>
+        {nodes.map((n) => (
+          <div key={n.key}>{n.element}</div>
+        ))}
+      </div>
+    );
   }
 
-  const flowKey = `flow:${flowId}`;
-  const flowSelected = selection === flowKey;
-  const activateFlow = () => select(flowKey, { id: flowId, ctx: {} });
-  const stepCount = flow.steps.length;
-
   return (
-    <div className="space-y-3">
-      <div
-        role="button"
-        tabIndex={0}
-        onClick={activateFlow}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            activateFlow();
-          }
-        }}
-        title="Flow details"
-        className={`flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 rounded-md px-2 py-1.5 hover:bg-kumo-tint ${flowSelected ? "bg-kumo-tint ring-1 ring-kumo-brand" : ""}`}
-      >
-        <Badge variant="outline">flow</Badge>
-        <span className="font-mono text-[13px] font-semibold text-kumo-strong">{shortId(flowId)}</span>
-        <span className="text-xs text-kumo-subtle">
-          {stepCount} step{stepCount === 1 ? "" : "s"} · terminal response{" "}
-          {flow.response ? <Mono>{shortId(flow.response)}</Mono> : "none"}
-        </span>
-        <span className="ml-auto flex items-center gap-2">
-          <StatusChips obKey={`${opId}/${flowId}`} />
-          <CaretRightIcon size={12} className="text-kumo-inactive" />
-        </span>
-      </div>
-
-      {nodes.length ? (
-        // Step cards size to the section body (a container), capped for
-        // readability; the 12px accounts for the diagram's own padding,
-        // which keeps selection rings clear of its clipping edge.
-        <div className="arch-flow" style={{ "--step-w": "min(640px, 100cqw - 12px)" } as CSSProperties}>
-          <Flow orientation="vertical" canvas={false} padding={{ x: 6, y: 6 }}>
-            {nodes.map((n) => (
-              <Flow.Node key={n.key} id={n.key} render={n.element} />
-            ))}
-          </Flow>
-        </div>
-      ) : (
-        <Muted>flow declares no steps</Muted>
-      )}
+    // Step cards size to the section body (a container), capped for
+    // readability; the 12px accounts for the diagram's own padding,
+    // which keeps selection rings clear of its clipping edge.
+    <div className="arch-flow" style={{ "--step-w": "min(640px, 100cqw - 12px)" } as CSSProperties}>
+      <Flow orientation="vertical" canvas={false} padding={{ x: 6, y: 6 }}>
+        {nodes.map((n) => (
+          <Flow.Node key={n.key} id={n.key} render={n.element} />
+        ))}
+      </Flow>
     </div>
   );
 }
@@ -358,7 +412,7 @@ function RequirementsTable({ id, op }: { id: Id; op: Operation }) {
       declares: (
         <>
           <KeyComponents value={r.key} />
-          {r.response === "replay_consistent" && <Badge variant="info">replay-consistent response</Badge>}
+          {r.result === "replay_consistent" && <Badge variant="info">replay-consistent result</Badge>}
         </>
       ),
     }));
@@ -466,7 +520,16 @@ function InputsTable({ op }: { op: Operation }) {
               <Table.Cell>
                 <span className="flex flex-wrap items-center gap-1.5">
                   {input.kind === "request" ? (
-                    <FactBadge fact={requestIdentity(input.identity)} />
+                    <>
+                      <FactBadge fact={requestIdentity(input.identity)} />
+                      <span className="inline-flex flex-wrap items-center gap-1 text-xs text-kumo-subtle">
+                        <Mono>Result&lt;</Mono>
+                        <IdLink id={input.result.ok}>{shortId(input.result.ok)}</IdLink>
+                        <Mono>,</Mono>
+                        <IdLink id={input.result.err}>{shortId(input.result.err)}</IdLink>
+                        <Mono>&gt;</Mono>
+                      </span>
+                    </>
                   ) : (
                     <>
                       <FactBadge fact={delivery(input.delivery)} />
@@ -489,7 +552,7 @@ function InputsTable({ op }: { op: Operation }) {
 // ---------------------------------------------------------------------------
 
 export function OperationView({ id }: { id: string }) {
-  const { model, navigateTo, route, obligations } = useApp();
+  const { model, navigateTo, obligations } = useApp();
   const op = model.operations[id];
 
   if (!op) {
@@ -504,9 +567,7 @@ export function OperationView({ id }: { id: string }) {
   const requirementCount = reqs.serialization.length + reqs.ordering.length + reqs.idempotency.length + reqs.recoverability.length;
   const inputCount = Object.keys(op.inputs).length;
   const transactionCount = Object.keys(op.transactions).length;
-  const flowIds = Object.keys(op.flows);
-  const requested = route.view === "op" ? route.flow : null;
-  const activeFlow = requested && op.flows[requested] ? requested : (flowIds[0] ?? null);
+  const stepCount = walkProgram(op.program).length;
   const machines = [...new Set(
     Object.values(op.transactions).flatMap((tx) => tx.steps.flatMap((s) => (s.kind === "transition" ? [s.machine] : []))),
   )];
@@ -524,7 +585,7 @@ export function OperationView({ id }: { id: string }) {
             <Fact label="service"><IdLink id={op.service}>{shortId(op.service)}</IdLink></Fact>
             <Fact label="concurrency"><Badge variant="neutral">{concurrencyText(op.execution.concurrency)}</Badge></Fact>
             <Fact label="transactions">{transactionCount}</Fact>
-            <Fact label="flows">{flowIds.length}</Fact>
+            <Fact label="program steps">{stepCount}</Fact>
             {machines.length > 0 && (
               <Fact label="state machines">
                 {machines.map((m) => (
@@ -551,31 +612,15 @@ export function OperationView({ id }: { id: string }) {
         </SectionCard>
 
         <SectionCard
-          title="Flows"
-          count={flowIds.length}
-          hint="alternative invocation paths — an invocation takes exactly one"
+          title="Program"
+          count={stepCount}
+          hint="the operation's one causal control structure — a decision's arms are alternatives, and every path ends at a terminal"
           bodyClassName="@container space-y-4 p-4"
         >
-          {activeFlow ? (
-            <>
-              <Tabs
-                variant="underline"
-                tabs={flowIds.map((flowId) => ({
-                  value: flowId,
-                  label: (
-                    <span className="inline-flex items-center gap-1.5">
-                      {shortId(flowId)}
-                      <StatusChips obKey={`${id}/${flowId}`} />
-                    </span>
-                  ),
-                }))}
-                value={activeFlow}
-                onValueChange={(value) => navigateTo(hashes.op(id, value))}
-              />
-              <FlowBody key={activeFlow} opId={id} op={op} flowId={activeFlow} flow={op.flows[activeFlow]} />
-            </>
+          {op.program.steps.length ? (
+            <ProgramBlock opId={id} op={op} block={op.program} hops={[]} />
           ) : (
-            <Empty size="sm" title="operation declares no flows" />
+            <Empty size="sm" title="operation declares no program steps" />
           )}
         </SectionCard>
       </div>

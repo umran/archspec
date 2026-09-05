@@ -44,11 +44,7 @@ pub fn page_data_json(
         .map_err(|error| format!("cannot serialize page data: {error}"))
 }
 
-pub fn render(
-    model: &Model,
-    report: Option<&ProverReport>,
-    title: &str,
-) -> Result<String, String> {
+pub fn render(model: &Model, report: Option<&ProverReport>, title: &str) -> Result<String, String> {
     let data = PageData {
         title,
         model,
@@ -97,8 +93,7 @@ mod tests {
         )
         .expect("fixture parses");
 
-        let html =
-            render(&model, None, "smoke </script> test").expect("renders");
+        let html = render(&model, None, "smoke </script> test").expect("renders");
 
         // Placeholders substituted.
         assert!(!html.contains(DATA_PLACEHOLDER));
@@ -118,8 +113,8 @@ mod tests {
 
     #[test]
     fn neutralizes_script_data_escape_sequences() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/minimal.yaml");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal.yaml");
 
         let mut model = archspec::parser::yaml::parse(
             &std::fs::read_to_string(path).expect("fixture readable"),
@@ -129,11 +124,8 @@ mod tests {
         // A `<!--` followed by `<script` inside script data would put
         // the HTML parser into the double-escaped state, where the
         // template's real close tag no longer ends the element.
-        if let Some(archspec::spec::Schema::Canonical(schema)) =
-            model.schemas.values_mut().next()
-        {
-            schema.description =
-                Some("Beware <!-- of <script> tricks".to_string());
+        if let Some(archspec::spec::Schema::Canonical(schema)) = model.schemas.values_mut().next() {
+            schema.description = Some("Beware <!-- of <script> tricks".to_string());
         } else {
             panic!("fixture has a canonical schema");
         }

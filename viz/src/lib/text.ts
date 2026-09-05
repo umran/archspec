@@ -1,7 +1,9 @@
 import type {
   Concurrency,
+  Condition,
   Derivation,
   SelectorPredicate,
+  SelectorValue,
   TypeRef,
   ValueRef,
 } from "../types/model";
@@ -23,6 +25,24 @@ export function predicateText(p: SelectorPredicate): string {
     }
     case "and":
       return p.predicates.map(predicateText).join(" ∧ ");
+  }
+}
+
+function selectorValueText(v: SelectorValue): string {
+  return v.kind === "value" ? refString(v.value) : JSON.stringify(v.value.value);
+}
+
+/** A branch condition, spelled the way a reader would. */
+export function conditionText(c: Condition): string {
+  switch (c.kind) {
+    case "unspecified":
+      return "unspecified";
+    case "eq":
+      return `${refString(c.value)} = ${selectorValueText(c.equals)}`;
+    case "and":
+      return c.conditions.map(conditionText).join(" ∧ ");
+    case "not":
+      return `¬(${conditionText(c.condition)})`;
   }
 }
 

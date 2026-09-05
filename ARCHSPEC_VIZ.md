@@ -1,9 +1,10 @@
 # archspec-viz
 
-`archspec-viz` renders an Archspec model as a single self-contained,
-interactive HTML file. The output opens directly from disk, makes no
-network requests, and can be attached to a review, a PR, or a design
-document as-is.
+`archspec-viz` renders an Archspec model — its services, operations
+and their programs, topics, state machines, and the checker's verdicts
+on them — as a single self-contained, interactive HTML file. The
+output opens directly from disk, makes no network requests, and can be
+attached to a review, a PR, or a design document as-is.
 
 ```
 cargo run --bin archspec-viz -- tests/fixtures/flash_checkout.yaml
@@ -37,7 +38,8 @@ around them. Edges are the model's information routes:
   operation invokes
 
 A dashed edge is a *declared but unexecuted* capability: the effect
-exists on the operation but no declared flow executes it. Effects owned
+exists on the operation but no step of its program executes it; a solid
+edge's detail names the program steps that do, by location. Effects owned
 by state-machine transitions are attributed to the operations that
 execute them through intents and marked "via transition". Click
 anything for a structured detail panel; double-click an operation to
@@ -46,27 +48,35 @@ fit control in the canvas corner re-centres the graph.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, concurrency, transaction and
-flow counts, the state machines it drives, verdict tally), then three
-sections as Kumo layer cards. **Requirements** is a table — one row
-per declared requirement with its key, its semantics (replay-consistent
-response, guaranteed completion) and, when a report is loaded, the
-verdict over its obligations; **Inputs** is a table of what starts an
-invocation (kind, source schema or topic, delivery and dispatch
-semantics, request identity). The two sit side by side when the pane
-is wide enough and stack otherwise. **Flows** shows the operation's
-invocation flows as tabs, one flow at a time — flows are alternative
-execution paths (an invocation takes exactly one), so they are never
-shown side by side. The active tab is part of the route
-(`#/op/<id>?flow=<flow id>`), so a flow can be deep-linked, and
-clicking a flow in the operation's detail panel or an obligation's
-subject lands directly on it. The flow itself is a Kumo `Flow`
-diagram: steps in order with connectors drawn between them;
-transaction steps expand in place into their transaction's steps
-(reads, writes, inserts, deletes, locks, transitions, artifact
-establishments), each with its selector, provenance, and a full detail
-panel; execute-effect steps are badged with the effect's kind
-(publication, request, external); transition steps link into the
-owning state machine. Selecting any row or card opens its detail
+program-step counts, the state machines it drives, verdict tally),
+then three sections as Kumo layer cards. **Requirements** is a table —
+one row per declared requirement with its key, its semantics
+(replay-consistent result, guaranteed completion) and, when a report
+is loaded, the verdict over its obligations; **Inputs** is a table of
+what starts an invocation (kind, source schema or topic, delivery and
+dispatch semantics, request identity and result contract). The two sit
+side by side when the pane is wide enough and stack otherwise.
+**Program** shows the operation's one program — there is exactly one,
+so there are no tabs and the route carries no query: `#/op/<id>` lands
+on it directly, and an old `?flow=` query is tolerated and ignored.
+The program is a Kumo `Flow` diagram: steps in order with connectors
+drawn between them, each card carrying its location as the checker
+names it (`3`, `3.ok.1` — one-based, arm-qualified). Transaction steps
+expand in place into their transaction's steps (reads, writes,
+inserts, deletes, locks, transitions, transaction-output and
+effect-intent establishments), each with its selector, provenance, and
+a full detail panel; execute-effect and execute-intent steps are
+badged with the effect's kind (publication, request, external) and,
+when they bind a result, with the binding's id and its `Result<Ok,
+Err>` schemas; `match_result` and `branch` cards show their arms side
+by side — `ok` / `err`, or `then` / `otherwise` with the condition
+rendered as text — each arm a nested sequence of the same step cards;
+`return` cards name the request input and the variant and provenance
+of the payload they construct, and `complete` cards close a
+subscription-driven path. Transition steps link into the owning state
+machine. An obligation's evidence names paths by the arms they take
+(`ok(result.x) › then(step 3)`), which is how a reader finds the
+decision it points at. Selecting any row or card opens its detail
 panel.
 
 **State machine view** (`#/machine/<id>`). A page header (name,
@@ -85,8 +95,9 @@ deep link or history navigation selects what the address bar names.
 
 **Detail panel.** Every model entity — service, operation, topic,
 schema, data object, state machine, state, transition, input, effect,
-intent, result, response, transaction, transaction step, flow,
-requirement, or graph edge — opens a detail panel organized into
+intent, transaction output, result binding, transaction, transaction
+step, program step, requirement, or graph edge — opens a detail panel
+organized into
 collapsible, counted sections (execution, inputs, declared effects,
 requirements, obligations, …) with key/value grids, typed badges, and
 clickable ids that open the referenced entity in place.
@@ -123,10 +134,14 @@ transitions in the machine view inherit theirs.
 
 ## The obligation report
 
-The report format is `archspec::analyzer::report` (`ProverReport`):
-one obligation per declared requirement — serialization, ordering,
-idempotency, response replay, recoverability, object history — with
-status `proven`, `disproven`, or `unknown`. Unknown is epistemic: the
+The report format is `archspec::analyzer::report` (`ProverReport`,
+`format: 2`): one obligation per declared requirement — serialization,
+ordering, idempotency, result replay (the result half of an idempotency
+requirement declaring `result: replay_consistent`), recoverability —
+with status `proven`, `disproven`, or `unknown`. Format 2 replaced the
+response-replay property with result replay, dropped object-history
+obligations and the flow subject, and made proofs cite the program
+paths and decisions they rest on. Unknown is epistemic: the
 checker could not establish the property, typically because a
 required fact is `unspecified` or no V1 verifier attempts that family.
 It is never evidence of a violation.
@@ -144,10 +159,15 @@ archspec-viz model.yaml --example-report      # scaffold, every status unknown
 ```
 
 `tests/fixtures/flash_checkout.report.json` is generated by the checker
-(see `tests/report.rs`), and records the fixture's genuine findings:
-the non-deduplicated, read-dependent `tx.reserve_inventory` is neither
-idempotent nor recoverable, and the external card charge is explicitly
-not deduplicated.
+(see `tests/report.rs`), and records the fixture's genuine findings
+(10 proven, 4 unknown): the non-deduplicated, read-dependent
+`tx.reserve_inventory` is neither idempotent nor recoverable, and that
+gap propagates to `create_order`'s idempotency through the
+`OrderCreated` cascade; the external card charge is explicitly not
+deduplicated; and `charge_payment` branches on the payment provider's
+result — `ok` publishes the capture, `err` the decline with its reason
+— which no declared fact makes replay-consistent, so a retry is not
+established to take the same arm.
 
 ## Front end
 

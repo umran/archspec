@@ -6,6 +6,8 @@
 §8.2 and §9. Implemented the same day
 (`analyzer::verification::ordering`).
 
+**Terminology note (2026-09-04).** `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` replaced the operation-execution surface. Read retired terms as follows: an *invocation flow* is a *path of the operation program*; `FlowStep` is `OperationStep`; `InvocationResult` / `EstablishInvocationResult` / `ValueSource::invocation_result` are `TransactionOutput` / `EstablishTransactionOutput` / `transaction_output`; `Response` / `ResponseSource` / `flow.response` are the `return` terminal and `RequestInput.result`; *response replay* is *result replay*; `ObjectHistoryRequirement::linearizable` is removed and deferred. The ordering analysis does not walk the program — its precedence source is the topic and its mechanism the lane — so nothing here changes; the idempotency verdicts it records for duplicate coverage are now computed per admitted path with each decision judged where it is taken (V3 §48), which is what altered the `transcode_video` record in §6.
+
 ---
 
 ## 1. The requirement and what a proof owes
@@ -176,8 +178,13 @@ and each declares its ordering key as `order_id` of its subscription.
 
 Video streaming (`tests/fixtures/video_streaming.yaml`):
 `transcode_video` and `publish_video` order by `video_id` on a topic
-keyed by `video_id`, route `by_topic_key` at lane concurrency one, and
-both idempotency requirements are proven. **Both proven.**
+keyed by `video_id`, route `by_topic_key` at lane concurrency one.
+**Both proven.** Their duplicate records differ since 2026-09-04:
+`publish_video`'s idempotency requirement is proven, while
+`transcode_video`'s is named as unproven — the fixture now matches on
+the external transcoding engine's result, and no declared fact makes
+that result replay-consistent (V3 §48.2). As in flash checkout, that
+is reported under idempotency; the ordering verdict is unchanged.
 
 ---
 
@@ -209,3 +216,9 @@ Executed 2026-08-22:
 3. **Implementation**: `analyzer::verification::ordering`, reusing the
    serialization verifier's key identity; the idempotency verdicts are
    read only to record duplicate coverage.
+
+Revised 2026-09-04: terminology note added for the operation-execution
+revision (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`, §48);
+§6's video-streaming record corrected for `transcode_video`, whose
+idempotency requirement is no longer proven. No ordering verdict
+changed, and no behavior of the ordering verifier changed.

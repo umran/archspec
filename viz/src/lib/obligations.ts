@@ -9,8 +9,6 @@ export function subjectKeys(subject: Subject): string[] {
   switch (subject.kind) {
     case "operation":
       return [subject.operation];
-    case "flow":
-      return [`${subject.operation}/${subject.flow}`];
     case "transaction":
       return [`${subject.operation}/${subject.transaction}`];
     case "object":
@@ -68,8 +66,6 @@ export function subjectText(subject: Subject): string {
       return subject.requirement !== undefined
         ? `${subject.operation} · requirement #${subject.requirement}`
         : subject.operation;
-    case "flow":
-      return `${subject.operation} · ${subject.flow}`;
     case "transaction":
       return `${subject.operation} · ${subject.transaction}`;
     case "object":
@@ -85,7 +81,6 @@ export function subjectText(subject: Subject): string {
 export function subjectGroup(subject: Subject): Id {
   switch (subject.kind) {
     case "operation":
-    case "flow":
     case "transaction":
       return subject.operation;
     case "object":
@@ -100,6 +95,6 @@ export function subjectGroup(subject: Subject): Id {
 /** Whether an obligation's property is the one a requirement chip refers to. */
 export function propertyMatchesRequirement(property: Obligation["property"], kind: string): boolean {
   if (property.kind === kind) return true;
-  // response_replay obligations anchor to the idempotency requirement.
-  return kind === "idempotency" && property.kind === "response_replay";
+  // result_replay obligations anchor to the idempotency requirement.
+  return kind === "idempotency" && property.kind === "result_replay";
 }

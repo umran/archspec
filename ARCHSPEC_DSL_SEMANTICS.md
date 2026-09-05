@@ -1,7 +1,7 @@
 # Archspec DSL Semantics
 
-**Status:** Normative semantic contract for the current DSL, prior to the verification/proof-solver stage.  
-**Source of truth inspected:** `master`, 2026-08-16.  
+**Status:** Normative semantic contract for the current DSL and the V1 verifiers.  
+**Source of truth inspected:** the operation-execution revision (`operation-execution-revision`, implementing `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`), 2026-09-04.  
 **Implementation namespace:** `src/spec/`.
 
 This document defines what an Archspec declaration means, what it does **not** mean, and what a verifier may soundly infer from it. It is intentionally stricter than a field reference: the purpose is to prevent the analyzer, an LLM author, and a human reader from silently assigning different meanings to the same declaration.
@@ -16,9 +16,9 @@ A declaration belongs to one of three semantic categories:
 
 | Category | Meaning | Examples |
 |---|---|---|
-| **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, flows, effects, transactions, schemas |
+| **Structural fact** | Describes what the modeled program can do or how entities relate. | operations, programs, effects, transactions, transaction outputs, result contracts, schemas |
 | **Implementation guarantee / assumption** | A fact the model claims the implementation or external system provides. The verifier may rely on it, subject to implementation conformance. | topic ordering, delivery semantics, dispatch routing, transaction isolation, locks, effect idempotency, concurrency bounds, request/message identity |
-| **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | operation serialization, operation ordering, operation idempotency, object linearizability |
+| **Requirement / obligation** | A property the architecture says must hold. It is **not** a guarantee merely because it is declared. The verifier must prove it from facts and structure. | operation serialization, operation ordering, operation idempotency, result replay consistency, recoverability |
 
 A structurally valid model is therefore not necessarily a safe model. Validation establishes that declarations are coherent and references are meaningful. Verification establishes whether the declared requirements follow from the declared facts and architecture.
 
@@ -283,24 +283,25 @@ means the object is identified by the tuple:
 
 It does **not** mean that `tenant_id` and `account_id` are alternative independent keys.
 
-Object identity is important for selector precision, insertion uniqueness, conflict analysis, linearizability domains, and lock reasoning. The declared identity is intrinsic to the logical object model: two distinct successfully created instances cannot share the same complete identity.
+Object identity is what selector precision, insert uniqueness, alias and interference analysis, locking, state-machine subject identity, and transaction reasoning rest on. The declared identity is intrinsic to the logical object model: two distinct successfully created instances cannot share the same complete identity.
 
-### `ObjectRequirements.history`
+### Object-history requirements are deferred
 
-Object history declarations are **requirements**, not guarantees.
+A `DataObject` declares no requirements. The former `ObjectRequirements.history` surface, with its `linearizable` member, is removed from the active DSL (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §3).
 
-#### `linearizable`
+The reason is scope, not doubt about the property. Linearizability is a meaningful correctness property even for a single logical store, but an object-history requirement becomes provable only once the model exposes the facts it rests on — replica topology, authoritative write location, read routing, quorum and leader guarantees, propagation lag, partition and failure assumptions, real-time observation boundaries — and Archspec does not yet model any of them. Keeping the requirement would have introduced an object-history proof domain with nothing to discharge it from.
 
-For each logical object instance, all modeled operations observing or mutating that instance must collectively admit a legal sequential history that respects real-time precedence.
+Nothing else is weakened by the removal:
 
-Important consequences:
+- transaction isolation, explicit locks, lock ordering, object identity, selector overlap, transaction conflicts, operation serialization, and operation ordering keep their declared meanings;
+- `serializable` continues to mean transaction serializability under §17 and must **not** be reinterpreted as linearizability;
+- no V1 verifier emits a verdict on object linearizability, and none infers it — from serializable isolation, locks, operation serialization, or topic ordering. Those facts retain only their own semantics.
 
-- linearizability is per logical object identity unless a broader object is modeled;
-- it is stronger than serializability because it includes real-time precedence;
-- serializable transactions do not automatically prove object linearizability;
-- linearizability of one object does not imply atomicity or serializability across different object identities.
+The scope rule for this iteration is:
 
-The proof solver must discharge this requirement from the architecture's actual synchronization, ordering, transactional, and execution facts.
+> Archspec models transaction and operation correctness without declaring end-to-end persistent-object history consistency requirements.
+
+Object-history requirements are to be reconsidered, as a coherent family rather than an isolated flag, when Archspec begins modeling distributed persistence and availability. Their exact vocabulary is not predeclared here.
 
 ---
 
@@ -413,7 +414,7 @@ This distinction is central to ambiguous-ordering analysis.
 
 An operation is a logical unit of application behavior owned by one service.
 
-Its declaration contains possible invocation sources, effects, transaction artifacts, transactions, flows, requirements, and execution facts.
+Its declaration contains possible invocation sources, effects, transaction artifacts (effect intents and transaction outputs), transactions, one program, requirements, and execution facts.
 
 `description` is documentation only and has no proof semantics.
 
@@ -431,23 +432,23 @@ An effect appearing in `operation.effects` is an effect the operation **may exec
 
 Declaration alone does not mean the effect occurs.
 
-Execution is represented by a flow step, an effect-intent path, or another construct that explicitly associates the effect with behavior.
+Execution is represented by a program step — a direct `execute_effect`, or an `execute_effect_intent` of an intent a transaction established — that explicitly associates the effect with behavior (§16).
 
 ### Transactions are declarations, not executions
 
-A transaction in `operation.transactions` is an atomic unit available to the operation's flows.
+A transaction in `operation.transactions` is an atomic unit available to the operation's program.
 
-It executes only when a flow references it.
+It executes only when a program step references it.
 
-### Flows are alternative complete paths
+### The program is one explicit causal control structure
 
-Each `InvocationFlow` describes one permitted terminal path through an invocation.
+`operation.program` is the operation's single control structure: a block of steps executed in order, in which a decision — `match_result` over a bound effect result, or `branch` over an ordinary predicate — nests further blocks, and every reachable path ends at an explicit terminal: `return`, constructing a request input's declared result, or `complete`, returning nothing.
 
-Its steps occur in declaration order.
+The structure is acyclic by construction. There are no loops; iteration is deliberately deferred (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §40).
 
-Multiple flows represent alternatives. Their mere existence does not mean that the flows execute concurrently or that every invocation executes every flow.
+An invocation traverses one path through the program: one arm at each decision, one terminal. Alternative paths exist only where a decision selects between them, and the DSL exposes what each decision rests on. There is no unexplained selection among alternative complete flows.
 
-A flow may terminate with a declared response. `response: null` is natural for subscription-driven operations or other paths with no request response.
+Control flow describes causality. It is not a durable workflow, a checkpoint, or a program counter: a retry traverses the same declared control from the first step, and what it re-encounters is judged by the transaction and effect replay rules (§16–§18).
 
 ---
 
@@ -481,6 +482,22 @@ Request identity is a **guarantee provided by the request boundary**, declaring 
 Equivalently, the payload is a function of its identity fields. The canonical conforming implementations are a boundary that rejects a retry whose payload disagrees with the original request under the same identity, and a caller contract strong enough to stand in a proof. A rejected conflicting request is not an admitted invocation of the operation, so rejection preserves the guarantee.
 
 The declaration is an implementation guarantee, not a mechanism: it fixes what the payload of a logical request is, deduplicates nothing, and does not by itself discharge any idempotency requirement.
+
+### `RequestInput.result`
+
+A request input declares the `Result<Ok, Err>` contract a request through it returns:
+
+```yaml
+result:
+  ok: schema.CreateOrderResponse
+  err: schema.RequestRejected
+```
+
+`ResultType { ok, err }` names two schemas. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Archspec models the algebraic outcome, not any language's API around it.
+
+The contract belongs to the input rather than to the operation. An operation may expose several request inputs, and a `RequestEffect` already targets one specific `operation + input`, from which it inherits this contract (§13.2). Subscription inputs have no synchronous result.
+
+`Err` is a **logical** outcome, not an interrupted execution (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §12). `Err(CardDeclined)` means a synchronous interaction completed and reported a modeled failure; it is conclusive. A crash, a timeout, a lost connection, or uncertainty about whether a remote completed is not an `Err` payload — it is the idempotency and recoverability problem of §9. The two must not be conflated.
 
 ## 8.2 Subscription input
 
@@ -649,26 +666,36 @@ A transaction may contribute to the proof in two distinct ways:
 1. **natural replayability**, derived from the transaction's declared semantics and deterministic provenance; or
 2. **explicit durable keyed commit deduplication**, declared with `DeduplicatedBy { key }` on the transaction.
 
-These mechanisms are not interchangeable. A transaction that merely prevents a second commit is not necessarily naturally replayable, because a retry may need to reproduce transaction artifacts required by later flow steps.
+These mechanisms are not interchangeable. A transaction that merely prevents a second commit is not necessarily naturally replayable, because a retry may need to reproduce transaction artifacts required by later program steps.
 
-The requirement is not discharged merely because the operation has a field named `idempotency_key`, because an `InvocationResult` exists, or because an `EffectIntent` exists.
+The requirement is not discharged merely because the operation has a field named `idempotency_key`, because a `TransactionOutput` exists, or because an `EffectIntent` exists.
 
-V1 discharges the requirement over each admitted flow — one with no response, or one with the triggering input's response — under the governing key's population (§12). Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole flow even after terminal completion. Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer collapses duplicate deliveries, each through its own proven requirement. A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a least fixpoint. Response consistency is the separate response-replay obligation below. Vacuously discharged: an empty population; no admitted flow, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
+V1 discharges the requirement over each **admitted path** of the program — a path ending at `complete`, or at a `return` for the triggering input (§16) — under the governing key's population (§12). Three legs must hold on every admitted path:
 
-### `ResponseReplayRequirement::replay_consistent`
+- **State leg.** Every transaction step must be retry-safe: a keyed commit over a stable key, or naturally replayable. There is no final-step exemption, because a duplicate delivery re-drives the whole program even after terminal completion.
+- **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer collapses duplicate deliveries, each through its own proven requirement.
+- **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no compatibility argument for the two histories; the decision is an obstacle.
 
-When replay consistency is required, retries for the same logical invocation must resolve the same logical response.
+A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint, so a cycle whose members each collapse the others' duplicates is proven and marked coinductive (§13.2). Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
 
-A response sourced from an `InvocationResult` is replay-consistent only when the solver can establish a safe path to the same logical result. V1 recognizes two principal routes:
+### `ResultReplayRequirement::replay_consistent`
 
-1. the establishing transaction is naturally replayable and the result derivation is replay-deterministic; or
-2. the establishing transaction is `DeduplicatedBy { key }`, and the exact result produced by the prior successful keyed commit is durably retained and recovered.
+The `result` member of an idempotency requirement asks a further question of the request result:
 
-`ResponseSource::InvocationResult` does not, by itself, imply durable memoization or transaction idempotency.
+> Repeated admitted attempts in the same logical idempotency class that return a request result must return the same result variant and a replay-equivalent payload.
 
-### `response: unspecified`
+No privileged result artifact is involved. A request result is constructed directly at a `return` terminal from values available there (§15), so the proof is control-path replay plus ordinary provenance. V1 discharges the requirement, for each admitted path ending at a `return` for the triggering input:
 
-No replay-stability requirement is declared for the response.
+1. every decision on the path must replay (§16): a class then follows one path to one terminal, which fixes the variant; and
+2. the terminal's derivation must be replay-deterministic in the context at the terminal — `deterministic` over roots the §18 rules make stable, including transaction outputs by route A or route B of §17 and effect results whose targets prove their own consistency.
+
+Premise 2 may name other operations' verdicts, since a bound request result is stable only when the target proves its result replay-consistent for the targeted input (§13.2). The checks are therefore computed as a greatest fixpoint over the replay-consistent requirements, exactly as idempotency's are: a cycle of requests whose members each pass their local checks is proven, and the proof is marked coinductive.
+
+Vacuously discharged: a key triggered by a subscription, or a program none of whose admitted paths returns a result for the triggering input — there is nothing to stabilize.
+
+### `result: unspecified`
+
+No replay-stability requirement is declared for the result.
 
 This does not waive the operation's idempotency requirement for side effects.
 
@@ -676,11 +703,11 @@ This does not waive the operation's idempotency requirement for side effects.
 
 A recoverability requirement keyed by an `IdempotencyKey` means:
 
-> The logical invocation identified by that key must reach terminal execution of a declared flow.
+> The logical invocation identified by that key must reach a valid terminal of the operation program — `return` or `complete` — after any modeled interruption.
 
 Recoverability is a **progress** obligation. Idempotency is a **safety** obligation. They are deliberately separate requirements because neither implies the other.
 
-An idempotency requirement constrains what repeated attempts may do. It is satisfied vacuously by never retrying at all: an invocation that crashes after its transaction commits and is never re-driven produces no duplicate work, and therefore violates nothing. Idempotency consequently says nothing about whether the remaining steps of an interrupted flow ever execute.
+An idempotency requirement constrains what repeated attempts may do. It is satisfied vacuously by never retrying at all: an invocation that crashes after its transaction commits and is never re-driven produces no duplicate work, and therefore violates nothing. Idempotency consequently says nothing about whether the remaining steps of an interrupted program ever execute.
 
 This is exactly the gap left by §14 and §22. Consider:
 
@@ -699,25 +726,31 @@ The keyed commit makes `E` *recoverable*, and the operation's idempotency requir
 
 The key identifies the retry-equivalence class in the same sense as §12: attempts sharing the key are attempts at the same logical invocation, so re-driving one of them continues that invocation rather than starting a new one.
 
-The requirement does not name a flow. An invocation takes one of the operation's alternative flows (§7), and a resumed attempt reaching the terminal step of any admitted flow discharges the obligation. Which flows remain admissible after a partial execution is the open question recorded in the revision draft; the requirement is deliberately stated so as not to prejudge it.
+The requirement does not name a path. An invocation takes one path through the program (§7), and a resumed attempt reaching the terminal of any admitted path discharges the obligation. Which paths remain admissible after a partial execution is the open question recorded in the revision draft; the requirement is deliberately stated so as not to prejudge it.
 
 ### `completion: resumable`
 
-An interrupted attempt must be **able** to resume and drive a declared flow to its terminal step.
+An interrupted attempt must be **able** to resume and drive the program to a terminal.
 
 For every prefix at which the invocation may fail, the solver must establish that a continuation exists:
 
 - each already-committed transaction resolves on re-encounter, by natural replay or by `Commit(T,K)` (§17);
 - every artifact a later step consumes is replay-available by route A or route B of §17;
-- no step is left in a state from which the flow cannot proceed.
+- no step is left in a state from which the program cannot proceed.
 
-V1 discharges this by **same-flow continuation**: for every admitted flow — one with no response, or one whose response belongs to the triggering input — re-driving that same flow from its first step must reach its terminal completion. Every transaction step needs re-encounter resolution except one that is the final step of a response-less flow, after which no failing prefix exists. Consumed artifacts are judged by the replay rules of §17 and §18, with references inside the establishing transaction exempt by atomicity, and a commit key judged by the re-encounter analysis rather than double-counted as consumption. This is a sufficient route and deliberately does not prejudge which other flows a resumed attempt may take (`ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`).
+V1 discharges this by **same-path continuation**: for every admitted path — one ending at `complete`, or at a `return` for the triggering input — re-driving that same path from its first step must reach the path's terminal. Per admitted path:
+
+- every transaction step needs re-encounter resolution, except one that is the final step of a path ending at `complete`, after which no failing prefix exists. A `return` is not such an exemption: constructing the result is itself a step after the transaction, so every transaction on a returning path must resolve;
+- consumed artifacts — an intent the path executes, which must be established at all; a transaction output referenced by a later transaction body or an effect derivation; the outputs the terminal result is derived from — are judged by the replay rules of §17 and §18, with references inside the establishing transaction exempt by atomicity, and a commit key judged by the re-encounter analysis rather than double-counted as consumption;
+- a decision is **never** an obstacle to progress. A retry not established to take the same arm follows whichever admitted path it then takes, and that path is analyzed on its own; the difference in work is idempotency's concern, not recoverability's.
+
+This is a sufficient route and deliberately does not prejudge which other paths a resumed attempt may take (`ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`). A program with no path admitted for the triggering input cannot make progress for it, and the obligation is unproven — the deliberate asymmetry with idempotency, for which the same shape is vacuous.
 
 `resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Archspec does not model.
 
 ### `completion: guaranteed`
 
-In addition to resumability, the architecture must guarantee that the logical invocation **is** re-driven until a declared flow terminates.
+In addition to resumability, the architecture must guarantee that the logical invocation **is** re-driven until the program reaches a terminal.
 
 This is a liveness obligation and additionally requires a modeled retry driver, such as:
 
@@ -741,7 +774,7 @@ A recoverability requirement makes retries *expected* rather than merely *possib
 
 The checker does not couple them either, but it says when the coupling is absent: a `guaranteed` recoverability proof for an operation that declares no idempotency requirement keyed from the triggering input carries a warning, because the driver makes retries expected and nothing declares them safe.
 
-Neither implies exactly-once external execution. Driving a flow to termination still leaves the effect-level uncertainty described in §14: an external effect may have succeeded before a crash without that success being durably known.
+Neither implies exactly-once external execution. Driving the program to a terminal still leaves the effect-level uncertainty described in §14: an external effect may have succeeded before a crash without that success being durably known.
 
 ---
 
@@ -796,7 +829,7 @@ A value source may be written as a `kind:id` string instead of the tagged map, w
     - idempotency_key
 ```
 
-The kind is always written. It is never inferred from the id: the five sources index five separate namespaces, and inferring would let the meaning of a reference depend on what happens to resolve, silently choosing for an id declared in two of them.
+The kind is always written. It is never inferred from the id: the seven sources index seven separate namespaces, and inferring would let the meaning of a reference depend on what happens to resolve, silently choosing for an id declared in two of them.
 
 Neither shorthand withholds a fact the canonical form states — both are re-spellings with the canonical form still accepted — so §1.1 is not engaged. Serialization emits the canonical form, keeping one explicit shape for tooling.
 
@@ -806,15 +839,16 @@ A value reference is evaluated by some set of invocations, and may only name a s
 
 The evaluating invocations are determined by where the reference is declared:
 
-- a reference declared within an operation — in its requirements, its effects, or its transactions — is evaluated by invocations of **that operation**;
+- a reference declared within an operation — in its requirements, its effects, its transactions, or its program — is evaluated by invocations of **that operation**;
 - a reference declared on a state-machine transition side effect is evaluated by invocations of **whichever operation applies that transition**.
 
 From that scope:
 
-- `input` and `invocation_result` must name declarations of an admitted operation. Another operation's input is never the "current invocation's input payload", and another operation's result is never available to this invocation.
+- `input`, `transaction_output`, `effect_result_ok`, and `effect_result_err` must name declarations of an admitted operation. An input, a transaction output, and a result binding each belong to exactly one operation: another operation's input is never the "current invocation's input payload", and another operation's output or bound result is never available to this invocation.
 - `effect` must name an effect of an admitted operation, or a transition side effect of a transition an admitted operation applies.
 - `state_machine_subject` is unrestricted. State machines are global, and any operation may address the persistent objects they govern.
 - `transaction_read` is restricted further, to the transaction execution that produces it. See §18.
+- `transaction_output`, `effect_result_ok`, and `effect_result_err` are restricted further still, to program points where control flow definitely provides them. See §16.
 
 This is a structural coherence rule, not a replay-stability claim. A reference being observable says nothing about whether its value is stable across retries.
 
@@ -830,13 +864,19 @@ References a field in the payload of a declared `PublicationEffect` or `RequestE
 
 Declaring such a reference establishes value lineage only if the surrounding declaration states how the value is propagated. It does not mean the effect has already executed.
 
-An external effect has no inspectable payload schema in the current DSL and therefore cannot provide ordinary field-path value references.
+An external effect has no inspectable payload schema in the current DSL and therefore cannot provide ordinary field-path value references. Its declared *result*, if any, is reached through a result binding instead (below).
 
-### `ValueSource::invocation_result`
+### `ValueSource::transaction_output`
 
-References a field in a logical `InvocationResult` available to the current invocation.
+References a field of a `TransactionOutput` (§15): a typed value a transaction of the same operation exported into the operation's control.
 
-Availability may come from production earlier in the current flow, deterministic reconstruction by a naturally replayable establishing transaction, or recovery from an explicitly keyed committed transaction. The source kind does not itself imply independent durable storage.
+Availability is a matter of control flow. The reference is valid only at a program point where the output is **definitely available**: established or recovered by a transaction on every path reaching that point (§16). Within the establishing transaction itself, a later step may reference the output by step order. How the value reaches a retry — reconstruction by a naturally replayable establishing transaction, or recovery from an explicitly keyed commit — is the §17 question, and the source kind does not itself imply independent durable storage.
+
+### `ValueSource::effect_result_ok` and `ValueSource::effect_result_err`
+
+Reference a field of the `Ok` or `Err` payload of a bound effect result (§13), where the id names the result binding of an `execute_effect` or `execute_effect_intent` step. The path resolves against the effect contract's `ok` or `err` schema respectively.
+
+These are **operation-local observations** of the current attempt. They are not transaction artifacts, and they are not inherently durable. Each is available only inside the arm of a `match_result` on that binding that selects its variant: `effect_result_ok` in the `ok` arm, `effect_result_err` in the `err` arm. Neither survives the join after the match (§16).
 
 ### `ValueSource::state_machine_subject`
 
@@ -848,7 +888,7 @@ The path is interpreted against that subject object's schema. Mutable subject st
 
 References a field observed by a named `Read` earlier in the same transaction execution.
 
-Transaction-read results are transaction-local provenance sources. They are not durable cross-transaction artifacts and are not available to later transactions merely because the surrounding flow continues.
+Transaction-read results are transaction-local provenance sources. They are not durable cross-transaction artifacts and are not available to later transactions or program steps merely because the surrounding program continues. Information observed inside a transaction reaches later control only by being exported through a `TransactionOutput` (§15).
 
 V1 permits them in the semantic model but does not use a provenance chain that reaches a transaction read to prove natural transaction replayability. See §18.
 
@@ -868,7 +908,7 @@ The current DSL assigns no special semantic meaning to an empty component list; 
 
 ### Governing keys and the attempt population
 
-When an idempotency, recoverability, or response-replay obligation is verified, its key is the **governing key** of the analysis. V1 analysis proceeds only when every component of a governing key is sourced from **one** input of the operation — the *triggering input* of the analysis. A component sourced from mutable persistent state, or from an artifact the invocation itself produces, cannot define a pre-execution equivalence class, and the obligation is `Unknown`.
+When an idempotency, recoverability, or result-replay obligation is verified, its key is the **governing key** of the analysis. V1 analysis proceeds only when every component of a governing key is sourced from **one** input of the operation — the *triggering input* of the analysis. A component sourced from mutable persistent state, or from an artifact the invocation itself produces, cannot define a pre-execution equivalence class, and the obligation is `Unknown`.
 
 The attempt population of such an obligation is the set of invocations triggered by that input. An invocation triggered by a different input has no value for the key, belongs to no equivalence class, and is not constrained by the obligation — the same population reading that applies to serialization and ordering keys, for the §7 reason that a concrete invocation is associated with the input that triggered it.
 
@@ -900,17 +940,29 @@ An effect declaration is a contract describing what kind of logical work occurs.
 
 It does not define how the values of a particular effect instance are computed. An effect instance is constructed at an execution or establishment site, and each such site declares the provenance of the values used to construct it:
 
-- a direct `execute_effect` flow step declares `values` (§16);
+- a direct `execute_effect` program step declares `values` (§16);
 - an explicit `establish_effect_intent` transaction step declares `values` (§14);
 - a `transition` transaction step declares `effect_values`, one derivation per side effect of the applied transition (§22).
 
 `execute_effect_intent` consumes an already-established effect instance and therefore declares no derivation: the instance's values were fixed at establishment (§14).
 
+### Effect results
+
+A synchronous effect may yield a first-class `Result<Ok, Err>` (§8.1). Which effects do is fixed by the contract:
+
+- a **publication** has no synchronous result and cannot bind one (§13.1);
+- a **request** inherits the result contract of the request input it targets, and never redeclares it (§13.2);
+- an **external** effect may declare `result: { ok, err }`, or declare none (§13.3).
+
+An execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique id (`result: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an operation-local observation of the current attempt, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
+
+The returned result is a separate semantic object from the outgoing effect payload. Stable outgoing values do not by themselves prove a stable returned result; effect-result replay is judged on its own (§18).
+
 ## 13.1 Publication effect
 
 A publication effect declares publication of one schema to one topic.
 
-When executed, the resulting logical message participates in the topic's declared delivery and ordering semantics.
+When executed, the resulting logical message participates in the topic's declared delivery and ordering semantics. A publication has no synchronous result: an execution site may not bind one.
 
 `idempotency_key_propagation` describes which values in the published payload preserve an upstream idempotency identity.
 
@@ -931,7 +983,7 @@ For an upstream idempotency requirement, a duplicate execution of a publication 
 1. the topic declares a keyed message identity mapping the published schema (§6) and the published instance is class-fixed — replay-deterministic for a direct execution, or an intent replay-available by route A or B of §17 — so that every attempt publishes the **same logical message**; and
 2. every modeled consumer of that message collapses duplicate deliveries of it. A consumer is an operation subscribing to the topic with a message selection admitting the schema; it collapses duplicates either through an idempotency requirement keyed from that subscription that is itself proven, or by receiving the subscription with `at_most_once` delivery, under which one logical message is delivered no more than once however often it is published.
 
-Condition 1 makes the duplicate no new logical work *at the topic*: at most it raises delivery multiplicity. Condition 2 makes it no new logical work anywhere the model can see. Delivery multiplicity is a degree of freedom the topic contract admits, but the work a redelivery causes in a consumer is still work the upstream attempt caused, and the requirement's "must not cause" is transitive: an operation whose retries double a downstream card charge is not idempotent, however faithfully it republishes one message. A consumer the model does not contain is outside the proof, which is conditional on the model's closed world of consumers (§1.3). Producer and consumer verdicts are mutually dependent; V1 computes them together with request discharge (§13.2) as a least fixpoint, and publication cycles settle unproven.
+Condition 1 makes the duplicate no new logical work *at the topic*: at most it raises delivery multiplicity. Condition 2 makes it no new logical work anywhere the model can see. Delivery multiplicity is a degree of freedom the topic contract admits, but the work a redelivery causes in a consumer is still work the upstream attempt caused, and the requirement's "must not cause" is transitive: an operation whose retries double a downstream card charge is not idempotent, however faithfully it republishes one message. A consumer the model does not contain is outside the proof, which is conditional on the model's closed world of consumers (§1.3). Producer and consumer verdicts are mutually dependent; V1 computes them together with request discharge (§13.2) as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven — a publication cycle through topics no less than a request cycle — by the minimal-counterexample argument of `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1, and such proofs are marked coinductive.
 
 `idempotency_key_propagation` plays no role in this discharge: a class-fixed instance already makes every duplicate payload-equal, so a consumer's key evaluates equally across them whichever fields it reads. Propagation remains lineage for the consumer's analysis (§12) and deduplicates nothing on the publishing side.
 
@@ -960,6 +1012,12 @@ Downstream duplicate invocation must therefore be considered possible.
 No retry fact is available.
 
 `idempotency_key_propagation` links the outbound request's key fields to upstream logical identity.
+
+### Result lineage
+
+A request effect's synchronous result is `target.input`'s declared `result` (§8.1): executing the effect yields exactly the `Result<Ok, Err>` the targeted input returns. The schemas are not redeclared on the effect; an execution site binding the result observes that type.
+
+Whether repeated executions observe the *same* result is a separate question with one V1 answer (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §32): the bound result is replay-stable exactly when the request instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement keyed from the targeted input with `result: replay_consistent` that is itself proven (§9). Payload-equal duplicates then fall into one class of that requirement, which returns the same variant and a replay-equivalent payload to each of them. Idempotency-key propagation remains lineage only; it proves neither duplicate safety nor result consistency.
 
 ### Duplicate request
 
@@ -991,6 +1049,20 @@ The guarantee is scoped to equality of that logical key. It does not imply order
 
 For an upstream idempotency requirement, a duplicate execution is safe when every component of the declared key is replay-stable relative to the governing key (§18): all attempts then execute under one key, and the boundary collapses them. No instance condition is needed, since the guarantee is scoped to key equality alone.
 
+### `ExternalEffect.result`
+
+Because Archspec cannot inspect beyond the boundary, an external effect may declare the synchronous result the boundary returns:
+
+```yaml
+result:
+  ok: schema.ChargeAccepted
+  err: schema.ChargeDeclined
+```
+
+Absent (`result: null`), no synchronous result is modeled and an execution site may not bind one.
+
+The declaration says what the returned outcome is shaped like. It says nothing about whether repeated executions return the same outcome: `deduplicated_by` collapses the *work* of same-key executions and does not imply that each returns the same result, and no other declared fact speaks to it. An external result is therefore **never replay-stable in V1**, and a decision resting on one is not established to replay (§16, §18). An explicit external result-replay guarantee is a candidate follow-up; until one exists, this is an honest gap the checker reports rather than a fact it assumes.
+
 ---
 
 ## 14. Effect intents
@@ -1019,75 +1091,124 @@ If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exac
 
 ### `ExecuteEffectIntent`
 
-A flow step executing an intent performs or attempts the work represented by the logical intent available to the current invocation.
+A program step executing an intent performs or attempts the work represented by the logical intent available to the current invocation.
 
 `ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
 
 The effect instance was already constructed when the intent was established, so `ExecuteEffectIntent` declares no derivation and must never recompute or replace the intent's values.
 
+It may bind the effect's synchronous result, exactly as a direct execution does (§13): a request intent yields its target input's result, an intent of an external effect yields the declared one, an intent of a publication yields none and may not bind. Binding a result adds no outgoing-value derivation; the instance stays the one the transaction captured.
+
 Reconstructing or recovering the same intent does **not** prove that repeating the external effect is safe. A crash after an external effect succeeds but before completion is durably known may still lead to another effect attempt. Effect-level idempotency/retry semantics must handle that uncertainty.
 
 ---
 
-## 15. Invocation results and responses
+## 15. Transaction outputs and request results
 
-### `InvocationResult`
+### `TransactionOutput`
 
-An invocation result is a logical transaction artifact shaped by a declared schema.
+A transaction output is a logical transaction artifact shaped by a declared schema: a typed value a transaction deliberately exports into the enclosing operation's control.
 
-It is semantically separate from transaction idempotency. Establishing an invocation result does **not**, by itself, prevent the enclosing transaction from executing or committing again.
+```yaml
+transaction_outputs:
+  output.create_order:
+    schema: schema.CreateOrderResponse
+```
 
-An invocation result is not inherently synonymous with a durable database record. Its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit.
+It represents **data** — a reservation id, a selected account, remaining stock, a routing decision, authorization metadata, a normalized version of the input. Later control may use it for branching, effect construction, another transaction, or terminal result construction. Its single meaning is:
 
-An artifact-level idempotency key, if still present in an interim implementation shape, must not be interpreted as an independent transaction-deduplication or durability guarantee. The revised structural model may remove that field entirely.
+> This transaction deliberately exposes this typed logical value to the enclosing operation.
 
-### `EstablishInvocationResult`
+A transaction output does **not** imply an operation result, success or failure, effect execution, idempotency, database storage, or memoization. It is semantically separate from transaction idempotency: establishing an output does not, by itself, prevent the enclosing transaction from executing or committing again. It is not inherently synonymous with a durable database record; its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit (below).
 
-Establishes the logical result produced by the surrounding transaction execution.
+A transaction output is intentionally generic and is not a `Result`. Outputs remain schema-shaped; `Result<Ok, Err>` is reserved for request results and synchronous effect results (§8.1, §13). If a future architecture requires result-typed outputs, the type model is to be extended deliberately rather than by coupling that concern into `TransactionOutput` (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §35).
 
-The establishment site should declare result-value provenance through `Derivation`.
+### `EstablishTransactionOutput`
 
-If the transaction is naturally replayable and the result derivation is replay-deterministic, a retry may reproduce the same logical result without independent durable result storage.
+The transaction step `establish_transaction_output` establishes an operation-owned output within the surrounding transaction execution:
 
-If the transaction is `DeduplicatedBy { key }`, the exact result produced by the first successful commit is retained with `Commit(T,K)` and recovered on replay instead of being recomputed.
+```yaml
+- kind: establish_transaction_output
+  output: output.create_order
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+```
 
-### `ReadInvocationResult`
+For `EstablishTransactionOutput(O, D)`, the transaction:
 
-The explicit transaction step `ReadInvocationResult` is removed by the revised model unless a separate concrete semantic use case is established.
+1. constructs a value shaped by `O.schema`;
+2. declares its provenance through `D`, evaluated in the transaction context at that step — it may reference operation-level values, artifacts available on entry, outputs established earlier in the same transaction, and preceding `transaction_read` results under the §18 rules;
+3. establishes `O` atomically with the transaction commit;
+4. makes `O` available to subsequent operation control after successful execution or commit recovery.
 
-A later transaction may reference an available result directly through `ValueSource::InvocationResult`.
+### Transaction-output replay
 
-### `Response`
+The two routes of §17 apply unchanged. If the transaction is naturally replayable and `D` is replay-deterministic, a retry reconstructs the same `O` without independent durable storage (route A). If the transaction is `DeduplicatedBy { key }`, the exact output produced by the first successful commit is retained with `Commit(T,K)`; a retry resolves the commit, restores `O`, and does not recompute `D` (route B). The same recovery rule applies to `EffectIntent`:
 
-A response belongs to a request input and declares the response schema.
+```text
+Commit(T,K)
+    |
+    +-- TransactionOutput O
+    |
+    +-- EffectIntent I
+```
 
-### `ResponseSource::unspecified`
+### Transaction encapsulation
 
-The model gives no stable replay source for the response.
+`transaction_read` remains transaction-local (§11, §18). If information observed or computed inside a transaction must influence later operation control, it must be explicitly exported through a transaction output:
 
-No replay-consistency proof may be derived solely from the response declaration.
+```text
+transaction-local observation
+        |
+        | establish_transaction_output
+        v
+operation-visible value
+```
 
-### `ResponseSource::invocation_result`
+Effect intents cross the same boundary for a different reason: they carry captured executable work (§23).
 
-The response is obtained from the logical invocation result available to the current invocation.
+### Request results: `return` and `complete`
 
-The solver may treat that response as replay-consistent only when it can prove that the same logical result will be reconstructed or recovered on retry.
+There is no response declaration. A request invocation terminates directly with its input's declared result, constructed at the terminal from the values available there:
+
+```yaml
+- kind: return
+  request: input.create_order.request
+  outcome:
+    kind: ok
+    values:
+      kind: deterministic
+      from:
+        - source: transaction_output:output.create_order
+          path: order_id
+```
+
+`return` names an operation-owned request input `R` with `R.result = Result<OkSchema, ErrSchema>`; `outcome: { kind: ok, values }` constructs an `OkSchema` payload from `values`, and `outcome: { kind: err, values }` an `ErrSchema` payload. A subscription input cannot be a `return` target. Unknown provenance is declared as `values: { kind: unspecified }`, never omitted.
+
+`complete` terminates an execution that returns nothing, as is natural for a subscription-driven operation.
+
+Terminal result replay consistency is proven from path and variant stability plus the ordinary provenance of the terminal derivation (§9, §16); no privileged result artifact intervenes between a transaction and the result it informs.
 
 ---
 
-## 16. Invocation flows and transaction artifacts
+## 16. The operation program and transaction artifacts
 
-### `InvocationFlow.steps`
+### `OperationBlock.steps`
 
-Steps execute in the order declared within that flow.
-
-Current flow-step kinds remain:
+The program is an `OperationBlock`: a sequence of steps executed in order. A decision step nests further blocks. The step kinds are:
 
 - `transaction`
 - `execute_effect`
 - `execute_effect_intent`
+- `match_result`
+- `branch`
+- `return`
+- `complete`
 
-No explicit `RecoverInvocationResult` or `RecoverEffectIntent` flow step is introduced.
+No explicit recovery step exists for a transaction output or an effect intent; recovery is what re-encountering a keyed transaction does (§17). The analyzer may lower the block structure to a control-flow graph; the DSL declares the structure.
 
 ### `transaction`
 
@@ -1099,55 +1220,148 @@ For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commi
 
 ### `execute_effect`
 
-Executes the referenced logical effect directly.
+Executes the referenced operation-owned logical effect directly.
 
 For `ExecuteEffect(E, D)`, the step:
 
 1. constructs one logical instance of effect `E`;
 2. obtains its values according to derivation `D`;
-3. executes that effect instance.
+3. executes that effect instance;
+4. optionally binds the effect's synchronous result under `result` (§13).
 
 `values` declares the provenance of the complete logical effect instance, for every effect kind, using the same `Derivation` vocabulary as transaction-level provenance declarations (§18). Unknown provenance must be declared explicitly as `unspecified` rather than omitted.
 
-Because the step occurs at flow level rather than inside a transaction, the derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to a transaction execution (§18).
+Because the step occurs at program level rather than inside a transaction, the derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to a transaction execution (§18).
 
-For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots (§18) establishes that a retry constructs the same logical effect instance. Effect payload stability and duplicate-execution safety remain separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
+For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots (§18) establishes that a retry constructs the same logical effect instance. Effect payload stability, duplicate-execution safety, and effect-result stability remain three separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
 
 A direct effect execution is not automatically durable or retry-safe. The verifier must use the effect's retry/deduplication environment and the invocation's possible failure/retry paths.
 
+A transition side effect is never executed directly: it is established as an intent by the transition and executed through `execute_effect_intent` (§22).
+
 ### `execute_effect_intent`
 
-Executes the referenced logical effect intent currently available to the invocation.
+Executes the referenced logical effect intent currently available to the invocation, and optionally binds its result (§14).
 
 The intent may have been produced by an earlier transaction in this invocation, reconstructed by naturally replaying that transaction, or recovered from an explicitly keyed transaction commit.
 
-### Transaction-artifact visibility
+### `match_result`
 
-A successful transaction may make `InvocationResult` and `EffectIntent` artifacts available to subsequent flow steps and subsequent transactions in the same invocation.
+Destructures a bound result into two arms:
 
-Conceptually, the invocation carries an abstract artifact context:
-
-```text
-ArtifactContext
-    InvocationResult R -> logical result value
-    EffectIntent E     -> logical effect intent
+```yaml
+- kind: match_result
+  result: result.charge_payment.card
+  ok:
+    steps: [...]
+  err:
+    steps: [...]
 ```
 
-This context is semantic bookkeeping, not a new DSL workflow construct.
+`result = Ok(v)` executes the `ok` block, `result = Err(e)` the `err` block. The match is exhaustive and mutually exclusive by construction; both arms are declared, though either may be empty.
+
+Inside `ok`, `effect_result_ok:<result>` is available and the `err` payload is not; inside `err`, the reverse. **Variant payloads are arm-local**: neither survives the join after the match, even when the other arm terminates. Data that must be generally available after a match is exported through a transaction artifact instead — a transaction inside the arm establishing a transaction output — or the control is structured so the consumer sits inside the arm.
+
+Success and failure of a synchronous interaction are expressed by `match_result` over a `Result`, not by a `branch` comparing a conventional status field. The two primitives are not overloaded to do each other's job.
+
+### `branch`
+
+An ordinary control decision over modeled values:
+
+```yaml
+- kind: branch
+  condition:
+    kind: eq
+    value:
+      source: input:input.checkout
+      path: region
+    equals: CA
+  then:
+    steps: [...]
+  otherwise:
+    steps: [...]
+```
+
+The `then` block executes when the condition holds. `otherwise` is optional; absent, the branch falls through to the following step when the condition does not hold.
+
+`Condition` is deliberately small and structurally exposes every value the decision depends on, so replay analysis can judge a decision without an expression language:
+
+- `eq { value, equals }` — equality of a value reference against `equals`, which accepts the selector-value surface of §19: a map is another value reference, a plain scalar is a literal;
+- `and { conditions }` — every nested condition holds;
+- `not { condition }` — the nested condition does not hold;
+- `unspecified` — the model provides no fact about how the decision is made.
+
+`eq`, `and`, and `not` are **deterministic functions of their references**: given equal values for every root, the decision takes the same arm. `unspecified` declares no fact and is never deterministic; a condition containing it anywhere is not. §1.1 governs it as it governs every other `unspecified`.
+
+### `return` and `complete`
+
+The terminals (§15). `return` constructs the named request input's declared result from `outcome`; `complete` returns nothing. Each ends its block: an invocation reaching it has finished.
+
+### Program validation
+
+Validation establishes that the program is structurally coherent. It performs no replay proof. The rules:
+
+1. **Termination.** Every reachable path ends at a `return` or `complete` (`ProgramNotTerminated`). A block whose last step is a decision terminates only if every arm of that decision terminates; a `branch` without `otherwise` never does.
+2. **Reachability.** No step follows a terminal — or a decision whose every arm terminates — in its block (`UnreachableProgramStep`, reported for the first dead step of a block).
+3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an executed effect's own declaration roots (an external deduplication key, propagation components). Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
+4. **Definite result assignment.** A result binding may be matched or referenced only where an effect-executing step on every path reaching the point has bound it (`EffectResultNotBound`).
+5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside its `err` arm (`EffectResultVariantOutOfScope`). Field paths resolve against the variant's schema.
+6. **Result-binding contracts.** A binding is declared only by a step executing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication. Binding ids are globally unique and owned by the operation.
+7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription). The outcome's derivation roots must be definitely available under rules 3–5.
+8. **Ownership.** Referenced transactions, effects, and intents belong to the operation; every value reference respects §11 scope.
+
+Rules 3–5 are a **forward definite-availability analysis** over the block structure (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §28–§29):
+
+```text
+Available(entry)      = {}
+Available(after T)    = Available(before T) ∪ EstablishedOrRecoveredBy(T)
+Available(after E→r)  = Available(before) ∪ {r}
+Available(join)       = ∩ Available(each predecessor that falls through)
+```
+
+A predecessor arm that terminates imposes no constraint on the join. `EstablishedOrRecoveredBy(T)` is the transaction's explicitly established outputs and intents plus the operation's intents for the side effects of every transition it applies (§22). Variant selection is not joined at all: an arm selects its variant for its own extent only.
+
+### Paths and path admission
+
+An invocation traverses one **path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Verification analyzes the program path by path — a path is exactly the linear sequence the retired invocation flows were, plus the decisions that selected it — so the forward replay pass of §18 applies unchanged, and what a decision rests on is judged where it is taken.
+
+A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based and is the direct generalization of the retired admitted-flow rule; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association was an open decision of the revision (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §46.5) and is deliberately not resolved here by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
+
+A path that falls off the end of its block with no terminal is rejected by validation (rule 1). Verification, which is not promised a valid model, admits such a path conservatively so its work is still analyzed, and recoverability records it as an obstacle.
+
+### Artifact context per path
+
+Along a path, the invocation carries an abstract artifact context:
+
+```text
+PathContext
+    TransactionOutput O -> logical value, with its replay route
+    EffectIntent E      -> logical effect intent, with its replay route
+    result r            -> bound result, with its replay judgment
+```
+
+This context is semantic bookkeeping, not a DSL workflow construct.
 
 Artifact availability may arise from:
 
-1. production earlier in the current invocation;
+1. production earlier on the current path;
 2. deterministic reconstruction during natural transaction replay; or
 3. recovery from a prior `Commit(T,K)` for an explicitly deduplicated transaction.
 
-Transaction-read results are excluded: they remain local to the transaction execution that produced them.
+Transaction-read results are excluded: they remain local to the transaction execution that produced them. Result bindings enter the context at the step that binds them, with their replay judgment (§18); they are observations, not artifacts, and no route reconstructs or recovers them.
 
-### `response`
+### Decision replay
 
-If present, the response is terminal for that flow.
+A retry traverses declared control. Whether it takes the same arm at a decision is a fact the checker establishes or records as a gap (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §30). Relative to a governing key (§12), a decision **replays** — every attempt in a class takes the same arm — when:
 
-The response declaration itself does not imply every preceding external effect succeeded exactly once; the solver must analyze the path.
+- for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
+- for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
+
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, or an external boundary whose result no fact stabilizes (§13.3). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
+
+### Step locations
+
+Program steps carry no ids. Diagnostics, proofs, and obstacles name a step by its **location**: one hop per nesting level, each the one-based position in its block and, for every level but the last, the arm entered beneath it. `3.ok.1` is the first step of the `ok` arm of the third top-level step; `2` is the second top-level step. A path is named by the arms it takes, as `ok(result.charge_payment.card) › then(step 3)`, or as "the program" when it has no decisions. An obstacle at a step is reported once per site however many paths share the prefix reaching it, since those paths reach the step with the same context.
 
 ---
 
@@ -1159,9 +1373,9 @@ A transaction is one atomic commit/abort unit.
 
 Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
 
-Atomicity does not imply serializability, and serializability does not imply linearizability.
+Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5).
 
-Framework transaction artifacts established by the transaction participate in the same logical atomic boundary as application-state mutations.
+Framework transaction artifacts established by the transaction — transaction outputs and effect intents (§23) — participate in the same logical atomic boundary as application-state mutations.
 
 ### `data_model: <id>`
 
@@ -1177,7 +1391,7 @@ It must not be used to imply atomic application-object access with no declared t
 
 ### Transaction idempotency guarantee
 
-A transaction should expose an `IdempotencyGuarantee` independently of any invocation-result or effect-intent declaration.
+A transaction should expose an `IdempotencyGuarantee` independently of any transaction-output or effect-intent declaration.
 
 #### `unspecified`
 
@@ -1217,11 +1431,11 @@ This is a concrete implementation/conformance obligation, not a claim that arbit
 
 Natural replayability is derived, not declared with a boolean.
 
-A transaction is naturally replayable only when the verifier can establish that another execution for the same logical invocation can safely reproduce the same logical transaction outcome and any artifacts required by later flow steps.
+A transaction is naturally replayable only when the verifier can establish that another execution for the same logical invocation can safely reproduce the same logical transaction outcome and any artifacts required by later program steps.
 
 This is stronger than merely showing that a second commit cannot happen.
 
-A one-shot guard that makes a second attempt abort may establish at-most-once commit behavior while still preventing the flow from reconstructing artifacts after a crash. Such a guard therefore does not, by itself, prove natural replayability.
+A one-shot guard that makes a second attempt abort may establish at-most-once commit behavior while still preventing the program from reconstructing artifacts after a crash. Such a guard therefore does not, by itself, prove natural replayability.
 
 V1 may use deterministic target/value provenance and mutation semantics where sufficient. If required facts are absent, natural replayability is `Unknown`.
 
@@ -1273,7 +1487,7 @@ Snapshot isolation does not in general imply serializability; write skew and pre
 
 Committed transactions admit an equivalent serial execution order.
 
-Serializable does **not** by itself imply real-time precedence and therefore does not automatically prove linearizability.
+Serializable does **not** by itself imply real-time precedence. It is a transaction-level fact and must not be promoted into an object-history guarantee (§5); no V1 verifier draws such an inference.
 
 Serializable execution also does not imply that a transaction is replayable across separate invocation attempts.
 
@@ -1360,21 +1574,40 @@ assumed:
    identity to the other's.
 4. **Recovered artifacts.** For a transaction `T` declared
    `DeduplicatedBy { key }` whose key components are all replay-stable,
-   the contents of every artifact established by `T` are replay-stable:
-   all attempts in a class address the same `Commit(T,K)`, which
-   durably retains the exact artifacts of the single successful
-   execution (§17 route B).
+   the contents of every artifact established by `T` — every
+   transaction output and effect intent — are replay-stable: all
+   attempts in a class address the same `Commit(T,K)`, which durably
+   retains the exact artifacts of the single successful execution
+   (§17 route B). A `transaction_output` reference to such an output
+   is therefore stable at every point where the output is available.
 5. **Reconstructed artifacts.** For a naturally replayable transaction,
-   an artifact whose establishment derivation is replay-deterministic
-   is replay-stable (§17 route A).
-6. **Congruence.** A value produced by `Deterministic { from }` with
+   an artifact — transaction output or effect intent — whose
+   establishment derivation is replay-deterministic is replay-stable
+   (§17 route A), and a `transaction_output` reference to it is
+   stable wherever it is available.
+6. **Effect results.** A reference through `effect_result_ok` or
+   `effect_result_err` to a bound result `r` is replay-stable iff
+   `r`'s effect is a **request** whose instance is class-fixed — a
+   direct execution with a replay-deterministic derivation, or an
+   intent replay-available by route A or B — whose schema is the
+   targeted input's schema, and whose target operation proves
+   `result: replay_consistent` for that input (§9, §13.2): the class
+   then sends one logical request into one class of the target, and
+   receives one variant and a replay-equivalent payload back. An
+   **external** effect's result is never replay-stable in V1, because
+   no declared fact makes it so (§13.3); a publication has no result.
+   The stability of a result is judged once, at the step that binds
+   it, and is what a `match_result` on it rests on (§16).
+7. **Congruence.** A value produced by `Deterministic { from }` with
    every root replay-stable is replay-deterministic, and its uses
    inherit stability.
-7. **Everything else is `Unknown`**: unidentified non-key input fields,
+8. **Everything else is `Unknown`**: unidentified non-key input fields,
    fields of a non-triggering input, `state_machine_subject` state
-   (always, in V1), `effect` payload roots, and `transaction_read`
-   results, which additionally poison any natural-replay provenance
-   closure that reaches them.
+   (always, in V1), `effect` payload roots, external effect results,
+   an artifact available by neither route, an artifact or result not
+   in the path context at the point of reference, and
+   `transaction_read` results, which additionally poison any
+   natural-replay provenance closure that reaches them.
 
 The `Unknown` cases are epistemic (§1.1): no rule establishes
 stability; instability is not proven.
@@ -1388,11 +1621,14 @@ different values across the class. Only a boundary fact excludes the
 conflicting attempt.
 
 These judgments — stability, replay determinism, natural
-replayability, artifact replay availability — form one simultaneous
-induction, computable in a single forward pass in flow order and,
-within a transaction, step order: every rule consumes only roots or
-facts established at earlier steps, and transaction-read dependence,
-the only backward-looking observation, is excluded outright.
+replayability, artifact replay availability, result stability, and
+decision replay — form one simultaneous induction, computed **per
+path** of the program (§16) in a single forward pass in path order
+and, within a transaction, step order: every rule consumes only roots
+or facts established at earlier steps of that path, and
+transaction-read dependence, the only backward-looking observation,
+is excluded outright. Two paths sharing a prefix reach the prefix's
+steps with the same context and reach the same judgments about them.
 
 ### Transaction read results
 
@@ -1471,7 +1707,7 @@ value:
 value: pending
 ```
 
-Inferring this discriminant is safe where inferring a `ValueSource`'s kind is not. Telling a map from a scalar resolves nothing, whereas the five value sources are all ids and differ only in which namespace they name. The distinction this section relies on — a selector exposing its literals and references structurally — survives the shorthand rather than being defaulted by it.
+Inferring this discriminant is safe where inferring a `ValueSource`'s kind is not. Telling a map from a scalar resolves nothing, whereas the seven value sources are all ids and differ only in which namespace they name. The distinction this section relies on — a selector exposing its literals and references structurally — survives the shorthand rather than being defaulted by it.
 
 A string literal opening with a value source kind is refused in shorthand. `value: input:input.transfer_stock.request` is almost certainly a reference that lost its path, and reading it as the text it spells would quietly turn a provenance-bearing comparison into a comparison with a constant. A string that genuinely spells one is declared in the canonical form.
 
@@ -1625,17 +1861,15 @@ The transition's `from` condition and update to `to` are interpreted as one logi
 
 The state machine declares legality, not concurrency safety. Two individually legal transitions can still race. The verifier must use isolation, locks, serialization, ordering, or other facts to prove that concurrent execution cannot produce an illegal history.
 
-### V1 transition replay rule
+### Transition transaction replay
 
-A transaction containing any `Transition` is **not naturally replayable in V1**.
+A transaction containing any `Transition` is **not naturally replayable** under the current replay proof rules.
 
-Once a transition-containing transaction has committed, its state-dependent transition cannot be assumed to execute again in a way that reproduces the original transaction outcome and artifacts. A transition that prevents a second commit may provide an at-most-once gate, but that is not sufficient for flow crash recovery.
+A successful transition changes the state against which its own precondition was evaluated, so re-executing the transaction cannot generally be assumed to reproduce the same transaction outcome or transaction artifacts. A transition that rejects a second application may provide an at-most-once state-mutation gate, but that is not natural replayability: suppressing the second mutation reproduces neither the outputs nor the intents of the original execution, and the gate must not be promoted into replayability.
 
-Accordingly, under the V1 contract:
+This limitation is a **proof fact, not a structural validity rule** (`CONSEQO_REVISION_V3_AMENDMENT_A_TRANSITION_DEDUP_RELAXATION.md`). A transition-containing transaction may declare any `IdempotencyGuarantee` permitted for other transactions — `unspecified`, `not_deduplicated`, or `deduplicated_by { key }` — and none of them is a validation concern; `unspecified` and `not_deduplicated` keep their §17 distinction. `DeduplicatedBy { key }` provides the durable recovery route: after the first successful logical commit, a later same-key encounter resolves the prior `Commit(T,K)` rather than reapplying the transition, and restores the exact retained transaction artifacts.
 
-> Every transaction containing a `Transition` MUST declare explicit durable keyed transaction idempotency with `DeduplicatedBy { key }`.
-
-The purpose is not merely to suppress a second transition. The keyed commit acts as the durable recovery boundary: after a successful commit, later encounters resolve the prior `Commit(T,K)` and recover its retained transaction artifacts without reapplying the transition.
+Where an idempotency, result-replay, or recoverability obligation depends on replay or recovery of a transition-containing transaction, the analyzer proves a sufficient route from the actual declarations: it assumes neither natural replayability nor durable keyed recovery, and the recovery route holds only when `deduplicated_by` is declared over a key the §18 rules make stable. Failing to establish a route leaves the relevant requirement unproven; it does not make the transaction invalid, and the diagnostics report the missing proof facts rather than prescribing `deduplicated_by` as the one legal architecture. A transition transaction over which nothing declares a retry obligation needs no key at all. A retry may also legitimately observe the durably transitioned state and take a different admitted path; what that divergence does is judged by decision replay (§16) and idempotency, not by structural validation. No requirement or guarantee is ever synthesized merely because a transaction contains a transition.
 
 ### Transition side effects
 
@@ -1667,7 +1901,7 @@ COMMIT
 ExecuteEffectIntent E
 ```
 
-If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, natural replay cannot be relied on to reproduce `E`, because V1 will not replay the transition transaction naturally. `DeduplicatedBy { key }` ensures that retrying `T` resolves the prior commit and restores `E`, allowing the flow to continue.
+If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, natural replay cannot be relied on to reproduce `E`, because V1 will not replay the transition transaction naturally. `DeduplicatedBy { key }` ensures that retrying `T` resolves the prior commit and restores `E`, allowing the program to continue along the same path. Without it no declared fact makes `E` available to the resumption, and an obligation that needs `E` there stays unproven.
 
 This still does not imply exactly-once external execution. Effect-level idempotency/retry analysis remains necessary.
 
@@ -1685,7 +1919,7 @@ state_transition.effect_values.keys()
 
 Missing derivations, extra derivations, and derivations keyed by another transition's effects are all structural validation errors. A transition without side effects declares an empty map. Unknown provenance must be declared explicitly as `unspecified`; the validator does not synthesize missing entries, preserving the distinction between provenance intentionally unspecified and a provenance declaration accidentally missing.
 
-Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step. It may therefore reference valid operation-level values, available invocation results, and preceding `transaction_read` results, subject to the usual read-before-use and field-selection rules (§18). It is not evaluated in a static state-machine-transition context, because its values belong to a concrete transaction application of the transition.
+Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step. It may therefore reference valid operation-level values, transaction outputs available at that point (§16), and preceding `transaction_read` results, subject to the usual read-before-use and field-selection rules (§18). It is not evaluated in a static state-machine-transition context, because its values belong to a concrete transaction application of the transition.
 
 A successful transition transaction logically performs the following atomically:
 
@@ -1695,13 +1929,20 @@ A successful transition transaction logically performs the following atomically:
 4. implicitly establish the corresponding effect-intent artifacts;
 5. commit the transition state and established artifacts together.
 
-Because every transition-containing transaction declares `DeduplicatedBy { key }` in V1, these derivations are evaluated only during the first successful keyed execution. A retry with the same transaction idempotency identity resolves `Commit(T,K)` and recovers the exact original artifacts without evaluating the derivations again. This is what permits transition effect values to depend on transaction-local reads even though those reads may not be replay-stable.
+When the transaction declares `DeduplicatedBy { key }`, these derivations are evaluated only during the first successful keyed execution: a retry with the same transaction idempotency identity resolves `Commit(T,K)` and recovers the exact original artifacts without evaluating the derivations again, which is what lets transition effect values depend on transaction-local reads even though those reads may not be replay-stable. Without keyed deduplication no such recovery fact exists: the intents are established on first success like any other artifact, but nothing makes them replay-available, and obligations that need them settle unproven (§18).
 
 ---
 
 ## 23. Framework transaction artifacts versus application data
 
-`InvocationResult` and `EffectIntent` are framework-level **logical transaction artifacts**, not inherently durable primitives.
+`TransactionOutput` and `EffectIntent` are the two principal framework-level **logical transaction artifacts**. Neither is an inherently durable primitive.
+
+They have deliberately different jobs (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §6):
+
+- a **`TransactionOutput`** is a typed logical value deliberately exported from a transaction into subsequent operation control. It represents **data**.
+- an **`EffectIntent`** is a captured logical effect instance intended for later execution. It represents **pending logical work**.
+
+The rule follows: do not use an `EffectIntent` merely to transport arbitrary transaction data, and do not use a `TransactionOutput` to represent work awaiting execution. Both may be established by the same transaction, both enter the path's artifact context under the same definite-availability rule (§16), and both may be retained by `Commit(T,K)`; they are not interchangeable.
 
 They may participate atomically in a transaction without belonging to the application `DataModel` namespace.
 
@@ -1731,7 +1972,7 @@ The solver must preserve these distinctions:
 | **Ordering vs serialization** | Serialization prevents overlap; ordering preserves the correct precedence. |
 | **Transport order vs semantic order** | A broker can serialize concurrent producers without establishing a business-level happens-before relation. |
 | **Operation concurrency vs lane concurrency** | One is global to the deployed operation; the other is per dispatch lane. |
-| **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. |
+| **Serializability vs linearizability** | Serializable histories need not respect real-time precedence. The DSL currently declares no object-history requirement (§5); the distinction is kept so that `serializable` is never promoted into one. |
 | **Atomic transaction vs external side effect** | Local atomic commit does not imply an external publication/request is atomic with it. |
 | **Idempotency lineage vs deduplication** | Propagating a key lets the analyzer trace identity; only a guarantee/mechanism actually deduplicates. |
 | **Deterministic derivation vs replay stability** | The same sources produce the same value, but those source values may differ on retry. |
@@ -1742,8 +1983,14 @@ The solver must preserve these distinctions:
 | **Object identity vs ordering key** | They may coincide, but neither declaration automatically implies the other. |
 | **State-machine legality vs replayability** | A legal transition graph does not imply that a transition-containing transaction can be naturally replayed after commit. |
 | **Effect-intent recovery vs exactly once** | Recovering the same intent does not establish whether the external effect already occurred or whether another attempt is safe. |
-| **Idempotency vs recoverability** | Idempotency bounds what retries may do and is satisfied by never retrying; recoverability obliges the flow to actually reach its terminal step. |
-| **Resumable vs guaranteed completion** | Being able to resume is a property of the flow's artifacts; being re-driven requires a modeled retry driver. |
+| **Idempotency vs recoverability** | Idempotency bounds what retries may do and is satisfied by never retrying; recoverability obliges the program to actually reach a terminal. |
+| **Resumable vs guaranteed completion** | Being able to resume is a property of the path's artifacts; being re-driven requires a modeled retry driver. |
+| **Unstable decision: safety vs progress** | A decision not established to replay is an obstacle for idempotency and result replay (a retry may do different work or return a different result) and never for recoverability (whichever admitted path the retry takes is analyzed on its own). |
+| **`Err` vs interrupted execution** | `Err` is a conclusive logical outcome a synchronous interaction returned; a crash, timeout, or lost connection is an idempotency/recoverability question and is not an `Err` payload. |
+| **`TransactionOutput` vs `EffectIntent`** | An output exports data; an intent captures pending work. Both are artifacts of the same commit, and neither may stand in for the other. |
+| **`match_result` vs `branch`** | A control-flow decision on a `Result` destructures a mutually exclusive typed outcome; a `branch` evaluates an ordinary predicate. Success/failure is never encoded as a status-field comparison. |
+| **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or nothing at all for an external boundary. |
+| **Transaction output vs request result** | An output is a schema-shaped artifact a transaction exports; a request result is a `Result<Ok, Err>` constructed at a `return` terminal. A result may be derived from an output, but no privileged artifact stands between them. |
 | **Duplicate-delivery fact vs liveness** | `at_least_once` and `may_repeat` say a retry may happen, not that retries continue until success. |
 | **Ordering key vs message identity** | The ordering key sequences messages; the message identity identifies one logical message. They may coincide; neither implies the other. |
 | **Object identity vs message identity** | `order_id` identifies the order, not the message about the order. |

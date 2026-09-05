@@ -208,7 +208,13 @@ pub fn check(model: &Model, idempotency: &[IdempotencyCheck]) -> Vec<OrderingChe
                 operation: operation_id.clone(),
                 requirement: index,
                 key: requirement.key.clone(),
-                verdict: check_requirement(model, operation_id, operation, requirement, idempotency),
+                verdict: check_requirement(
+                    model,
+                    operation_id,
+                    operation,
+                    requirement,
+                    idempotency,
+                ),
             });
         }
     }
@@ -392,17 +398,15 @@ fn check_requirement(
     };
 
     match (precedence, lane) {
-        (Some(precedence), Some(lane)) if obstacles.is_empty() => {
-            OrderingVerdict::Proven {
-                proof: OrderingProof::LaneOrder {
-                    input: input_id.clone(),
-                    topic: topic_id,
-                    precedence,
-                    lane,
-                    duplicates,
-                },
-            }
-        }
+        (Some(precedence), Some(lane)) if obstacles.is_empty() => OrderingVerdict::Proven {
+            proof: OrderingProof::LaneOrder {
+                input: input_id.clone(),
+                topic: topic_id,
+                precedence,
+                lane,
+                duplicates,
+            },
+        },
 
         _ => OrderingVerdict::Unproven { obstacles },
     }

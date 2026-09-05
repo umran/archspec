@@ -3,7 +3,11 @@
 use crate::analyzer::Evidence;
 use crate::spec::{Id, ValueRef, ValueSource};
 
-use super::replay::{GoverningKeyDefect, PayloadIdentityGap, ReplayGap, StabilityGap};
+use super::paths::{DecisionTaken, PathRef};
+use super::replay::{
+    DecisionGap, GoverningKeyDefect, InstanceGap, PayloadIdentityGap, ReplayGap, ResultGap,
+    StabilityGap, UnstableRoot,
+};
 
 pub(crate) fn governing_key_evidence(defect: &GoverningKeyDefect) -> Evidence {
     match defect {
@@ -12,7 +16,7 @@ pub(crate) fn governing_key_evidence(defect: &GoverningKeyDefect) -> Evidence {
             message: "The governing key is empty: it places every attempt in one \
                       class, and essentially nothing is replay-stable relative to \
                       it."
-                .to_string(),
+            .to_string(),
         },
 
         GoverningKeyDefect::ComponentNotFromInput { source } => Evidence {
@@ -146,14 +150,169 @@ pub(crate) fn stability_sentence(gap: &StabilityGap) -> String {
             format!("it reaches transaction read `{read}`, which is never replay-stable")
         }
 
-        StabilityGap::ArtifactUnavailable { artifact } => {
-            format!("artifact `{artifact}` is not replay-available")
-        }
+        StabilityGap::ArtifactUnavailable {
+            artifact,
+            transaction,
+            recovery,
+            reconstruction,
+        } => format!(
+            "artifact `{artifact}`, established by `{transaction}`, is replay-available \
+             through neither route; recovery: {}; reconstruction: {}",
+            gap_sentences(recovery),
+            gap_sentences(reconstruction)
+        ),
 
         StabilityGap::ArtifactNotInContext { artifact } => {
-            format!("artifact `{artifact}` is not established before this point of the flow")
+            format!("artifact `{artifact}` is not established before this point of the path")
+        }
+
+        StabilityGap::ResultNotInContext { result } => {
+            format!("result `{result}` is not bound before this point of the path")
+        }
+
+        StabilityGap::ResultUnstable {
+            result,
+            effect,
+            gap,
+        } => format!(
+            "effect result `{result}` of `{effect}` is not replay-stable: {}",
+            result_gap_sentence(gap)
+        ),
+    }
+}
+
+pub(crate) fn result_gap_sentence(gap: &ResultGap) -> String {
+    match gap {
+        ResultGap::InstanceNotClassFixed { gap } => {
+            format!(
+                "the instance is not class-fixed ({})",
+                instance_gap_sentence(gap)
+            )
+        }
+
+        ResultGap::RequestSchemaMismatch { expected, actual } => format!(
+            "the request declares schema `{actual}`, but the targeted input declares \
+             `{expected}`, so payload equality does not transfer"
+        ),
+
+        ResultGap::TargetResultNotDeclared { operation, input } => format!(
+            "`{operation}` declares no replay-consistent result requirement keyed from \
+             `{input}`"
+        ),
+
+        ResultGap::TargetResultUnproven { operation, input } => format!(
+            "the replay-consistent result requirement of `{operation}` keyed from \
+             `{input}` is not proven in this analysis"
+        ),
+
+        ResultGap::ExternalResultUndeclared => {
+            "no declared fact makes an external boundary's returned result \
+             replay-consistent"
+                .to_string()
+        }
+
+        ResultGap::NoResultContract => {
+            "the effect contract yields no synchronous result".to_string()
         }
     }
+}
+
+pub(crate) fn instance_gap_sentence(gap: &InstanceGap) -> String {
+    match gap {
+        InstanceGap::DerivationUnspecified => "its instance provenance is unspecified".to_string(),
+
+        InstanceGap::RootsUnstable { roots } => format!(
+            "its instance depends on roots that are not replay-stable: {}",
+            unstable_roots(roots)
+        ),
+
+        InstanceGap::IntentNotEstablished { intent } => {
+            format!("intent `{intent}` is established by no earlier step of the path")
+        }
+
+        InstanceGap::IntentNotReplayAvailable {
+            intent,
+            transaction,
+            recovery,
+            reconstruction,
+        } => format!(
+            "intent `{intent}` is established by `{transaction}` but replay-available \
+             through neither route; recovery: {}; reconstruction: {}",
+            gap_sentences(recovery),
+            gap_sentences(reconstruction)
+        ),
+    }
+}
+
+pub(crate) fn decision_gap_sentence(gap: &DecisionGap) -> String {
+    match gap {
+        DecisionGap::ConditionUnspecified => {
+            "the condition declares no fact about how the decision is made".to_string()
+        }
+
+        DecisionGap::ConditionRootsUnstable { roots } => format!(
+            "the condition depends on roots that are not replay-stable: {}",
+            unstable_roots(roots)
+        ),
+
+        DecisionGap::ResultNotInContext { result } => {
+            format!("result `{result}` is bound by no earlier step of the path")
+        }
+
+        DecisionGap::ResultUnstable {
+            result,
+            effect,
+            gap,
+        } => format!(
+            "result `{result}` of `{effect}` is not replay-stable: {}",
+            result_gap_sentence(gap)
+        ),
+    }
+}
+
+pub(crate) fn unstable_roots(roots: &[UnstableRoot]) -> String {
+    roots
+        .iter()
+        .map(|entry| format!("`{}` ({})", entry.root.path, stability_sentence(&entry.gap)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A decision as a sentence names it.
+pub(crate) fn describe_decision(taken: &DecisionTaken) -> String {
+    match taken {
+        DecisionTaken::Match {
+            location,
+            result,
+            arm,
+        } => format!("the match on `{result}` at step `{location}`, taking its `{arm}` arm"),
+
+        DecisionTaken::Branch { location, arm } => {
+            format!("the branch at step `{location}`, taking its `{arm}` arm")
+        }
+    }
+}
+
+/// A path as a sentence names it: the program itself when it has no
+/// decisions, else the arms taken.
+pub(crate) fn describe_path(path: &PathRef) -> String {
+    if path.decisions.is_empty() {
+        return "the program".to_string();
+    }
+
+    format!("the path `{}`", path_label(path))
+}
+
+/// The compact label of a path: `ok(result.payment) › then(step 3)`.
+pub fn path_label(path: &PathRef) -> String {
+    path.decisions
+        .iter()
+        .map(|decision| match decision {
+            DecisionTaken::Match { result, arm, .. } => format!("{arm}({result})"),
+            DecisionTaken::Branch { location, arm } => format!("{arm}(step {location})"),
+        })
+        .collect::<Vec<_>>()
+        .join(" › ")
 }
 
 pub(crate) fn describe_value_ref(value: &ValueRef) -> String {
@@ -168,18 +327,14 @@ pub(crate) fn describe_value_source(source: &ValueSource) -> String {
     match source {
         ValueSource::Input(id) => format!("input `{id}`"),
         ValueSource::Effect(id) => format!("effect `{id}`"),
-        ValueSource::InvocationResult(id) => format!("invocation result `{id}`"),
+        ValueSource::TransactionOutput(id) => format!("transaction output `{id}`"),
         ValueSource::StateMachineSubject(id) => format!("state-machine subject `{id}`"),
         ValueSource::TransactionRead(id) => format!("transaction read `{id}`"),
+        ValueSource::EffectResultOk(id) => format!("the ok payload of effect result `{id}`"),
+        ValueSource::EffectResultErr(id) => format!("the err payload of effect result `{id}`"),
     }
 }
 
 pub(crate) fn value_source_id(source: &ValueSource) -> Option<&Id> {
-    match source {
-        ValueSource::Input(id)
-        | ValueSource::Effect(id)
-        | ValueSource::InvocationResult(id)
-        | ValueSource::StateMachineSubject(id)
-        | ValueSource::TransactionRead(id) => Some(id),
-    }
+    Some(source.id())
 }

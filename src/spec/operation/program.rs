@@ -1,0 +1,358 @@
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::spec::{Id, ResultVariant};
+
+use super::{Derivation, SelectorValue, ValueRef};
+
+/// The one explicit control structure of an operation.
+///
+/// A program is a block of steps executed in order. Decisions —
+/// `MatchResult` over a synchronous effect result, `Branch` over an
+/// ordinary predicate — nest further blocks, and every reachable path
+/// ends at an explicit terminal: `Return` for a request-driven
+/// execution, `Complete` for one that returns nothing. The structure is
+/// acyclic by construction: loops are deliberately deferred.
+///
+/// Control flow describes causality. It is not a durable workflow, a
+/// checkpoint, or a program counter; a retry traverses the same
+/// declared control from the start, and what it re-encounters is
+/// judged by the transaction and effect replay rules.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationBlock {
+    pub steps: Vec<OperationStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationStep {
+    /// Executes, or resolves the prior keyed commit of, an
+    /// operation-owned transaction.
+    Transaction(RunTransaction),
+
+    /// Constructs one instance of an operation-owned effect and
+    /// executes it.
+    ExecuteEffect(ExecuteEffect),
+
+    /// Executes an already-established effect instance.
+    ExecuteEffectIntent(ExecuteEffectIntent),
+
+    /// Destructures a bound effect result into its `ok` and `err`
+    /// arms.
+    MatchResult(MatchResult),
+
+    /// An ordinary control decision over modeled values.
+    Branch(Branch),
+
+    /// Terminates a request-driven execution with the request's
+    /// declared result.
+    Return(Return),
+
+    /// Terminates an execution that returns nothing, as is natural for
+    /// a subscription-driven operation.
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunTransaction {
+    pub transaction: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteEffect {
+    pub effect: Id,
+
+    /// Provenance of the complete outgoing logical effect instance
+    /// constructed and executed by this step.
+    pub values: Derivation,
+
+    /// Binds the effect's synchronous result, when the effect contract
+    /// is result-bearing and the result is not deliberately ignored.
+    ///
+    /// The result type is inferred from the contract: a request effect
+    /// inherits its target input's result, an external effect declares
+    /// its own, a publication has none and cannot bind one. The bound
+    /// id is an operation-local observation, not a transaction
+    /// artifact.
+    pub result: Option<Id>,
+}
+
+/// Executes an already-established effect instance; the values were
+/// fixed at establishment, so no derivation is declared here. The
+/// result binding follows the underlying effect contract exactly as
+/// for a direct execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteEffectIntent {
+    pub intent: Id,
+    pub result: Option<Id>,
+}
+
+/// Explicit, exhaustive, mutually exclusive destructuring of a bound
+/// result.
+///
+/// Inside `ok`, `effect_result_ok:<result>` is available and the `err`
+/// payload is not; inside `err`, the reverse. Neither payload survives
+/// the join after the match: data that must be generally available
+/// later is exported through a transaction artifact instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchResult {
+    pub result: Id,
+    pub ok: OperationBlock,
+    pub err: OperationBlock,
+}
+
+/// An ordinary control decision. `MatchResult` destructures a result;
+/// `Branch` evaluates a predicate over modeled values. Neither is
+/// overloaded to do the other's job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    pub condition: Condition,
+    pub then: OperationBlock,
+
+    /// Absent, the branch falls through to the following step when the
+    /// condition does not hold.
+    pub otherwise: Option<OperationBlock>,
+}
+
+/// The predicate of a `Branch`.
+///
+/// The vocabulary is deliberately small and structurally exposes every
+/// value the decision depends on, so replay analysis can judge whether
+/// a retry takes the same arm without an expression language: `eq`,
+/// `and`, and `not` are deterministic functions of their references,
+/// and `unspecified` states that the model provides no fact about how
+/// the decision is made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Condition {
+    /// The model provides no fact about the decision; which arm an
+    /// invocation takes is unknown to the analyzer.
+    Unspecified,
+
+    /// Equality of a modeled value against a literal or another modeled
+    /// value. `equals` accepts the selector-value surface: a map is a
+    /// value reference, a scalar is a literal.
+    Eq {
+        value: ValueRef,
+        equals: SelectorValue,
+    },
+
+    And {
+        conditions: Vec<Condition>,
+    },
+
+    Not {
+        condition: Box<Condition>,
+    },
+}
+
+impl Condition {
+    /// Every value reference the decision observes.
+    pub fn roots(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::Unspecified => Vec::new(),
+
+            Self::Eq { value, equals } => {
+                let mut roots = vec![value];
+
+                if let SelectorValue::Value(reference) = equals {
+                    roots.push(reference);
+                }
+
+                roots
+            }
+
+            Self::And { conditions } => conditions.iter().flat_map(Condition::roots).collect(),
+
+            Self::Not { condition } => condition.roots(),
+        }
+    }
+
+    /// Whether the decision is a deterministic function of its roots.
+    /// Only `unspecified` is not.
+    pub fn is_deterministic(&self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Eq { .. } => true,
+            Self::And { conditions } => conditions.iter().all(Condition::is_deterministic),
+            Self::Not { condition } => condition.is_deterministic(),
+        }
+    }
+}
+
+/// Terminates a request-driven execution by constructing the request
+/// input's declared result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Return {
+    /// The operation-owned request input whose result is returned.
+    pub request: Id,
+
+    pub outcome: ResultOutcome,
+}
+
+/// Which variant a `Return` constructs, and the provenance of its
+/// payload: `Ok` builds the request's `ok` schema, `Err` its `err`
+/// schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResultOutcome {
+    Ok { values: Derivation },
+    Err { values: Derivation },
+}
+
+impl ResultOutcome {
+    pub fn variant(&self) -> ResultVariant {
+        match self {
+            Self::Ok { .. } => ResultVariant::Ok,
+            Self::Err { .. } => ResultVariant::Err,
+        }
+    }
+
+    pub fn values(&self) -> &Derivation {
+        match self {
+            Self::Ok { values } | Self::Err { values } => values,
+        }
+    }
+}
+
+/// The arm of a decision a nested block belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Arm {
+    Ok,
+    Err,
+    Then,
+    Otherwise,
+}
+
+impl Arm {
+    pub fn of(variant: ResultVariant) -> Self {
+        match variant {
+            ResultVariant::Ok => Self::Ok,
+            ResultVariant::Err => Self::Err,
+        }
+    }
+}
+
+impl fmt::Display for Arm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ok => "ok",
+            Self::Err => "err",
+            Self::Then => "then",
+            Self::Otherwise => "otherwise",
+        })
+    }
+}
+
+/// Where a step sits in a program: one hop per nesting level, each the
+/// step's position in its block and, for every level but the last, the
+/// arm entered beneath it.
+///
+/// Steps carry no ids of their own, so this is how diagnostics and
+/// reports name them. It renders one-based, as `3.ok.1`: the first step
+/// of the `ok` arm of the third top-level step.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StepLocation(pub Vec<StepHop>);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepHop {
+    pub step: usize,
+    pub arm: Option<Arm>,
+}
+
+impl StepLocation {
+    pub fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The location of step `step` in the block this location's step
+    /// opens through `arm`, or in the program itself at the root.
+    fn descend(&self, arm: Option<Arm>, step: usize) -> Self {
+        let mut hops = self.0.clone();
+
+        if let Some(last) = hops.last_mut() {
+            last.arm = arm;
+        }
+
+        hops.push(StepHop { step, arm: None });
+
+        Self(hops)
+    }
+}
+
+impl fmt::Display for StepLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (position, hop) in self.0.iter().enumerate() {
+            if position > 0 {
+                f.write_str(".")?;
+            }
+
+            write!(f, "{}", hop.step + 1)?;
+
+            if let Some(arm) = hop.arm {
+                write!(f, ".{arm}")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl OperationBlock {
+    /// Every step of the program with its location, depth first in
+    /// program order.
+    pub fn steps_with_locations(&self) -> Vec<(StepLocation, &OperationStep)> {
+        let mut out = Vec::new();
+
+        self.collect(&StepLocation::root(), None, &mut out);
+
+        out
+    }
+
+    fn collect<'a>(
+        &'a self,
+        parent: &StepLocation,
+        arm: Option<Arm>,
+        out: &mut Vec<(StepLocation, &'a OperationStep)>,
+    ) {
+        for (index, step) in self.steps.iter().enumerate() {
+            let location = parent.descend(arm, index);
+
+            out.push((location.clone(), step));
+
+            match step {
+                OperationStep::MatchResult(matched) => {
+                    matched.ok.collect(&location, Some(Arm::Ok), out);
+                    matched.err.collect(&location, Some(Arm::Err), out);
+                }
+
+                OperationStep::Branch(branch) => {
+                    branch.then.collect(&location, Some(Arm::Then), out);
+
+                    if let Some(otherwise) = &branch.otherwise {
+                        otherwise.collect(&location, Some(Arm::Otherwise), out);
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
+
+    /// The location of step `index` of the block that `parent` opens
+    /// through `arm`; `parent` is the root for the program's own steps.
+    pub fn location(parent: &StepLocation, arm: Option<Arm>, index: usize) -> StepLocation {
+        parent.descend(arm, index)
+    }
+}

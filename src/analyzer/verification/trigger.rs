@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 
 use crate::spec::{
-    Effect, Id, Input, MessageSelector, Model, Operation, PublicationEffect, SubscriptionInput,
+    Effect, ExternalEffect, Id, IdempotencyKey, Input, MessageSelector, Model, Operation,
+    PublicationEffect, RequestEffect, ResultReplayRequirement, SubscriptionInput,
     TransitionSideEffect, ValueSource,
 };
 
@@ -158,12 +159,89 @@ impl<'a> TriggerGraph<'a> {
 /// payload-equal invocations through that input into the work of one
 /// logical invocation (a governing key names one input, §12).
 pub fn collapses_duplicates(operation: &Operation, input: &Id) -> bool {
-    operation.requirements.idempotency.iter().any(|requirement| {
-        !requirement.key.components.is_empty()
-            && requirement
-                .key
-                .components
-                .iter()
-                .all(|component| component.source == ValueSource::Input(input.clone()))
-    })
+    operation
+        .requirements
+        .idempotency
+        .iter()
+        .any(|requirement| {
+            !requirement.key.components.is_empty()
+                && requirement
+                    .key
+                    .components
+                    .iter()
+                    .all(|component| component.source == ValueSource::Input(input.clone()))
+        })
+}
+
+/// The requirement of `operation` that declares its result
+/// replay-consistent for invocations through `input`: an idempotency
+/// requirement keyed entirely from that input with
+/// `result: replay_consistent`. Its proof is what lets a caller observe
+/// one result across repeated, payload-equal requests.
+pub fn returns_consistently(operation: &Operation, input: &Id) -> Option<usize> {
+    operation
+        .requirements
+        .idempotency
+        .iter()
+        .position(|requirement| {
+            requirement.result == ResultReplayRequirement::ReplayConsistent
+                && !requirement.key.components.is_empty()
+                && requirement
+                    .key
+                    .components
+                    .iter()
+                    .all(|component| component.source == ValueSource::Input(input.clone()))
+        })
+}
+
+/// The effect contract behind an execution site, unifying
+/// operation-owned effects and transition side effects.
+#[derive(Debug, Clone, Copy)]
+pub enum EffectContract<'a> {
+    Publication(&'a PublicationEffect),
+    Request(&'a RequestEffect),
+    External(&'a ExternalEffect),
+}
+
+/// The contract of an effect executed by `operation`: one of its own
+/// effects, or a transition side effect reached through one of its
+/// intents.
+pub fn effect_contract<'a>(
+    model: &'a Model,
+    operation: &'a Operation,
+    effect: &Id,
+) -> Option<EffectContract<'a>> {
+    if let Some(declared) = operation.effects.get(effect) {
+        return Some(match declared {
+            Effect::Publication(publication) => EffectContract::Publication(publication),
+            Effect::Request(request) => EffectContract::Request(request),
+            Effect::External(external) => EffectContract::External(external),
+        });
+    }
+
+    for machine in model.state_machines.values() {
+        for transition in machine.transitions.values() {
+            if let Some(side_effect) = transition.side_effects.get(effect) {
+                return Some(match side_effect {
+                    TransitionSideEffect::Publication(publication) => {
+                        EffectContract::Publication(publication)
+                    }
+
+                    TransitionSideEffect::Request(request) => EffectContract::Request(request),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// The triggering input of an admissible governing key: the input its
+/// first component names. Inadmissible keys are judged by the replay
+/// engine; this is only how verdicts are keyed by `(operation, input)`.
+pub fn key_input(key: &IdempotencyKey) -> Option<&Id> {
+    match &key.components.first()?.source {
+        ValueSource::Input(input) => Some(input),
+        _ => None,
+    }
 }

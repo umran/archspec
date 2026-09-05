@@ -5,6 +5,8 @@
 **Date:** 2026-08-20
 **Scope:** The exact V1 rules for when a `ValueRef` is replay-stable across attempts of the same logical invocation; two new boundary declarations those rules consume; validation obligations; consequences for the idempotency, recoverability, and response-replay analyses.
 
+**Terminology note (2026-09-04).** `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` replaced the operation-execution surface this document reasons over. Read its retired terms as follows: an *invocation flow* is a *path of the operation program* (one arm taken at each `match_result` or `branch`, ending at a terminal), and "flow order" / "flow level" are "path order" / "program level"; `FlowStep` is `OperationStep`; `InvocationResult`, `EstablishInvocationResult`, and `ValueSource::invocation_result` are `TransactionOutput`, `EstablishTransactionOutput`, and `transaction_output` — rules R4, R5, and the R7 table apply to transaction outputs verbatim; a `Response` / `ResponseSource` / `flow.response` is the `return` terminal constructing the `RequestInput.result` contract; *response replay* is *result replay*; `ObjectHistoryRequirement::linearizable` is removed and deferred. The rules carry over unchanged **per admitted path**, judged in the single forward pass over that path, with each decision judged where it is taken. Two roots the revision added — `effect_result_ok` / `effect_result_err` — are judged by the rule recorded in the R7 table below. See V3 §48.
+
 ---
 
 ## 1. The question
@@ -59,7 +61,8 @@ Everything else is `Unknown`.
 
 Replay analysis is always relative to an operation `O` and a governing
 equivalence key `K` — the `IdempotencyKey` of the idempotency,
-recoverability, or response-replay obligation under proof.
+recoverability, or response-replay (now result-replay) obligation under
+proof.
 
 **Rule R0 (governing-key admissibility).** V1 analysis proceeds only
 when every component of `K` is a `ValueRef` sourced from **one** input
@@ -103,8 +106,8 @@ recovery route is judged by rule R4 below.
 
 The quantification is over evaluations. An attempt that crashes before
 evaluating `r` imposes nothing; an attempt that evaluates `r` twice at
-different flow points observes the class-determined value both times or
-the reference is not stable.
+different points of its path observes the class-determined value both
+times or the reference is not stable.
 
 Stability composes upward through the existing rule: a value produced
 by `Deterministic { from }` whose roots are all replay-stable is
@@ -362,12 +365,13 @@ and payload. The rule's force is that it also covers duplicate
 Let `T` be a transaction of `O` with
 `idempotency: DeduplicatedBy { key: K' }`, and let every component of
 `K'` be replay-stable relative to `(O, K)` under these rules. Then for
-every artifact established by `T` — each `InvocationResult`, each
-explicitly established `EffectIntent`, and each transition side-effect
-intent — the artifact's contents are replay-stable: references through
-`ValueSource::InvocationResult`, and the effect instance consumed by
-`ExecuteEffectIntent`, evaluate to the values fixed by the single
-successful `Commit(T, K')`.
+every artifact established by `T` — each `InvocationResult` (since
+2026-09-04, each `TransactionOutput`), each explicitly established
+`EffectIntent`, and each transition side-effect intent — the
+artifact's contents are replay-stable: references through
+`ValueSource::InvocationResult` (now `ValueSource::TransactionOutput`),
+and the effect instance consumed by `ExecuteEffectIntent`, evaluate to
+the values fixed by the single successful `Commit(T, K')`.
 
 *Soundness.* `K'`-stability makes every attempt in the class evaluate
 the same `K'`, hence address the same logical commit identity. At most
@@ -408,8 +412,8 @@ A value produced by `Derivation::Deterministic { from }` with every
 root replay-stable is replay-deterministic. Where such a value is
 itself referenceable — artifact contents under R4/R5, mutation values
 and selector targets inside natural-replay analysis, a direct
-`ExecuteEffect` instance at flow level (§16) — its references and uses
-inherit stability from this rule.
+`ExecuteEffect` instance at flow level (now program level; §16) — its
+references and uses inherit stability from this rule.
 
 ### R7 — everything else
 
@@ -419,7 +423,8 @@ inherit stability from this rule.
 | Literal | Stable (R2). |
 | Triggering-input payload field | Stable only under R3; otherwise `Unknown`. |
 | Field of a non-triggering input | Not evaluable by the population; unusable, and any obligation resting on it is `Unknown`. |
-| `invocation_result` | Stable under R4 or R5; otherwise `Unknown`. |
+| `invocation_result` (now `transaction_output`) | Stable under R4 or R5; otherwise `Unknown`. |
+| `effect_result_ok` / `effect_result_err` *(added 2026-09-04)* | Stable only when the bound effect is a **request** whose instance is class-fixed (R6 over its derivation, or an intent replay-available under R4/R5), whose schema is the targeted input's, and whose target operation holds a **proven** `result: replay_consistent` requirement keyed from that input — the target then answers payload-equal requests with one variant and a replay-equivalent payload (V3 §32). An **external** effect's result is never stable: no declared fact makes an external boundary's answer replay-consistent, and `deduplicated_by` collapses the work, not the answer (V3 §48.2). A publication has no result. Otherwise `Unknown`. |
 | `effect` | `Unknown`. An effect instance is constructed per execution site; V1 does not treat its payload as an observable stable root. Intent contents are covered as artifacts (R4/R5) through `ExecuteEffectIntent`, which consumes the instance whole. Idempotency-key *propagation* declarations are unaffected: they are lineage assertions, not evaluated roots (§12). |
 | `state_machine_subject` | `Unknown`, always. Mutable persistent state may change between attempts, including through the operation's own committed work; V1 attempts no invariance analysis, for the §18 reasons. |
 | `transaction_read` | Never stable, and poisons any natural-replay provenance closure that reaches it. Already normative (§18); restated here for completeness of the table. |
@@ -432,11 +437,17 @@ establishes stability, not that instability is proven.
 The stability judgment, replay-determinism of derivations, natural
 transaction replayability, and artifact replay availability are one
 simultaneous induction. It is well-founded and needs no fixpoint: a
-single forward pass in flow order (and, within a transaction, step
-order) suffices, because every rule consumes only roots (R1–R3, R7) or
-facts established at earlier steps (R4–R6), and `TransactionRead`
-dependence — the only backward-looking observation — is conservatively
-excluded outright.
+single forward pass in flow order (now: along one path of the program,
+in path order) and, within a transaction, step order suffices, because
+every rule consumes only roots (R1–R3, R7) or facts established at
+earlier steps (R4–R6), and `TransactionRead` dependence — the only
+backward-looking observation — is conservatively excluded outright.
+*(2026-09-04.)* The one rule that reaches outside the operation — the
+`effect_result_*` row of R7, which rests on another operation's
+result-replay verdict — is why the result-replay checker itself is a
+greatest fixpoint across operations (V3 §48.2); within one path the
+pass remains a single forward sweep that consumes those verdicts as
+given.
 
 ---
 
@@ -450,13 +461,21 @@ mechanical:
   deterministic over R1–R6-stable roots, with the existing `Transition`
   and `TransactionRead` exclusions.
 - **Artifact replay** (revision §23): route A is R5; route B is R4.
-- **Response replay** (revision §18): route 1 is R5 applied to the
-  result-establishing transaction plus R6 on the result derivation;
-  route 2 is R4.
+- **Response replay** (revision §18) — since 2026-09-04, **result
+  replay** (V3 §16, §33): the `return` derivation must be
+  replay-deterministic in the context at the terminal — R6 over roots
+  stable by R1–R5 and the `effect_result_*` row — and every decision on
+  the returning path must replay (V3 §30). The old route 1 is R5 on
+  the output-establishing transaction plus R6 on the terminal
+  derivation; route 2 is R4.
 - **Direct executions** (§16): an `ExecuteEffect` derivation is
-  replay-deterministic iff deterministic over stable roots — R6 at flow
-  level, where `transaction_read` roots are already structurally
-  excluded.
+  replay-deterministic iff deterministic over stable roots — R6 at
+  program level, where `transaction_read` roots are already
+  structurally excluded.
+- **Decisions** *(added 2026-09-04)*: a `match_result` replays iff
+  its result is stable under the `effect_result_*` row; a `branch`
+  iff its condition is deterministic over roots stable under these
+  rules (`unspecified` never).
 - **Recoverability** (`resumable`): every artifact a post-crash
   continuation consumes must be replay-available via R4 or R5; the
   re-driven attempt's own roots are governed by the same table.
@@ -592,13 +611,20 @@ commit by the idempotency key itself — repairs it.
 6. **Flow applicability.** The stability judgment quantifies over
    evaluations, and an evaluation of an artifact reference presupposes
    the artifact is available in the attempt's context (§16). Which
-   flows remain admissible for a resumed attempt after a partial
-   execution — and therefore which evaluations can occur — is revision
-   question 7, which this document deliberately does not prejudge.
+   flows (now: paths of the program) remain admissible for a resumed
+   attempt after a partial execution — and therefore which evaluations
+   can occur — is revision question 7, which this document
+   deliberately does not prejudge. Since 2026-09-04 the judgment is
+   made along one path at a time, in the context that path has built.
 
 ---
 
 ## 9. Candidate structural diff
+
+*(As implemented 2026-08-20. Since 2026-09-04 `RequestInput` also
+carries `result: ResultType` — the `Result<Ok, Err>` contract a
+`return` constructs, V3 §13 — and the response-replay vocabulary
+sketched below became the result-replay checker's.)*
 
 ```rust
 pub struct RequestInput {
@@ -683,6 +709,17 @@ the remaining obstacles land with the idempotency slice.
 9. **Fixtures**: extend `flash_checkout.yaml` with `message_identity`
    on `topic.order_events` (`event_id` per schema) and
    `identity: keyed [idempotency_key]` on `input.create_order.request`.
+
+Revised 2026-09-04: the operation-execution revision
+(`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`, §48) renamed
+the artifact the rules govern (`InvocationResult` →
+`TransactionOutput`), made the judgment path-wise over the operation
+program, and added two roots — `effect_result_ok` /
+`effect_result_err` — whose rule the R7 table now records, together
+with the decision-replay consequence in §6. Rules R1–R6 are unchanged
+in substance. The terminology note after the status block maps the
+retired vocabulary; the worked examples of §7 keep their original
+names.
 
 ---
 

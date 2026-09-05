@@ -45,9 +45,9 @@ pub enum VerificationCode {
     /// declared facts. Epistemic, not a violation (§1.2).
     SerializationUnproven,
 
-    /// A declared response-replay obligation is not established by the
+    /// A declared result-replay obligation is not established by the
     /// declared facts. Epistemic, not a violation (§1.2).
-    ResponseReplayUnproven,
+    ResultReplayUnproven,
 
     /// A declared recoverability requirement is not established by the
     /// declared facts. Epistemic, not a violation (§1.2).
@@ -108,7 +108,6 @@ pub enum ValidationCode {
     TransactionReadFieldNotSelected,
 
     StateTransitionSubjectMismatch,
-    TransitionTransactionNotDeduplicated,
     TransitionEffectValuesMismatch,
     TransitionEffectIntentExplicitlyEstablished,
     AmbiguousTransitionEffectIntent,
@@ -116,9 +115,12 @@ pub enum ValidationCode {
 
     EmptyObjectIdentity,
 
-    RecoverabilityRequiresFlow,
-
-    ResponseInvocationResultSchemaMismatch,
-
     InvalidInputKind,
+
+    ProgramNotTerminated,
+    UnreachableProgramStep,
+    TransactionArtifactNotAvailable,
+    EffectResultNotBound,
+    EffectResultVariantOutOfScope,
+    EffectHasNoResult,
 }

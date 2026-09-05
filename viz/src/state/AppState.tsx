@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 
-import { buildIndex, flowContaining, type ModelIndex } from "../lib/index";
+import { buildIndex, type ModelIndex } from "../lib/index";
 import { buildObligationIndex, type ObligationIndex } from "../lib/obligations";
 import { hashes, impliedSubject, navigate, routeKey, useRoute, type Route } from "../lib/route";
 import type { Graph } from "../types/graph";
@@ -20,6 +20,8 @@ import type { Obligation, ProverReport } from "../types/report";
 export interface DetailContext {
   req?: { prop: RequirementKind; index: number };
   txStep?: { op: Id; tx: Id; index: number };
+  /** A program step, by its location in the operation's program. */
+  step?: { op: Id; location: string };
   edge?: boolean;
 }
 
@@ -194,22 +196,16 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
       const s = ob.subject;
       switch (s.kind) {
         case "operation": {
-          const prop = ob.property.kind === "response_replay" ? "idempotency" : ob.property.kind;
+          const prop = ob.property.kind === "result_replay" ? "idempotency" : ob.property.kind;
           navigateTo(
             hashes.op(s.operation),
             s.requirement !== undefined ? `req:${prop}:${s.requirement}` : undefined,
           );
           break;
         }
-        case "flow":
-          navigateTo(hashes.op(s.operation, s.flow), `flow:${s.flow}`);
+        case "transaction":
+          navigateTo(hashes.op(s.operation), `tx:${s.transaction}`);
           break;
-        case "transaction": {
-          const operation = data.model.operations[s.operation];
-          const flow = operation ? flowContaining(operation, s.transaction) : null;
-          navigateTo(hashes.op(s.operation, flow), `tx:${s.transaction}`);
-          break;
-        }
         case "state_machine":
           navigateTo(hashes.machine(s.machine, s.transition));
           break;
@@ -221,7 +217,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
           break;
       }
     },
-    [navigateTo, openDetail, data.model],
+    [navigateTo, openDetail],
   );
 
   const value = useMemo<AppState>(

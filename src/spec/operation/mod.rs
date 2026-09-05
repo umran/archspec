@@ -1,24 +1,24 @@
 pub mod effect;
 pub mod effect_intent;
-pub mod flow;
 pub mod idempotency;
 pub mod input;
-pub mod invocation_result;
-pub mod response;
+pub mod program;
+pub mod result;
 pub mod state_machine;
 pub mod transaction;
+pub mod transaction_output;
 pub mod value;
 
 pub use effect::*;
 pub use effect_intent::*;
-pub use flow::*;
 pub use idempotency::*;
 pub use input::*;
-pub use invocation_result::*;
-pub use response::*;
+pub use program::*;
+pub use result::*;
 use serde::{Deserialize, Serialize};
 pub use state_machine::*;
 pub use transaction::*;
+pub use transaction_output::*;
 pub use value::*;
 
 use std::collections::BTreeMap;
@@ -44,14 +44,15 @@ pub struct Operation {
     /// identity of the intent that transition implicitly establishes.
     pub effect_intents: BTreeMap<Id, EffectIntent>,
 
-    pub invocation_results: BTreeMap<Id, InvocationResult>,
-    pub responses: BTreeMap<Id, Response>,
+    /// Typed values transactions of this operation may export into its
+    /// control.
+    pub transaction_outputs: BTreeMap<Id, TransactionOutput>,
 
-    /// Atomic units reusable by invocation flows.
+    /// Atomic units the program may execute.
     pub transactions: BTreeMap<Id, Transaction>,
 
-    /// Alternative valid terminal invocation paths.
-    pub flows: BTreeMap<Id, InvocationFlow>,
+    /// The operation's one explicit control structure.
+    pub program: OperationBlock,
 
     pub requirements: OperationRequirements,
     pub execution: ExecutionSemantics,
@@ -82,29 +83,36 @@ pub struct OrderingRequirement {
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyRequirement {
     pub key: IdempotencyKey,
-    pub response: ResponseReplayRequirement,
+    pub result: ResultReplayRequirement,
 }
 
+/// Whether repeated attempts that return a request result must return
+/// the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ResponseReplayRequirement {
+pub enum ResultReplayRequirement {
+    /// No replay-stability requirement is declared for the result. This
+    /// does not waive the requirement's side-effect obligation.
     Unspecified,
+
+    /// Repeated admitted attempts in the same logical idempotency class
+    /// that return a request result must return the same result
+    /// variant and a replay-equivalent payload.
     ReplayConsistent,
 }
 
-/// An obligation that a logical invocation reaches terminal execution
-/// of a declared flow.
+/// An obligation that a logical invocation reaches a valid terminal of
+/// the operation program.
 ///
 /// This is a progress obligation and is deliberately separate from
 /// `IdempotencyRequirement`, which is a safety obligation. Idempotency
 /// constrains what repeated attempts may do; it is satisfied vacuously
 /// by never retrying, and therefore says nothing about whether the
-/// remaining steps of an interrupted flow ever execute.
+/// remaining steps of an interrupted program ever execute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoverabilityRequirement {
-    /// Identity of the logical invocation that must reach terminal
-    /// execution.
+    /// Identity of the logical invocation that must reach a terminal.
     ///
     /// Attempts sharing this key are attempts at the same logical
     /// invocation, so re-driving one of them continues that invocation
@@ -118,8 +126,8 @@ pub struct RecoverabilityRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionRequirement {
-    /// An interrupted attempt must be able to resume and drive a
-    /// declared flow to its terminal step.
+    /// An interrupted attempt must be able to resume and drive the
+    /// program to a `Return` or `Complete` terminal.
     ///
     /// The solver must establish that every prefix at which the
     /// invocation may fail admits a continuation: already-committed
@@ -131,8 +139,8 @@ pub enum CompletionRequirement {
     Resumable,
 
     /// In addition to resumability, the architecture must guarantee
-    /// that the logical invocation is re-driven until a declared flow
-    /// terminates.
+    /// that the logical invocation is re-driven until a terminal is
+    /// reached.
     ///
     /// This is a liveness obligation and additionally requires a
     /// modeled retry driver, such as at-least-once delivery on the

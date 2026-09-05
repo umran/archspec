@@ -5,6 +5,8 @@
 **Date:** 2026-08-21
 **Scope:** Duplicate-execution safety per effect kind; the single-delivery vacuous route; cross-operation request discharge and its fixpoint; what V1 does not infer.
 
+**Terminology note (2026-09-04).** `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` replaced the surface this document was written against. Read its retired terms as follows: an *invocation flow* is a *path of the operation program* (one arm taken at each `match_result` or `branch`, ending at a terminal); `FlowStep` is `OperationStep`; `InvocationResult`, `EstablishInvocationResult`, and `ValueSource::invocation_result` are `TransactionOutput`, `EstablishTransactionOutput`, and `transaction_output`; a `Response` / `ResponseSource` / `flow.response` is the `return` terminal constructing the `RequestInput.result` contract; *response replay* is *result replay*; `ObjectHistoryRequirement::linearizable` is removed and deferred. The V1 rules below carry over unchanged **per admitted path** — a path ending at `complete` or at `return` for the triggering input — with each decision judged where it is taken: a path's decisions must replay (V3 §30) for the path's retry to be the same work, which is the control leg §6 now records. See V3 §48.
+
 ---
 
 ## 1. The remaining gap
@@ -186,28 +188,41 @@ proofs rest on a cycle.
 
 A transition side effect is executed only through its implicitly
 established intent (§22), so it takes the intent-mediated form of the
-rules above: the intent must be replay-available — in practice route
-B, since every transition transaction is explicitly keyed — and the
+rules above: the intent must be replay-available — route B when the
+transaction is keyed; since Amendment A
+(`CONSEQO_REVISION_V3_AMENDMENT_A_TRANSITION_DEDUP_RELAXATION.md`) a
+transition transaction may also be unkeyed, and its intents are then
+replay-available by no route, so the site settles unproven — and the
 publication or request condition of §3/§4 applies to its contract.
 
 ---
 
 ## 6. The state leg, restated
 
-For completeness, the V1 idempotency analysis over each admitted flow
-(the same admitted-flow scoping as recoverability: flows with no
-response, or with the triggering input's response) is:
+For completeness, the V1 idempotency analysis over each admitted path
+of the operation program (the same scoping as recoverability: paths
+ending at `complete`, or at `return` for the triggering input) is:
 
 1. **every** transaction step is retry-safe — keyed commit over a
    stable key, or naturally replayable. Unlike recoverability, there
    is no final-step exemption: a duplicate delivery re-drives the
-   whole flow even after terminal completion, so every committed
+   whole program even after terminal completion, so every committed
    transaction may be re-encountered;
 2. every effect-executing step is duplicate-safe per §2–§5;
-3. an executed intent must be established by an earlier step at all.
+3. an executed intent must be established by an earlier step at all;
+4. *(added 2026-09-04, the control leg)* every decision on the path
+   replays — a `match_result` whose result is replay-stable, or a
+   `branch` whose condition is deterministic over replay-stable roots
+   (V3 §30) — so a retry traverses the same path. A decision that may
+   go the other way lets the retry do different work, and V1 has no
+   compatibility argument for the two histories; it is recorded as an
+   obstacle (`PathDecisionUnstable`). An external effect's result is
+   never replay-stable in V1 (V3 §48.2), so a match on one is always
+   such an obstacle.
 
-Response consistency is the separate response-replay obligation and is
-not re-checked here. Serialization facts are not needed: keyed commits
+Result consistency is the separate result-replay obligation and is
+not re-checked here; its verdicts feed in only where a decision rests
+on a request effect's result. Serialization facts are not needed: keyed commits
 exclude concurrent same-key commits by contract (§17), natural replay
 writes class-fixed values to class-fixed targets whatever the
 interleaving, and the boundary guarantees of §2–§4 are stated over
@@ -219,7 +234,7 @@ populations, not schedules.
 
 - **Empty population**: the triggering subscription admits no message
   schemas.
-- **No admitted behavior**: no admitted flow exists for the triggering
+- **No admitted behavior**: no admitted path exists for the triggering
   input, so an attempt performs no modeled work and there is nothing
   to duplicate. (Recoverability treats the same shape as an obstacle:
   progress is impossible; safety is trivial. The asymmetry is
@@ -248,8 +263,15 @@ populations, not schedules.
   derivation is replay-deterministic under the message identity pinned
   by `event_id`, and `PaymentCaptured` is identity-mapped — but the
   card charge is an external effect explicitly `not_deduplicated`.
-  **Unproven**, with exactly that obstacle: the model admits charging
-  the card twice.
+  **Unproven**, with that obstacle: the model admits charging the card
+  twice. *(Since 2026-09-04 the fixture binds the charge's result and
+  matches on it — `ok` publishes `PaymentCaptured`, `err` publishes
+  `PaymentFailed` with the decline `reason` — and two further obstacles
+  join the first: the match on the external result is not established
+  to replay, so a retry may take the other arm; and the `PaymentFailed`
+  instance depends on the `reason` root, which is not replay-stable
+  because no declared fact makes an external result
+  replay-consistent. The verdict is unchanged.)*
 - **`reserve_inventory`**: the reservation transaction is
   `not_deduplicated` with a read-dependent write, and the publication
   intent it establishes is replay-available by neither route.
@@ -289,10 +311,27 @@ Executed 2026-08-21:
    duplicate-execution rules of §2–§4, including the
    publication/request asymmetry.
 3. **Implementation**: `analyzer::verification::idempotency`, reusing
-   the replay engine, with the request fixpoint of §4.1.
+   the replay engine, with the fixpoint of §4.1.
 
 Revised 2026-08-21: §3 gained the consumer leg, §4.1 the publication
 edges of the fixpoint, and §8 the corrected `create_order` outcome;
 the main document's §9 and §13.1 and the implementation (with the
 trigger graph in `analyzer::verification::trigger`) were reconciled
 the same day.
+
+Revised 2026-08-25: the 2026-08-21 pass left least-fixpoint prose
+behind in the main document's §9 and §13.1 — the latter still
+describing publication cycles as settling unproven — and in the
+implementation's module and obstacle documentation. The behavior was
+and remains the greatest fixpoint of §4.1 over both legs, as
+`cyclic_publication_dependencies_prove_coinductively` asserts; the
+prose was corrected to match, and no behavior changed.
+
+Revised 2026-09-04: the operation-execution revision
+(`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`, §48) replaced
+flows with one operation program. The analysis now runs per admitted
+path, §6 gained the control leg, and §8's `charge_payment` outcome
+records the two obstacles the fixture's new match on the card result
+adds; the terminology note after the status block maps the retired
+vocabulary. The per-kind rules of §2–§5 and the fixpoint of §4.1 are
+unchanged.

@@ -5,7 +5,6 @@ import { Input } from "@cloudflare/kumo/components/input";
 import { Tooltip } from "@cloudflare/kumo/components/tooltip";
 import { ListChecksIcon, MoonIcon, SunIcon } from "@phosphor-icons/react";
 
-import { shortId } from "../lib/ids";
 import { STATUS_GLYPH, statusCounts } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { useApp } from "../state/AppState";
@@ -59,15 +58,7 @@ export function TopBar() {
                 <Breadcrumbs.Separator />
                 <Breadcrumbs.Current>{route.view === "op" ? "operation" : "machine"}</Breadcrumbs.Current>
                 <Breadcrumbs.Separator />
-                {route.view === "op" && route.flow ? (
-                  <>
-                    <Breadcrumbs.Link href={hashes.op(route.id)}>{route.id}</Breadcrumbs.Link>
-                    <Breadcrumbs.Separator />
-                    <Breadcrumbs.Current>{shortId(route.flow)}</Breadcrumbs.Current>
-                  </>
-                ) : (
-                  <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
-                )}
+                <Breadcrumbs.Current>{route.id}</Breadcrumbs.Current>
               </>
             )}
           </Breadcrumbs>

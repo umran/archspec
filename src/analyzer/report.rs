@@ -12,24 +12,22 @@
 //! `scaffold` enumerates every obligation the declared requirements
 //! imply, all `unknown` — executable documentation of the shape.
 //! `obligations` fills the same enumeration in from a real
-//! `VerificationReport`; families V1 does not verify (ordering,
-//! object history) stay `unknown` with a note saying so.
+//! `VerificationReport`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::verification::{
+    self, ArtifactReplay, ConsumerCollapse, DecisionReplay, DecisionRule, EffectSafety,
+    IdempotencyProof, IdempotencyVerdict, InstanceStability, KeyIdentity, PathRef,
+    RecoverabilityProof, RecoverabilityVerdict, Resolution, ResultReplayProof, ResultReplayVerdict,
+    ResultStabilityRule, RetryDriver, RetryRoute, SerializationProof, SerializationVerdict,
+    StableRoot, VerificationReport,
+};
+use crate::analyzer::verification::{
     DuplicateHandling, LaneFact, LineageFact, ModelNote, OrderingProof, OrderingVerdict,
     PrecedenceSource,
 };
-use crate::analyzer::verification::{
-    self, ArtifactReplay, ConsumerCollapse, EffectSafety, IdempotencyProof, IdempotencyVerdict,
-    InstanceStability, KeyIdentity, RecoverabilityProof, RecoverabilityVerdict, Resolution,
-    ResponseReplayProof, ResponseReplayVerdict, RetryDriver, RetryRoute, SerializationProof,
-    SerializationVerdict, StableRoot, VerificationReport,
-};
-use crate::spec::{
-    CompletionRequirement, Id, Model, ObjectHistoryRequirement, ValueRef, ValueSource,
-};
+use crate::spec::{CompletionRequirement, Id, Model, ResultReplayRequirement, ValueRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +48,11 @@ pub struct ProverReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<EvidenceItem>,
 }
+
+/// The current report format. Format 2 replaced the response-replay
+/// property with result replay, dropped object-history obligations and
+/// the flow subject, and made proofs cite program paths.
+pub const FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,9 +83,8 @@ pub struct Obligation {
 
 /// The correctness property an obligation discharges.
 ///
-/// The first four mirror `OperationRequirements`; `response_replay`
-/// splits out the response half of an idempotency requirement;
-/// `object_history` mirrors `ObjectHistoryRequirement`.
+/// The first four mirror `OperationRequirements`; `result_replay`
+/// splits out the result half of an idempotency requirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Property {
@@ -90,8 +92,7 @@ pub enum Property {
     Ordering,
     Idempotency,
     Recoverability,
-    ResponseReplay,
-    ObjectHistory,
+    ResultReplay,
     Custom { name: String },
 }
 
@@ -107,10 +108,6 @@ pub enum Subject {
         operation: Id,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requirement: Option<usize>,
-    },
-    Flow {
-        operation: Id,
-        flow: Id,
     },
     Transaction {
         operation: Id,
@@ -245,10 +242,10 @@ pub fn scaffold(model: &Model) -> ProverReport {
                 ),
             );
 
-            if r.response == crate::spec::ResponseReplayRequirement::ReplayConsistent {
+            if r.result == ResultReplayRequirement::ReplayConsistent {
                 obligations.push(Obligation {
-                    id: format!("oblig.{op_id}.response_replay.{i}"),
-                    property: Property::ResponseReplay,
+                    id: format!("oblig.{op_id}.result_replay.{i}"),
+                    property: Property::ResultReplay,
                     subject: Subject::Operation {
                         operation: op_id.clone(),
                         requirement: Some(i),
@@ -256,7 +253,7 @@ pub fn scaffold(model: &Model) -> ProverReport {
                     status: Status::Unknown,
                     summary: format!(
                         "Every attempt at {op_id} sharing the declared key \
-                         observes an equivalent response."
+                         returns an equivalent result."
                     ),
                     assumptions: Vec::new(),
                     evidence: Vec::new(),
@@ -271,8 +268,8 @@ pub fn scaffold(model: &Model) -> ProverReport {
                 Property::Recoverability,
                 i,
                 format!(
-                    "An interrupted invocation of {op_id} {} a declared \
-                     flow's terminal step.",
+                    "An interrupted invocation of {op_id} {} a terminal of \
+                     its program.",
                     match r.completion {
                         CompletionRequirement::Resumable => "can be resumed to reach",
                         CompletionRequirement::Guaranteed => "is re-driven until it reaches",
@@ -282,35 +279,8 @@ pub fn scaffold(model: &Model) -> ProverReport {
         }
     }
 
-    for (dm_id, dm) in &model.data_models {
-        for (obj_id, obj) in &dm.objects {
-            for req in &obj.requirements.history {
-                let name = match req {
-                    ObjectHistoryRequirement::Linearizable => "linearizable",
-                };
-
-                obligations.push(Obligation {
-                    id: format!("oblig.{dm_id}.{obj_id}.history.{name}"),
-                    property: Property::ObjectHistory,
-                    subject: Subject::Object {
-                        data_model: dm_id.clone(),
-                        object: obj_id.clone(),
-                    },
-                    status: Status::Unknown,
-                    summary: format!(
-                        "Accesses to {obj_id} admit a legal sequential \
-                         history respecting real-time precedence."
-                    ),
-                    assumptions: Vec::new(),
-                    evidence: Vec::new(),
-                    counterexample: None,
-                });
-            }
-        }
-    }
-
     ProverReport {
-        format: 1,
+        format: FORMAT,
         model_revision: Some(model.revision.0),
         obligations,
         notes: Vec::new(),
@@ -319,24 +289,10 @@ pub fn scaffold(model: &Model) -> ProverReport {
 
 /// Builds the obligation report from real verification results.
 ///
-/// Every declared obligation appears. The families V1 verifies carry
-/// their verdicts — proofs rendered as assumptions, obstacles as
-/// evidence; ordering and object-history obligations stay `unknown`
-/// with a note that no V1 verifier attempts them.
+/// Every declared obligation appears, carrying its verdict — proofs
+/// rendered as assumptions, obstacles as evidence.
 pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverReport {
     let mut report = scaffold(model);
-
-    for obligation in &mut report.obligations {
-        match obligation.property {
-            Property::ObjectHistory => obligation.evidence.push(EvidenceItem {
-                subject: None,
-                message: "No V1 verifier attempts object-history obligations."
-                    .to_string(),
-            }),
-
-            _ => {}
-        }
-    }
 
     for check in &verification.serialization {
         let id = obligation_id(&check.operation, "serialization", check.requirement);
@@ -370,14 +326,9 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
             .find(|obligation| obligation.id == id)
         {
             if check.coinductive {
-                obligation.assumptions.insert(
-                    0,
-                    "proven coinductively: this requirement and the ones it reaches \
-                     through request targets or message consumers collapse each \
-                     other's duplicates, and the greatest fixpoint admits the cycle \
-                     (effect-safety draft §4.1)"
-                        .to_string(),
-                );
+                obligation
+                    .assumptions
+                    .insert(0, coinductive_note("request targets or message consumers"));
             }
 
             // Lineage facts ride along: declared propagations become
@@ -396,7 +347,10 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
                 };
 
                 match &lineage.fact {
-                    LineageFact::Propagated { source, requirement } => {
+                    LineageFact::Propagated {
+                        source,
+                        requirement,
+                    } => {
                         let key = source
                             .components
                             .iter()
@@ -438,13 +392,24 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         }
     }
 
-    for check in &verification.response_replay {
-        let id = obligation_id(&check.operation, "response_replay", check.requirement);
+    for check in &verification.result_replay {
+        let id = obligation_id(&check.operation, "result_replay", check.requirement);
 
         patch(&mut report, &id, || match &check.verdict {
-            ResponseReplayVerdict::Proven { proof } => Ok(response_replay_assumptions(proof)),
-            ResponseReplayVerdict::Unproven { .. } => Err(check.diagnostic()),
+            ResultReplayVerdict::Proven { proof } => Ok(result_replay_assumptions(proof)),
+            ResultReplayVerdict::Unproven { .. } => Err(check.diagnostic()),
         });
+
+        if check.coinductive
+            && let Some(obligation) = report
+                .obligations
+                .iter_mut()
+                .find(|obligation| obligation.id == id)
+        {
+            obligation
+                .assumptions
+                .insert(0, coinductive_note("request effects"));
+        }
     }
 
     for check in &verification.recoverability {
@@ -483,6 +448,14 @@ pub fn obligations(model: &Model, verification: &VerificationReport) -> ProverRe
         .collect();
 
     report
+}
+
+fn coinductive_note(through: &str) -> String {
+    format!(
+        "proven coinductively: this requirement and the ones it reaches through \
+         {through} each rest on the others, and the greatest fixpoint admits the \
+         cycle (effect-safety draft §4.1)"
+    )
 }
 
 fn obligation_id(operation: &Id, slug: &str, requirement: usize) -> String {
@@ -534,22 +507,13 @@ fn property_slug(property: &Property) -> &str {
         Property::Ordering => "ordering",
         Property::Idempotency => "idempotency",
         Property::Recoverability => "recoverability",
-        Property::ResponseReplay => "response_replay",
-        Property::ObjectHistory => "object_history",
+        Property::ResultReplay => "result_replay",
         Property::Custom { name } => name,
     }
 }
 
 fn value_ref_label(value: &ValueRef) -> String {
-    let source = match &value.source {
-        ValueSource::Input(id)
-        | ValueSource::Effect(id)
-        | ValueSource::InvocationResult(id)
-        | ValueSource::StateMachineSubject(id)
-        | ValueSource::TransactionRead(id) => id,
-    };
-
-    format!("{source}.{}", value.path)
+    format!("{}.{}", value.source.id(), value.path)
 }
 
 fn serialization_assumptions(proof: &SerializationProof) -> Vec<String> {
@@ -685,7 +649,11 @@ fn ordering_assumptions(proof: &OrderingProof) -> Vec<String> {
                              that already took effect in order; its work is idempotency \
                              requirement #{}'s obligation ({})",
                             coverage.requirement,
-                            if coverage.proven { "proven" } else { "unproven" }
+                            if coverage.proven {
+                                "proven"
+                            } else {
+                                "unproven"
+                            }
                         ),
 
                         None => format!(
@@ -708,8 +676,8 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
             "{input} admits no message schemas; no attempt can bear the key"
         )],
 
-        IdempotencyProof::NoAdmittedFlows { input } => vec![format!(
-            "no admitted flow exists for {input}; an attempt performs no \
+        IdempotencyProof::NoAdmittedPaths { input } => vec![format!(
+            "no path of the program is admitted for {input}; an attempt performs no \
              modeled work"
         )],
 
@@ -718,13 +686,15 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
              identity is pinned by the key: a class holds at most one attempt"
         )],
 
-        IdempotencyProof::RetrySafeFlows { flows } => {
+        IdempotencyProof::RetrySafePaths { paths } => {
             let mut assumptions = Vec::new();
 
-            for flow in flows {
-                let prefix = flow_prefix(flows.len(), &flow.flow);
+            for path in paths {
+                let prefix = path_prefix(paths.len(), &path.path);
 
-                for transaction in &flow.transactions {
+                assumptions.extend(decision_assumptions(&prefix, &path.decisions));
+
+                for transaction in &path.transactions {
                     assumptions.push(match &transaction.route {
                         RetryRoute::KeyedCommit { key } => format!(
                             "{prefix}{} commits are deduplicated by {}, stable \
@@ -741,7 +711,7 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
                     });
                 }
 
-                for effect in &flow.effects {
+                for effect in &path.effects {
                     match &effect.safety {
                         EffectSafety::ExternallyDeduplicated { key } => assumptions.push(format!(
                             "{prefix}the external boundary of {} deduplicates \
@@ -812,37 +782,47 @@ fn idempotency_assumptions(proof: &IdempotencyProof) -> Vec<String> {
     }
 }
 
-fn response_replay_assumptions(proof: &ResponseReplayProof) -> Vec<String> {
+fn result_replay_assumptions(proof: &ResultReplayProof) -> Vec<String> {
     match proof {
-        ResponseReplayProof::NoAdmittedInvocations { input } => vec![format!(
+        ResultReplayProof::NoAdmittedInvocations { input } => vec![format!(
             "{input} admits no message schemas; no attempt can bear the key"
         )],
 
-        ResponseReplayProof::NoResolvedResponse { input } => vec![format!(
-            "no admitted flow resolves a response for {input}; there is nothing \
+        ResultReplayProof::NoReturnedResult { input } => vec![format!(
+            "no admitted path returns a result for {input}; there is nothing \
              to stabilize"
         )],
 
-        ResponseReplayProof::ClassFixedResult {
-            result,
-            transaction,
-            replay,
-            ..
-        } => vec![match replay {
-            ArtifactReplay::Recovered { .. } => format!(
-                "the response resolves {result}, retained by {transaction}'s \
-                 keyed commit and recovered on every retry"
-            ),
+        ResultReplayProof::ClassFixedResult { returns } => {
+            let mut assumptions = Vec::new();
 
-            ArtifactReplay::Reconstructed { .. } => format!(
-                "the response resolves {result}, reconstructed deterministically \
-                 by naturally replaying {transaction}"
-            ),
+            for returned in returns {
+                let prefix = path_prefix(returns.len(), &returned.path);
 
-            ArtifactReplay::Unavailable { .. } => format!(
-                "the response resolves {result} via {transaction}"
-            ),
-        }],
+                assumptions.extend(decision_assumptions(&prefix, &returned.decisions));
+
+                assumptions.push(format!(
+                    "{prefix}the returned {} payload is derived deterministically from \
+                     {}",
+                    returned.variant,
+                    root_labels(&returned.derivation)
+                ));
+
+                // Several roots may rest on one fact; state it once.
+                let mut cited = Vec::new();
+
+                for root in &returned.derivation {
+                    if let Some(label) = root_rule_label(root)
+                        && !cited.contains(&label)
+                    {
+                        assumptions.push(format!("{prefix}{label}"));
+                        cited.push(label);
+                    }
+                }
+            }
+
+            assumptions
+        }
     }
 }
 
@@ -852,9 +832,9 @@ fn recoverability_assumptions(proof: &RecoverabilityProof) -> Vec<String> {
             "{input} admits no message schemas; no attempt can bear the key"
         )],
 
-        RecoverabilityProof::Resumable { flows } => resumption_assumptions(flows),
+        RecoverabilityProof::Resumable { paths } => resumption_assumptions(paths),
 
-        RecoverabilityProof::Guaranteed { driver, flows } => {
+        RecoverabilityProof::Guaranteed { driver, paths } => {
             let mut assumptions = vec![match driver {
                 RetryDriver::AtLeastOnceDelivery { input, topic } => format!(
                     "{input} redelivers via {topic} at least once, re-driving \
@@ -876,20 +856,20 @@ fn recoverability_assumptions(proof: &RecoverabilityProof) -> Vec<String> {
                 ),
             }];
 
-            assumptions.extend(resumption_assumptions(flows));
+            assumptions.extend(resumption_assumptions(paths));
 
             assumptions
         }
     }
 }
 
-fn resumption_assumptions(flows: &[verification::FlowResumption]) -> Vec<String> {
+fn resumption_assumptions(paths: &[verification::PathResumption]) -> Vec<String> {
     let mut assumptions = Vec::new();
 
-    for flow in flows {
-        let prefix = flow_prefix(flows.len(), &flow.flow);
+    for path in paths {
+        let prefix = path_prefix(paths.len(), &path.path);
 
-        for transaction in &flow.transactions {
+        for transaction in &path.transactions {
             assumptions.push(match &transaction.resolution {
                 Resolution::KeyedCommit { key } => format!(
                     "{prefix}{} resolves on re-encounter through its keyed \
@@ -904,14 +884,14 @@ fn resumption_assumptions(flows: &[verification::FlowResumption]) -> Vec<String>
                 ),
 
                 Resolution::TerminalStep => format!(
-                    "{prefix}{} is the flow's terminal step; no failing prefix \
-                     follows its commit",
+                    "{prefix}{} is the path's final step before completion; no \
+                     failing prefix follows its commit",
                     transaction.transaction
                 ),
             });
         }
 
-        for artifact in &flow.artifacts {
+        for artifact in &path.artifacts {
             assumptions.push(match &artifact.replay {
                 ArtifactReplay::Recovered { transaction, .. } => format!(
                     "{prefix}artifact {} is recovered from {transaction}'s keyed \
@@ -936,9 +916,45 @@ fn resumption_assumptions(flows: &[verification::FlowResumption]) -> Vec<String>
     assumptions
 }
 
-fn flow_prefix(flow_count: usize, flow: &Id) -> String {
-    if flow_count > 1 {
-        format!("in {flow}: ")
+/// The facts fixing each decision of a path: one line per decision.
+fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<String> {
+    decisions
+        .iter()
+        .map(|decision| {
+            let taken = match &decision.decision {
+                verification::DecisionTaken::Match { result, arm, .. } => {
+                    format!("the match on {result} takes its {arm} arm on every attempt")
+                }
+
+                verification::DecisionTaken::Branch { location, arm } => {
+                    format!("the branch at step {location} takes its {arm} arm on every attempt")
+                }
+            };
+
+            let because = match &decision.rule {
+                DecisionRule::StableResult { effect, rule, .. } => match rule {
+                    ResultStabilityRule::ReplayConsistentTarget {
+                        operation, input, ..
+                    } => format!(
+                        "{effect} sends a class-fixed request into {operation} via {input}, \
+                         whose result replay is proven"
+                    ),
+                },
+
+                DecisionRule::StableCondition { roots } => {
+                    format!("the condition is deterministic over {}", root_labels(roots))
+                }
+            };
+
+            format!("{prefix}{taken}: {because}")
+        })
+        .collect()
+}
+
+/// The prefix naming a path when the proof spans more than one.
+fn path_prefix(path_count: usize, path: &PathRef) -> String {
+    if path_count > 1 {
+        format!("on {}: ", verification::path_label(path))
     } else {
         String::new()
     }
@@ -956,6 +972,29 @@ fn root_labels(roots: &[StableRoot]) -> String {
         .join(", ")
 }
 
+/// A root whose stability rests on a fact worth stating on its own
+/// line: an artifact or an effect result.
+fn root_rule_label(root: &StableRoot) -> Option<String> {
+    match &root.rule {
+        verification::StabilityRule::RecoveredArtifact { transaction } => Some(format!(
+            "{} is recovered from {transaction}'s keyed commit on every retry",
+            root.root.source.id()
+        )),
+
+        verification::StabilityRule::ReconstructedArtifact { transaction } => Some(format!(
+            "{} is reconstructed deterministically by naturally replaying {transaction}",
+            root.root.source.id()
+        )),
+
+        verification::StabilityRule::ReplayConsistentResult { result, effect } => Some(format!(
+            "result {result} of {effect} is observed equally by every attempt: the \
+             target proves its result replay-consistent"
+        )),
+
+        _ => None,
+    }
+}
+
 fn instance_label(instance: &InstanceStability) -> String {
     match instance {
         InstanceStability::ReplayDeterministic { .. } => {
@@ -963,13 +1002,13 @@ fn instance_label(instance: &InstanceStability) -> String {
         }
 
         InstanceStability::EstablishedIntent { intent, replay } => match replay {
-            ArtifactReplay::Recovered { transaction, .. } => format!(
-                "intent {intent} is recovered from {transaction}'s keyed commit"
-            ),
+            ArtifactReplay::Recovered { transaction, .. } => {
+                format!("intent {intent} is recovered from {transaction}'s keyed commit")
+            }
 
-            ArtifactReplay::Reconstructed { transaction, .. } => format!(
-                "intent {intent} is reconstructed by naturally replaying {transaction}"
-            ),
+            ArtifactReplay::Reconstructed { transaction, .. } => {
+                format!("intent {intent} is reconstructed by naturally replaying {transaction}")
+            }
 
             ArtifactReplay::Unavailable { .. } => format!("intent {intent}"),
         },

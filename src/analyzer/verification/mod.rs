@@ -10,18 +10,21 @@
 //!
 //! This module is the model checker. It grew one requirement family
 //! at a time and now discharges all five of §9: operation
-//! serialization (`serialization`), ordering (`ordering`), response
-//! replay consistency (`response_replay`), recoverability
+//! serialization (`serialization`), ordering (`ordering`), result
+//! replay consistency (`result_replay`), recoverability
 //! (`recoverability`), and operation idempotency (`idempotency`). The
-//! replay-based three share the replay engine (`replay`): root
-//! stability, natural transaction replayability, and artifact replay
-//! availability. Verifiers that follow effects into other operations
-//! share the trigger graph (`trigger`); ordering rests on the
-//! serialization verifier's key identity and on idempotency's
-//! verdicts for redelivery. Beyond §9, a model-wide deadlock
-//! checker is earmarked (revision draft §27, question 9), gated on
-//! the locking facts the DSL cannot yet state (question 8); no
-//! verifier here reasons about locks.
+//! replay-based three share the replay engine (`replay`) — root
+//! stability, natural transaction replayability, artifact replay
+//! availability, effect-result and decision replay — applied path by
+//! path over the operation program (`paths`). Verifiers that follow
+//! effects into other operations share the trigger graph (`trigger`);
+//! ordering rests on the serialization verifier's key identity and on
+//! idempotency's verdicts for redelivery; idempotency and
+//! recoverability rest on result replay's verdicts wherever a decision
+//! or a value observes a request effect's result. Beyond §9, a
+//! model-wide deadlock checker is earmarked (revision draft §27,
+//! question 9), gated on the locking facts the DSL cannot yet state
+//! (question 8); no verifier here reasons about locks.
 //!
 //! Two rules govern every verdict:
 //!
@@ -47,40 +50,46 @@
 mod describe;
 pub mod idempotency;
 pub mod ordering;
+pub mod paths;
 pub mod recoverability;
 pub mod replay;
-pub mod response_replay;
+pub mod result_replay;
 pub mod serialization;
 pub mod trigger;
 pub mod value_identity;
 
+pub use describe::path_label;
 pub use idempotency::{
-    ConsumerCollapse, EffectRetrySafety, EffectSafety, FlowRetrySafety, IdempotencyCheck,
-    IdempotencyObstacle, IdempotencyProof, IdempotencyVerdict, IdentityLineage, InstanceStability,
-    LineageFact, ProducerRef, RetryRoute, TransactionRetrySafety, UnstableRoot,
+    ConsumerCollapse, EffectRetrySafety, EffectSafety, IdempotencyCheck, IdempotencyObstacle,
+    IdempotencyProof, IdempotencyVerdict, IdentityLineage, LineageFact, PathRetrySafety,
+    ProducerRef, RetryRoute, TransactionRetrySafety,
 };
 pub use ordering::{
     DuplicateCoverage, DuplicateHandling, LaneFact, OrderingCheck, OrderingObstacle, OrderingProof,
     OrderingVerdict, PrecedenceSource,
 };
+pub use paths::{DecisionTaken, PathRef};
 pub use recoverability::{
-    ArtifactAvailability, FlowResumption, RecoverabilityCheck, RecoverabilityNote,
+    ArtifactAvailability, PathResumption, RecoverabilityCheck, RecoverabilityNote,
     RecoverabilityObstacle, RecoverabilityProof, RecoverabilityVerdict, Resolution, RetryDriver,
     TransactionResolution,
 };
 pub use replay::{
-    ArtifactReplay, GoverningKeyDefect, PayloadIdentityGap, ReplayAnalysis, ReplayGap,
-    StabilityGap, StabilityRule, StableRoot,
+    ArtifactReplay, DecisionGap, DecisionReplay, DecisionRule, GoverningKeyDefect, InstanceGap,
+    InstanceStability, PayloadIdentityGap, ReplayAnalysis, ReplayGap, ResultGap, ResultReplay,
+    ResultStabilityRule, StabilityGap, StabilityRule, StableRoot, UnstableRoot,
 };
-pub use response_replay::{
-    ResponseReplayCheck, ResponseReplayObstacle, ResponseReplayProof, ResponseReplayVerdict,
-    ResponseSite,
+pub use result_replay::{
+    ResultReplayCheck, ResultReplayObstacle, ResultReplayProof, ResultReplayVerdict, ReturnedResult,
 };
 pub use serialization::{
     KeyIdentity, MessageKeyFact, SerializationCheck, SerializationObstacle, SerializationProof,
     SerializationVerdict,
 };
-pub use trigger::{Consumer, Producer, ProducerSite, TriggerGraph, collapses_duplicates};
+pub use trigger::{
+    Consumer, EffectContract, Producer, ProducerSite, TriggerGraph, collapses_duplicates,
+    effect_contract, key_input, returns_consistently,
+};
 pub use value_identity::{CanonicalValuePath, canonical_value_path};
 
 use crate::analyzer::{Diagnostic, DiagnosticCode, Severity, VerificationCode};
@@ -128,7 +137,9 @@ impl ModelNote {
                 };
 
                 format!(
-                    "`{input}` of `{operation}` subscribes to `{topic}` and {admits}; the                      operation declares no idempotency requirement keyed from that input, so                      the work a duplicate delivery repeats is checked by nothing."
+                    "`{input}` of `{operation}` subscribes to `{topic}` and {admits}; the \
+                     operation declares no idempotency requirement keyed from that input, so \
+                     the work a duplicate delivery repeats is checked by nothing."
                 )
             }
         }
@@ -182,7 +193,7 @@ pub struct VerificationReport {
     pub serialization: Vec<SerializationCheck>,
     pub ordering: Vec<OrderingCheck>,
     pub idempotency: Vec<IdempotencyCheck>,
-    pub response_replay: Vec<ResponseReplayCheck>,
+    pub result_replay: Vec<ResultReplayCheck>,
     pub recoverability: Vec<RecoverabilityCheck>,
 
     /// Model-wide notes, raised as warnings.
@@ -209,9 +220,9 @@ impl VerificationReport {
                     .filter_map(IdempotencyCheck::diagnostic),
             )
             .chain(
-                self.response_replay
+                self.result_replay
                     .iter()
-                    .filter_map(ResponseReplayCheck::diagnostic),
+                    .filter_map(ResultReplayCheck::diagnostic),
             )
             .chain(
                 self.recoverability
@@ -240,9 +251,9 @@ impl VerificationReport {
                 .iter()
                 .all(|entry| matches!(entry.verdict, IdempotencyVerdict::Proven { .. }))
             && self
-                .response_replay
+                .result_replay
                 .iter()
-                .all(|entry| matches!(entry.verdict, ResponseReplayVerdict::Proven { .. }))
+                .all(|entry| matches!(entry.verdict, ResultReplayVerdict::Proven { .. }))
             && self
                 .recoverability
                 .iter()
@@ -251,16 +262,23 @@ impl VerificationReport {
 }
 
 /// Verifies every declared requirement the checker currently supports.
+///
+/// Result replay comes first: it depends on nothing but itself, and
+/// its proven set is what idempotency and recoverability consult when
+/// a decision or a value rests on a request effect's result.
 pub fn verify(model: &Model) -> VerificationReport {
-    let idempotency = idempotency::check(model);
+    let result_replay = result_replay::check(model);
+    let consistent = result_replay::consistent_set(&result_replay);
+
+    let idempotency = idempotency::check(model, &consistent);
     let ordering = ordering::check(model, &idempotency);
 
     VerificationReport {
         serialization: serialization::check(model),
         ordering,
         idempotency,
-        response_replay: response_replay::check(model),
-        recoverability: recoverability::check(model),
+        result_replay,
+        recoverability: recoverability::check(model, &consistent),
         notes: notes(model),
     }
 }

@@ -9,13 +9,11 @@ export type Property =
   | { kind: "ordering" }
   | { kind: "idempotency" }
   | { kind: "recoverability" }
-  | { kind: "response_replay" }
-  | { kind: "object_history" }
+  | { kind: "result_replay" }
   | { kind: "custom"; name: string };
 
 export type Subject =
   | { kind: "operation"; operation: Id; requirement?: number }
-  | { kind: "flow"; operation: Id; flow: Id }
   | { kind: "transaction"; operation: Id; transaction: Id }
   | { kind: "object"; data_model: Id; object: Id }
   | { kind: "state_machine"; machine: Id; transition?: Id }

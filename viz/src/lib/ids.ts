@@ -2,8 +2,8 @@ import type { FieldPath, Id } from "../types/model";
 
 const KIND_PREFIXES = new Set([
   "service", "operation", "topic", "schema", "machine", "state",
-  "transition", "flow", "tx", "intent", "effect", "input", "result",
-  "response", "object", "data", "read", "oblig",
+  "transition", "tx", "intent", "effect", "input", "result", "output",
+  "object", "data", "read", "oblig",
 ]);
 
 /** Drops the conventional kind prefix: `operation.create_order` → `create_order`. */

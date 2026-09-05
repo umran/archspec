@@ -87,7 +87,7 @@ export function SystemView() {
       })}
 
       {layout.edges.map(({ edge: e, d, labelAt }) => {
-        const unexecuted = "executed_by" in e && e.executed_by.length === 0;
+        const unexecuted = "executed_at" in e && e.executed_at.length === 0;
         const dimmed = selection ? !related.has(e.id) : q ? !(matches(e.from) || matches(e.to)) : false;
         const classes = ["arch-edge", e.kind];
         if (unexecuted) classes.push("unexecuted");
@@ -127,12 +127,12 @@ export function SystemView() {
               {truncate(shortId(op.id), 24)}
             </text>
             <text className="subtitle" x={p.x + 10} y={p.y + 36}>
-              {`${op.flows} flow${op.flows === 1 ? "" : "s"} · ${op.inputs} input${op.inputs === 1 ? "" : "s"}`}
+              {`${op.steps} step${op.steps === 1 ? "" : "s"} · ${op.inputs} input${op.inputs === 1 ? "" : "s"}`}
             </text>
             <text className="badge-text" x={p.x + 10} y={p.y + 52}>
               {badges.join("  ")}
             </text>
-            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open flows)"}</title>
+            <title>{op.id + (op.description ? `\n${op.description}` : "") + "\n(double-click to open the program)"}</title>
             <StatusChip x={p.x + p.w - 6} y={p.y} obKey={op.id} />
           </g>
         );
