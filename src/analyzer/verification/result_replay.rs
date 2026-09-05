@@ -16,8 +16,8 @@
 //! consistent.
 //!
 //! For each returning path the proof is control-path replay plus
-//! ordinary provenance (§16, §33). Every decision on the path must
-//! replay (§30): a class then follows one path to one terminal, which
+//! ordinary provenance (§9, §16). Every decision on the path must
+//! replay (§16): a class then follows one path to one terminal, which
 //! fixes the variant. The terminal derivation must be
 //! replay-deterministic in the context at the terminal — deterministic
 //! over roots the §18 rules make stable, including transaction outputs
@@ -27,7 +27,7 @@
 //! That last premise names other operations' verdicts, so the checks
 //! are computed as a greatest fixpoint over the replay-consistent
 //! requirements, exactly as idempotency's are
-//! (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1): a cycle of requests whose
+//! (§9): a cycle of requests whose
 //! members each pass their local checks proves, and the proof is
 //! marked coinductive. The argument is the same minimal-counterexample
 //! one — a differing observation is a violation at strictly shorter

@@ -22,9 +22,9 @@
 //! idempotency's verdicts for redelivery; idempotency and
 //! recoverability rest on result replay's verdicts wherever a decision
 //! or a value observes a request effect's result. Beyond §9, a
-//! model-wide deadlock checker is earmarked (revision draft §27,
-//! question 9), gated on the locking facts the DSL cannot yet state
-//! (question 8); no verifier here reasons about locks.
+//! model-wide deadlock checker is earmarked (§27 question 9),
+//! gated on the locking facts the DSL cannot yet state (§27
+//! question 8); no verifier here reasons about locks.
 //!
 //! Two rules govern every verdict:
 //!

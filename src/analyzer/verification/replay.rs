@@ -25,8 +25,8 @@
 //!
 //! V1 proves a transaction naturally replayable only when re-executing
 //! its body for the same logical invocation reproduces the same
-//! committed state: no `Transition` (revision §22.1), no `Insert`
-//! (duplicate-identity insert outcomes are undefined — revision §27
+//! committed state: no `Transition` (§22), no `Insert`
+//! (duplicate-identity insert outcomes are undefined — §27
 //! question 4), no `Delete` (§20), and every `Write` with a stable
 //! target and a replay-deterministic derivation. Reads and locks do
 //! not mutate state and do not block the natural route; read-dependent
@@ -50,11 +50,11 @@
 //!
 //! ## Effect results and decisions
 //!
-//! A bound effect result is judged per observed variant (Amendment B).
+//! A bound effect result is judged per observed variant (§18 rule 6).
 //! A request result is replay-stable — in both variants at once — when
 //! the outgoing instance is class-fixed and the target proves its
 //! result replay-consistent for the targeted input; stable outgoing
-//! values do not by themselves prove a stable returned result (§31).
+//! values do not by themselves prove a stable returned result (§13).
 //! An external result is replay-stable when the boundary declares
 //! `deduplicated_by` over a class-fixed key — equal keys identify one
 //! logical external interaction whose terminal result is fixed — and
@@ -64,7 +64,7 @@
 //! provides no usable fact; neither is promoted by idempotency alone.
 //! A decision replays — every attempt in a class takes the same arm —
 //! when the matched result is stable in the variant of the arm taken,
-//! or the branch condition is deterministic over stable roots (§30).
+//! or the branch condition is deterministic over stable roots (§16).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -243,7 +243,7 @@ pub enum ReplayGap {
     ContainsTransition,
 
     /// Route A: the transaction inserts an object; duplicate-identity
-    /// insert outcomes are not yet defined (revision §27 question 4).
+    /// insert outcomes are not yet defined (§27 question 4).
     ContainsInsert,
 
     /// Route A: the transaction deletes objects; deletion replay
@@ -368,7 +368,7 @@ pub enum ResultStabilityRule {
     /// payload-equal request into one class of the target's
     /// replay-consistent result requirement, which is proven: the
     /// target returns the same variant and a replay-equivalent payload
-    /// to each of them (§32).
+    /// to each of them (§13.2).
     ReplayConsistentTarget {
         operation: Id,
         input: Id,
@@ -381,7 +381,7 @@ pub enum ResultStabilityRule {
     /// attempts address one logical external interaction, whose
     /// terminal result the guarantee fixes — and the observed variant
     /// is terminal: `Ok` by definition, `Err` by the contract's
-    /// declared `terminal` disposition (Amendment B).
+    /// declared `terminal` disposition (§13.3).
     ExternalTerminalResult {
         variant: ResultVariant,
         key: Vec<StableRoot>,
@@ -441,7 +441,7 @@ pub enum ResultGap {
 }
 
 /// The replay judgments of one bound result, per observed variant.
-/// Stability is variant-sensitive (Amendment B): a deduplicated
+/// Stability is variant-sensitive (§18 rule 6): a deduplicated
 /// external boundary's terminal `Ok` is stable while the same
 /// binding's retryable `Err` is not. A request result carries one
 /// judgment in both variants — the target's replay-consistent
@@ -496,7 +496,7 @@ pub enum DecisionRule {
     StableCondition { roots: Vec<StableRoot> },
 }
 
-/// Why a retry is not established to take the same arm (§30).
+/// Why a retry is not established to take the same arm (§16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DecisionGap {
@@ -1181,7 +1181,7 @@ impl<'a> ReplayAnalysis<'a> {
     /// Whether same-class attempts observe one result from an effect
     /// execution, judged per variant. A request result requires a
     /// class-fixed instance and a target proving its result
-    /// replay-consistent (§31, §32), and is then stable in both
+    /// replay-consistent (§13.2), and is then stable in both
     /// variants at once. An external result is judged by
     /// `external_result_replay`.
     fn result_replay(
@@ -1269,7 +1269,7 @@ impl<'a> ReplayAnalysis<'a> {
         })
     }
 
-    /// The Amendment B judgment of an external result, per variant.
+    /// The §13.3 judgment of an external result, per variant.
     ///
     /// `deduplicated_by` over a class-fixed key makes equal-key
     /// executions one logical external interaction whose terminal
@@ -1345,7 +1345,7 @@ impl<'a> ReplayAnalysis<'a> {
         }
     }
 
-    /// Whether every attempt in the class takes the same arm (§30).
+    /// Whether every attempt in the class takes the same arm (§16).
     fn decision_replay(
         &self,
         context: &PathContext,
@@ -1364,7 +1364,7 @@ impl<'a> ReplayAnalysis<'a> {
                 // variant, so the decision rests on that variant's
                 // judgment: a stable terminal `Ok` re-selects the ok
                 // arm even where the same binding's `Err` would not
-                // replay (Amendment B §15).
+                // replay (§18 rule 6).
                 let replay = match context.results.get(*result) {
                     None => Err(DecisionGap::ResultNotInContext {
                         result: (*result).clone(),

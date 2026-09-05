@@ -1,5 +1,5 @@
 //! Verification of recoverability requirements (§9 of the semantics
-//! contract; `ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`).
+//! contract).
 //!
 //! > The logical invocation identified by the key must reach a valid
 //! > terminal of the operation program — `return` or `complete` —
@@ -10,7 +10,7 @@
 //! **same-path continuation**: for every prefix at which an attempt
 //! may fail, re-driving the same path of the program from its first
 //! step reaches the path's terminal. This is a sufficient route that
-//! does not prejudge revision question 7 (which *other* paths a
+//! does not prejudge §27 question 7 (which *other* paths a
 //! resumed attempt may take). A decision a retry is not established
 //! to take the same way is no obstacle to progress: whichever
 //! admitted path it then follows is analyzed on its own, and the

@@ -1,5 +1,5 @@
 //! Verification of operation ordering requirements (§9 of the
-//! semantics contract; `ARCHSPEC_ORDERING_DRAFT.md`).
+//! semantics contract).
 //!
 //! > Same-key invocations for which a meaningful logical precedence
 //! > exists must preserve that precedence through the operation's

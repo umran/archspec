@@ -492,7 +492,7 @@ fn rejects_field_reference_into_untyped_external_effect() {
 
 #[test]
 fn transition_transactions_accept_any_idempotency_guarantee() {
-    // Amendment A: a transition blocks the natural-replay proof route,
+    // A transition blocks the natural-replay proof route,
     // but the missing proof fact is the solver's concern, never a
     // structural error. The keyed form is the fixture as declared.
     for idempotency in [
