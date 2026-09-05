@@ -205,9 +205,37 @@ pub(crate) fn result_gap_sentence(gap: &ResultGap) -> String {
              `{input}` is not proven in this analysis"
         ),
 
-        ResultGap::ExternalResultUndeclared => {
-            "no declared fact makes an external boundary's returned result \
-             replay-consistent"
+        ResultGap::ExternalNotDeduplicated => {
+            "the external boundary is explicitly `not_deduplicated`, so no \
+             same-key terminal result is fixed"
+                .to_string()
+        }
+
+        ResultGap::ExternalDeduplicationUnknown => {
+            "no deduplication fact is declared for the external boundary, so \
+             nothing identifies same-key executions as one logical interaction \
+             with one terminal result"
+                .to_string()
+        }
+
+        ResultGap::ExternalDeduplicationKeyUnstable { roots } => format!(
+            "the external deduplication key is not replay-stable, so attempts \
+             may address different logical external interactions: {}",
+            unstable_roots(roots)
+        ),
+
+        ResultGap::ExternalErrorRetryable => {
+            "the observed error is declared retryable — an attempt-level, \
+             nonterminal outcome — so it does not establish the logical \
+             interaction's terminal result, and a later attempt may observe a \
+             different one"
+                .to_string()
+        }
+
+        ResultGap::ExternalErrorDispositionUnspecified => {
+            "the error's disposition is unspecified: no declared fact says \
+             whether observing it terminally resolves the logical external \
+             interaction"
                 .to_string()
         }
 

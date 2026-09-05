@@ -490,14 +490,30 @@ A request input declares the `Result<Ok, Err>` contract a request through it ret
 ```yaml
 result:
   ok: schema.CreateOrderResponse
-  err: schema.RequestRejected
+  err:
+    schema: schema.RequestRejected
+    disposition: unspecified
 ```
 
-`ResultType { ok, err }` names two schemas. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Archspec models the algebraic outcome, not any language's API around it.
+`ResultType { ok, err }` names the `Ok` schema and the `Err` contract — `ErrorResultType { schema, disposition }`. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Archspec models the algebraic outcome, not any language's API around it. A bare schema id is accepted as shorthand for the `Err` contract and means `disposition: unspecified`; because `unspecified` is epistemic, no shorthand or default may silently declare `terminal` or `retryable`, and canonical serialization always emits the disposition.
 
 The contract belongs to the input rather than to the operation. An operation may expose several request inputs, and a `RequestEffect` already targets one specific `operation + input`, from which it inherits this contract (§13.2). Subscription inputs have no synchronous result.
 
 `Err` is a **logical** outcome, not an interrupted execution (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §12). `Err(CardDeclined)` means a synchronous interaction completed and reported a modeled failure; it is conclusive. A crash, a timeout, a lost connection, or uncertainty about whether a remote completed is not an `Err` payload — it is the idempotency and recoverability problem of §9. The two must not be conflated.
+
+### `ErrorDisposition`
+
+The disposition declares whether observing the contract's `Err` terminally resolves the **logical interaction** — one logical request, or one logical external execution — or conclusively ends only the observing attempt (`CONSEQO_REVISION_V3_AMENDMENT_B_EXTERNAL_IDEMPOTENCY_RETRYABLE_ERRORS.md`):
+
+- `terminal` — observing this `Err` terminally resolves the logical interaction with the declared error payload.
+- `retryable` — observing this `Err` conclusively ends the current attempt but does not terminally resolve the logical interaction; another attempt is **semantically admitted**. It does not say a retry occurs, is guaranteed, succeeds, returns a different result, or happens promptly — those are execution semantics Archspec does not model here, and V1 deliberately introduces no retry policy, loop, attempt count, or backoff.
+- `unspecified` — no usable fact. Nothing about terminality or retryability may be inferred (§1.1).
+
+`Ok` is terminal by definition; no `Ok` disposition exists. A retryable `Err` remains a *logical, conclusive* outcome of its attempt — the distinction from crashes and timeouts above is untouched.
+
+The disposition belongs to the **result contract**, not to the schema: the same error schema may be terminal in one contract and retryable in another. One disposition covers the whole declared `Err` variant; heterogeneous per-error-class dispositions inside one contract are out of scope in V1.
+
+For a request contract, the disposition describes whether an error returned by the target semantically admits another logical request attempt. It is orthogonal to `RequestEffect.retry` (§13.2): `retry` describes whether the requesting boundary may issue repeated attempts, the disposition whether another attempt is admitted after this error — `Err retryable` with `retry: never`, and `Err terminal` with `retry: may_repeat`, are both coherent, and no automatic coupling exists. For an external contract, the disposition feeds the strengthened `deduplicated_by` terminal-result rule (§13.3).
 
 ## 8.2 Subscription input
 
@@ -1049,6 +1065,13 @@ The guarantee is scoped to equality of that logical key. It does not imply order
 
 For an upstream idempotency requirement, a duplicate execution is safe when every component of the declared key is replay-stable relative to the governing key (§18): all attempts then execute under one key, and the boundary collapses them. No instance condition is needed, since the guarantee is scoped to key equality alone.
 
+For a **result-bearing** external effect, the guarantee additionally fixes the interaction's terminal result. Equal evaluated keys identify one logical external execution; individual attempts are concrete executions made while that logical execution has not yet terminally resolved. Beyond suppressing duplicate logical work, `deduplicated_by`:
+
+- does not let a retryable error outcome establish the terminal logical result;
+- fixes the logical execution's terminal result once it reaches one — after the first terminal `Ok` or terminal `Err`, every subsequent same-key execution observes the same variant and a replay-equivalent payload.
+
+Duplicate-work collapse and terminal-result stability are two consequences of the same declaration; no separate external result-replay guarantee exists. A boundary that performs the work once but answers a duplicate with a distinct response — `Ok(original)` then `Err(AlreadyProcessed)` — does **not** conform unless the modeled boundary abstracts the duplicate response back into the original logical result; expose the distinct duplicate response as the modeled result and the boundary must not be declared `deduplicated_by`. For a resultless effect (`result: null`), the meaning is unchanged: same-key logical work is deduplicated, and there is no result-replay component. As every implementation guarantee, conformance is an obligation on the boundary (§1.3); the checker consumes the declaration and cannot inspect the boundary.
+
 ### `ExternalEffect.result`
 
 Because Archspec cannot inspect beyond the boundary, an external effect may declare the synchronous result the boundary returns:
@@ -1056,12 +1079,16 @@ Because Archspec cannot inspect beyond the boundary, an external effect may decl
 ```yaml
 result:
   ok: schema.ChargeAccepted
-  err: schema.ChargeDeclined
+  err:
+    schema: schema.ChargeDeclined
+    disposition: terminal
 ```
 
 Absent (`result: null`), no synchronous result is modeled and an execution site may not bind one.
 
-The declaration says what the returned outcome is shaped like. It says nothing about whether repeated executions return the same outcome: `deduplicated_by` collapses the *work* of same-key executions and does not imply that each returns the same result, and no other declared fact speaks to it. An external result is therefore **never replay-stable in V1**, and a decision resting on one is not established to replay (§16, §18). An explicit external result-replay guarantee is a candidate follow-up; until one exists, this is an honest gap the checker reports rather than a fact it assumes.
+The declaration carries the result's shape and the error's disposition, and combines with the effect's idempotency guarantee. For a result-bearing `ExternalEffect`, `deduplicated_by { key }` identifies one logical external interaction for equal evaluated keys and, in addition to suppressing duplicate logical work, fixes the interaction's terminal logical `Result`: after the first terminal `Ok` or terminal `Err`, every subsequent same-key execution observes the same variant and a replay-equivalent payload. Retryable `Err` outcomes are attempt-level, nonterminal outcomes and do not establish the logical interaction's terminal result; an `Err` with unspecified disposition provides no usable terminality fact.
+
+Relative to a governing key, a bound external result is therefore replay-stable — per observed variant — when the effect declares `deduplicated_by`, every component of its key is replay-stable, and the observed variant is terminal: `Ok` by definition, `Err` under a declared `terminal` disposition (§16, §18). A retryable or unspecified `Err`, a boundary declared `not_deduplicated` or with an unspecified guarantee, or an unstable key leaves the observation unusable as a replay-stable root, and a decision resting on it is not established to replay — an honest gap the checker reports rather than a fact it assumes. `not_deduplicated` does not say repeated executions return *different* results; only that the guarantee is unavailable.
 
 ---
 
@@ -1357,7 +1384,7 @@ A retry traverses declared control. Whether it takes the same arm at a decision 
 - for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
 - for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
 
-Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, or an external boundary whose result no fact stabilizes (§13.3). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
+Otherwise the checker reports the decision as **not established to replay**, naming the gap: the condition is `unspecified`; a condition root is unstable; the result is not bound before the decision on this path; or the result is unstable in the taken arm's variant — its instance not class-fixed, its request's schema not the target's, its target declaring no replay-consistent requirement for the input or one that is unproven, or an external boundary that is `not_deduplicated`, carries no deduplication fact, deduplicates by an unstable key, or whose observed `Err` is retryable or of unspecified disposition (§13.3). Instability is not proven; a different arm on retry may be legitimate. What that means for each obligation is stated in §9: an obstacle for idempotency and result replay, never for recoverability.
 
 ### Step locations
 
@@ -1586,28 +1613,37 @@ assumed:
    (§17 route A), and a `transaction_output` reference to it is
    stable wherever it is available.
 6. **Effect results.** A reference through `effect_result_ok` or
-   `effect_result_err` to a bound result `r` is replay-stable iff
-   `r`'s effect is a **request** whose instance is class-fixed — a
-   direct execution with a replay-deterministic derivation, or an
-   intent replay-available by route A or B — whose schema is the
-   targeted input's schema, and whose target operation proves
-   `result: replay_consistent` for that input (§9, §13.2): the class
-   then sends one logical request into one class of the target, and
-   receives one variant and a replay-equivalent payload back. An
-   **external** effect's result is never replay-stable in V1, because
-   no declared fact makes it so (§13.3); a publication has no result.
-   The stability of a result is judged once, at the step that binds
-   it, and is what a `match_result` on it rests on (§16).
+   `effect_result_err` to a bound result `r` is judged per variant.
+   For a **request**, both variants are stable at once iff the
+   instance is class-fixed — a direct execution with a
+   replay-deterministic derivation, or an intent replay-available by
+   route A or B — the schema is the targeted input's schema, and the
+   target operation proves `result: replay_consistent` for that input
+   (§9, §13.2): the class then sends one logical request into one
+   class of the target, and receives one variant and a
+   replay-equivalent payload back. For an **external** effect, a
+   variant is stable iff the effect declares `deduplicated_by` over a
+   key whose components are all replay-stable — equal keys identify
+   one logical external interaction whose terminal result the
+   guarantee fixes (§13.3) — and the referenced variant is terminal:
+   `Ok` by definition, `Err` under a declared `terminal` disposition.
+   A retryable or unspecified `Err` gains nothing from the guarantee;
+   no instance condition applies, since result identity follows the
+   key exactly as the work collapse does. A publication has no
+   result. The judgments are made at the step that binds the result;
+   a `match_result` rests on the judgment of the variant of the arm
+   it takes (§16).
 7. **Congruence.** A value produced by `Deterministic { from }` with
    every root replay-stable is replay-deterministic, and its uses
    inherit stability.
 8. **Everything else is `Unknown`**: unidentified non-key input fields,
    fields of a non-triggering input, `state_machine_subject` state
-   (always, in V1), `effect` payload roots, external effect results,
-   an artifact available by neither route, an artifact or result not
-   in the path context at the point of reference, and
-   `transaction_read` results, which additionally poison any
-   natural-replay provenance closure that reaches them.
+   (always, in V1), `effect` payload roots, external effect results
+   outside rule 6 — an undeduplicated or unstably keyed boundary, a
+   retryable or unspecified `Err` — an artifact available by neither
+   route, an artifact or result not in the path context at the point
+   of reference, and `transaction_read` results, which additionally
+   poison any natural-replay provenance closure that reaches them.
 
 The `Unknown` cases are epistemic (§1.1): no rule establishes
 stability; instability is not proven.
@@ -1989,7 +2025,7 @@ The solver must preserve these distinctions:
 | **`Err` vs interrupted execution** | `Err` is a conclusive logical outcome a synchronous interaction returned; a crash, timeout, or lost connection is an idempotency/recoverability question and is not an `Err` payload. |
 | **`TransactionOutput` vs `EffectIntent`** | An output exports data; an intent captures pending work. Both are artifacts of the same commit, and neither may stand in for the other. |
 | **`match_result` vs `branch`** | A control-flow decision on a `Result` destructures a mutually exclusive typed outcome; a `branch` evaluates an ordinary predicate. Success/failure is never encoded as a status-field comparison. |
-| **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or nothing at all for an external boundary. |
+| **Effect payload replay vs effect result replay** | A class-fixed outgoing instance proves every attempt asks the same question; whether the same answer comes back is a separate fact — a target's proven result consistency, or a deduplicated external boundary's fixed terminal result (never its retryable or unspecified errors). |
 | **Transaction output vs request result** | An output is a schema-shaped artifact a transaction exports; a request result is a `Result<Ok, Err>` constructed at a `return` terminal. A result may be derived from an output, but no privileged artifact stands between them. |
 | **Duplicate-delivery fact vs liveness** | `at_least_once` and `may_repeat` say a retry may happen, not that retries continue until success. |
 | **Ordering key vs message identity** | The ordering key sequences messages; the message identity identifies one logical message. They may coincide; neither implies the other. |

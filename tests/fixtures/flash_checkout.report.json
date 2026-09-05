@@ -144,11 +144,11 @@
           "message": "The path `ok(result.charge_payment.card)` executes external effect `effect.charge_payment.card`, which is explicitly `not_deduplicated`: a duplicate execution is distinguishable duplicate work at that boundary."
         },
         {
-          "message": "On the path `ok(result.charge_payment.card)`, the match on `result.charge_payment.card` at step `2`, taking its `ok` arm is not established to replay, so a retry may do different work: result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: no declared fact makes an external boundary's returned result replay-consistent."
+          "message": "On the path `ok(result.charge_payment.card)`, the match on `result.charge_payment.card` at step `2`, taking its `ok` arm is not established to replay, so a retry may do different work: result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary is explicitly `not_deduplicated`, so no same-key terminal result is fixed."
         },
         {
           "subject": "effect.charge_payment.publish_failed",
-          "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: no declared fact makes an external boundary's returned result replay-consistent)."
+          "message": "The instance `effect.charge_payment.publish_failed` constructs on the path `err(result.charge_payment.card)` depends on roots that are not replay-stable: `reason` (effect result `result.charge_payment.card` of `effect.charge_payment.card` is not replay-stable: the external boundary is explicitly `not_deduplicated`, so no same-key terminal result is fixed)."
         }
       ]
     },

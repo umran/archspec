@@ -126,11 +126,24 @@ export type IdempotencyGuarantee =
   | { kind: "not_deduplicated" }
   | { kind: "deduplicated_by"; key: IdempotencyKey };
 
+/** Whether observing the contract's `Err` terminally resolves the
+ *  logical interaction (`terminal`), conclusively ends one attempt
+ *  while admitting another (`retryable`), or says nothing
+ *  (`unspecified`). */
+export type ErrorDisposition = "unspecified" | "terminal" | "retryable";
+
+/** The `Err` half of a result contract: the payload schema and the
+ *  declared disposition of observing that error. */
+export interface ErrorResultType {
+  schema: Id;
+  disposition: ErrorDisposition;
+}
+
 /** A first-class `Result<Ok, Err>` contract: two schemas, exactly one
  *  of which shapes a given outcome. */
 export interface ResultType {
   ok: Id;
-  err: Id;
+  err: ErrorResultType;
 }
 
 export type ResultVariant = "ok" | "err";

@@ -6,11 +6,11 @@ use std::{
 use archspec::{
     parser::yaml,
     spec::{
-        CompletionRequirement, Condition, Derivation, Effect, Field, FieldPath, Id,
-        IdempotencyGuarantee, Input, LaneConcurrency, Literal, MessageIdentity, OperationStep,
-        RequestIdentity, ResultOutcome, ResultVariant, ScalarType, Schema, SchemaCompleteness,
-        SelectorValue, ServiceKind, TopicOrdering, TransactionStep, TransitionSideEffect, TypeRef,
-        ValueSource,
+        CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition, ErrorResultType,
+        Field, FieldPath, Id, IdempotencyGuarantee, Input, LaneConcurrency, Literal,
+        MessageIdentity, OperationStep, RequestIdentity, ResultOutcome, ResultVariant, ScalarType,
+        Schema, SchemaCompleteness, SelectorValue, ServiceKind, TopicOrdering, TransactionStep,
+        TransitionSideEffect, TypeRef, ValueSource,
     },
 };
 
@@ -721,7 +721,16 @@ fn flash_checkout_parses_request_results_and_return_terminals() {
     };
 
     assert_eq!(request.result.ok, Id("schema.CreateOrderResponse".into()));
-    assert_eq!(request.result.err, Id("schema.RequestRejected".into()));
+    assert_eq!(
+        request.result.err.schema,
+        Id("schema.RequestRejected".into())
+    );
+
+    // The bare-schema shorthand declares nothing about disposition.
+    assert_eq!(
+        request.result.err.disposition,
+        ErrorDisposition::Unspecified
+    );
     assert_eq!(
         request.result.schema(ResultVariant::Err),
         &Id("schema.RequestRejected".into())
@@ -780,7 +789,8 @@ fn external_effects_declare_their_result_contract() {
     let result = card.result.as_ref().expect("the provider returns a result");
 
     assert_eq!(result.ok, Id("schema.ChargeAccepted".into()));
-    assert_eq!(result.err, Id("schema.ChargeDeclined".into()));
+    assert_eq!(result.err.schema, Id("schema.ChargeDeclined".into()));
+    assert_eq!(result.err.disposition, ErrorDisposition::Unspecified);
 
     // A boundary modeling no synchronous result says so.
     let source = read_fixture("video_streaming.yaml");
@@ -798,6 +808,105 @@ fn external_effects_declare_their_result_contract() {
     };
 
     assert_eq!(push.result, None);
+
+    // A declared disposition parses as part of the contract.
+    let Some(Effect::External(engine)) = model
+        .operations
+        .get(&Id("operation.transcode_video".into()))
+        .unwrap()
+        .effects
+        .get(&Id("effect.transcode_video.engine".into()))
+    else {
+        panic!("the engine should be an external effect");
+    };
+
+    let result = engine.result.as_ref().expect("the engine returns a result");
+
+    assert_eq!(result.err.schema, Id("schema.RenderFailed".into()));
+    assert_eq!(result.err.disposition, ErrorDisposition::Terminal);
+}
+
+fn parse_error_contract(declaration: &str) -> ErrorResultType {
+    serde_yaml::from_str(declaration)
+        .unwrap_or_else(|error| panic!("`{declaration}` should parse: {error}"))
+}
+
+fn error_contract_error(declaration: &str) -> String {
+    serde_yaml::from_str::<ErrorResultType>(declaration)
+        .expect_err(&format!("`{declaration}` should not parse"))
+        .to_string()
+}
+
+#[test]
+fn an_error_contract_declares_schema_and_disposition() {
+    // Every disposition parses in the canonical map form.
+    for (text, disposition) in [
+        ("unspecified", ErrorDisposition::Unspecified),
+        ("terminal", ErrorDisposition::Terminal),
+        ("retryable", ErrorDisposition::Retryable),
+    ] {
+        let contract = parse_error_contract(&format!(
+            "schema: schema.ProviderError\ndisposition: {text}"
+        ));
+
+        assert_eq!(contract.schema, Id("schema.ProviderError".into()));
+        assert_eq!(contract.disposition, disposition);
+    }
+
+    // The bare-schema shorthand declares nothing: `unspecified` is
+    // epistemic, and no shorthand may silently strengthen it.
+    assert_eq!(
+        parse_error_contract("schema.ProviderError"),
+        ErrorResultType {
+            schema: Id("schema.ProviderError".into()),
+            disposition: ErrorDisposition::Unspecified,
+        }
+    );
+
+    // So does omitting the disposition in the map form.
+    assert_eq!(
+        parse_error_contract("schema: schema.ProviderError").disposition,
+        ErrorDisposition::Unspecified
+    );
+
+    // A disposition outside the declared three is rejected.
+    let message = error_contract_error(
+        "schema: schema.ProviderError\ndisposition: definitely_not_a_disposition",
+    );
+
+    assert!(
+        message.contains("definitely_not_a_disposition"),
+        "error should mention the invalid value, got: {message}"
+    );
+
+    // The map form requires the error schema.
+    error_contract_error("disposition: terminal");
+}
+
+#[test]
+fn error_dispositions_serialize_into_the_canonical_form() {
+    let source = read_fixture("video_streaming.yaml");
+
+    let model = yaml::parse(&source).expect("video streaming fixture should parse");
+
+    let serialized = yaml::serialize(&model).expect("model should serialize");
+
+    // Canonical serialization always emits the disposition — the
+    // declared terminal one, and `unspecified` for every contract the
+    // shorthand left undeclared.
+    assert!(
+        serialized.contains("disposition: terminal"),
+        "serialized model should carry the engine's terminal disposition"
+    );
+
+    assert!(
+        serialized.contains("disposition: unspecified"),
+        "serialized model should make undeclared dispositions explicit"
+    );
+
+    let reparsed = yaml::parse(&serialized).expect("serialized model should parse");
+
+    assert_eq!(model, reparsed);
 }
 
 #[test]

@@ -939,6 +939,12 @@ fn decision_assumptions(prefix: &str, decisions: &[DecisionReplay]) -> Vec<Strin
                         "{effect} sends a class-fixed request into {operation} via {input}, \
                          whose result replay is proven"
                     ),
+
+                    ResultStabilityRule::ExternalTerminalResult { variant, .. } => format!(
+                        "{effect} deduplicates by a class-fixed external key, which fixes \
+                         the interaction's terminal result, and the observed {variant} is \
+                         terminal"
+                    ),
                 },
 
                 DecisionRule::StableCondition { roots } => {
@@ -989,6 +995,16 @@ fn root_rule_label(root: &StableRoot) -> Option<String> {
         verification::StabilityRule::ReplayConsistentResult { result, effect } => Some(format!(
             "result {result} of {effect} is observed equally by every attempt: the \
              target proves its result replay-consistent"
+        )),
+
+        verification::StabilityRule::DeduplicatedExternalResult {
+            result,
+            effect,
+            variant,
+        } => Some(format!(
+            "the {variant} of result {result} is observed equally by every attempt: \
+             {effect} deduplicates by a class-fixed external key, which fixes the \
+             interaction's terminal result"
         )),
 
         _ => None,

@@ -270,27 +270,69 @@ export function requestResult(): Explanation {
     summary:
       "A request through this input completes with exactly one of two typed outcomes: an ok " +
       "payload or an err payload. Err is a logical outcome the boundary returned — a declined " +
-      "card, a rejected request — not a crash, a timeout, or a lost connection.",
+      "card, a rejected request — not a crash, a timeout, or a lost connection. The err's " +
+      "disposition says whether observing it terminally resolves the logical request or " +
+      "semantically admits another attempt; it causes no retry by itself.",
   };
 }
 
-/** What an external boundary's result says, and what it does not. */
-export function externalResult(result: ResultType | null): Explanation {
-  if (result) {
+/** What an external boundary's result says under its idempotency
+ *  guarantee: `deduplicated_by` fixes one logical interaction's
+ *  terminal result per key, and the error's disposition decides
+ *  whether an observed err is that terminal result. */
+export function externalResult(
+  result: ResultType | null,
+  idempotency: IdempotencyGuarantee,
+): Explanation {
+  if (!result) {
     return {
-      label: "returns a result",
-      tone: "info",
-      summary:
-        "The boundary returns Result<ok, err>, and the program may branch on it. No declared fact " +
-        "says a repeated execution returns the same outcome, so a decision on this result is not " +
-        "established to replay.",
+      label: "no synchronous result",
+      tone: "neutral",
+      summary: "The boundary returns nothing the program can observe; executing it binds no result.",
     };
   }
-  return {
-    label: "no synchronous result",
-    tone: "neutral",
-    summary: "The boundary returns nothing the program can observe; executing it binds no result.",
-  };
+  if (idempotency.kind !== "deduplicated_by") {
+    return {
+      label: "returns a result",
+      tone: "warning",
+      summary:
+        "The boundary returns Result<ok, err>, and the program may branch on it — but without " +
+        "deduplicated_by, nothing identifies same-key executions as one logical interaction, so " +
+        "no terminal result is fixed and a decision on this result is not established to replay.",
+    };
+  }
+  switch (result.err.disposition) {
+    case "terminal":
+      return {
+        label: "returns a fixed terminal result",
+        tone: "success",
+        summary:
+          "Equal deduplication keys identify one logical interaction whose terminal result the " +
+          "guarantee fixes: ok is terminal by definition and the err is declared terminal, so a " +
+          "same-key repeat observes the same outcome again and a decision on this result replays " +
+          "whenever the key is class-fixed.",
+      };
+    case "retryable":
+      return {
+        label: "returns a result with a retryable err",
+        tone: "info",
+        summary:
+          "Equal deduplication keys identify one logical interaction, and its terminal ok is " +
+          "fixed — but the retryable err conclusively ends only its own attempt: a later " +
+          "same-key execution may observe a different outcome, so only the ok arm of a decision " +
+          "on this result is established to replay.",
+      };
+    case "unspecified":
+      return {
+        label: "returns a result",
+        tone: "info",
+        summary:
+          "Equal deduplication keys identify one logical interaction, and its terminal ok is " +
+          "fixed — but the err's disposition is unspecified: no fact says whether an observed " +
+          "err terminally resolved the interaction, so the err arm of a decision on this result " +
+          "is not established to replay.",
+      };
+  }
 }
 
 /** A request effect's result, inherited from the input it targets. */

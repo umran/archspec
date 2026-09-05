@@ -1645,7 +1645,7 @@ fn rejects_request_result_schema_that_does_not_exist() {
         panic!("create_order input should be a request");
     };
 
-    request.result.err = id("schema.missing");
+    request.result.err.schema = id("schema.missing");
 
     let errors = validation::validate(&model);
 

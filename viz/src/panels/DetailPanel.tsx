@@ -81,14 +81,18 @@ function Propagation({ items }: { items: IdempotencyKeyPropagation[] }) {
   );
 }
 
-/** A Result<ok, err> contract as two schema links. */
+/** A Result<ok, err> contract as two schema links, with the error's
+ *  declared disposition when it declares one. */
 function ResultContract({ result }: { result: ResultType }) {
   return (
     <span className="inline-flex flex-wrap items-center gap-1">
       <Mono className="text-kumo-subtle">Result&lt;</Mono>
       <IdLink id={result.ok}>{shortId(result.ok)}</IdLink>
       <Mono className="text-kumo-subtle">,</Mono>
-      <IdLink id={result.err}>{shortId(result.err)}</IdLink>
+      <IdLink id={result.err.schema}>{shortId(result.err.schema)}</IdLink>
+      {result.err.disposition !== "unspecified" && (
+        <Mono className="text-kumo-subtle">{result.err.disposition}</Mono>
+      )}
       <Mono className="text-kumo-subtle">&gt;</Mono>
     </span>
   );
@@ -555,7 +559,7 @@ function EffectDetail({ id }: { id: Id }) {
               <span className="text-xs text-kumo-subtle">by <KeyComponents value={e.idempotency.key} /></span>
             )}
           </FactNote>
-          <FactNote fact={externalResult(e.result)}>
+          <FactNote fact={externalResult(e.result, e.idempotency)}>
             {e.result && <ResultContract result={e.result} />}
           </FactNote>
         </>

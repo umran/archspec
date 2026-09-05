@@ -55,10 +55,16 @@ pub struct ExternalEffect {
     /// same reason: Archspec cannot inspect beyond it. `None` means no
     /// synchronous result is modeled.
     ///
-    /// Declaring the contract says what the returned outcome is shaped
-    /// like. It says nothing about whether repeated executions return
-    /// the same outcome; no declared fact establishes that, so an
-    /// external result is never replay-stable in V1.
+    /// The contract declares the result's shape and the error's
+    /// disposition. For a result-bearing effect, `deduplicated_by`
+    /// additionally fixes the interaction's terminal logical result:
+    /// equal evaluated keys identify one logical external execution,
+    /// and after its first terminal `Ok` or terminal `Err`, every
+    /// subsequent same-key execution observes the same variant and a
+    /// replay-equivalent payload. A retryable `Err` is an attempt-level,
+    /// nonterminal outcome and establishes no terminal result. The
+    /// checker cannot prove the real boundary honors this; the
+    /// declaration is a conformance obligation on the boundary.
     pub result: Option<ResultType>,
 }
 

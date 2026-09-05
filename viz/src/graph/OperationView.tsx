@@ -526,7 +526,10 @@ function InputsTable({ op }: { op: Operation }) {
                         <Mono>Result&lt;</Mono>
                         <IdLink id={input.result.ok}>{shortId(input.result.ok)}</IdLink>
                         <Mono>,</Mono>
-                        <IdLink id={input.result.err}>{shortId(input.result.err)}</IdLink>
+                        <IdLink id={input.result.err.schema}>{shortId(input.result.err.schema)}</IdLink>
+                        {input.result.err.disposition !== "unspecified" && (
+                          <Mono>{input.result.err.disposition}</Mono>
+                        )}
                         <Mono>&gt;</Mono>
                       </span>
                     </>

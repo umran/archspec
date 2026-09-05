@@ -1789,7 +1789,13 @@ fn validate_result_type_references(
 ) {
     expect_reference(index, subject, &result.ok, ReferenceKind::Schema, errors);
 
-    expect_reference(index, subject, &result.err, ReferenceKind::Schema, errors);
+    expect_reference(
+        index,
+        subject,
+        &result.err.schema,
+        ReferenceKind::Schema,
+        errors,
+    );
 }
 
 fn validate_input_references(

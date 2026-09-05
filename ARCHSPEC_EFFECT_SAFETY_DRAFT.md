@@ -216,9 +216,13 @@ ending at `complete`, or at `return` for the triggering input) is:
    (V3 §30) — so a retry traverses the same path. A decision that may
    go the other way lets the retry do different work, and V1 has no
    compatibility argument for the two histories; it is recorded as an
-   obstacle (`PathDecisionUnstable`). An external effect's result is
-   never replay-stable in V1 (V3 §48.2), so a match on one is always
-   such an obstacle.
+   obstacle (`PathDecisionUnstable`). *(Superseded 2026-09-05 by
+   Amendment B:)* a match on an external result replays in the arm it
+   takes when the boundary is `deduplicated_by` over a stable key and
+   the observed variant is terminal — `Ok` by definition, `Err` under
+   a declared `terminal` disposition; a retryable or unspecified
+   `Err`, or a boundary without the guarantee, remains such an
+   obstacle.
 
 Result consistency is the separate result-replay obligation and is
 not re-checked here; its verdicts feed in only where a decision rests
