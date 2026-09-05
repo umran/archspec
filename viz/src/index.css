@@ -2,7 +2,7 @@
 @import "@cloudflare/kumo/styles/tailwind";
 @import "tailwindcss";
 
-/* ---------- archspec graph theme on Kumo tokens ---------- */
+/* ---------- conseqa graph theme on Kumo tokens ---------- */
 
 :root {
   --arch-edge-publish: #a87fe0;

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use archspec::{
+use conseqa::{
     analyzer::{
         report::{self, Status},
         validation,

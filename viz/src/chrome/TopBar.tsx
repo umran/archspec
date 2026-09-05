@@ -36,7 +36,7 @@ export function TopBar() {
     <header className="@container shrink-0 border-b border-kumo-hairline bg-kumo-base">
       <div className="mx-auto flex h-12 max-w-[1240px] items-center gap-3 px-4 @md:gap-4 @md:px-6">
         {/* The model, not the tool: the document title already reads
-            "<model> · archspec", and a host embedding these views has a
+            "<model> · conseqa", and a host embedding these views has a
             name of its own in its chrome. */}
         <div className="flex min-w-0 items-baseline gap-2 text-sm">
           <span className="truncate font-medium text-kumo-strong">{data.title}</span>

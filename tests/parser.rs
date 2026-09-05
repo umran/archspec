@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use archspec::{
+use conseqa::{
     parser::yaml,
     spec::{
         CompletionRequirement, Condition, Derivation, Effect, ErrorDisposition, ErrorResultType,

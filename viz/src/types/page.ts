@@ -2,8 +2,8 @@ import type { Graph } from "./graph";
 import type { Model } from "./model";
 import type { ProverReport } from "./report";
 
-// The page data `archspec-viz` injects as `window.ARCHSPEC`, or serves
-// as `archspec.json` during development.
+// The page data `conseqa-viz` injects as `window.CONSEQA`, or serves
+// as `conseqa.json` during development.
 export interface PageData {
   title: string;
   model: Model;
@@ -13,20 +13,20 @@ export interface PageData {
 
 declare global {
   interface Window {
-    ARCHSPEC?: PageData;
+    CONSEQA?: PageData;
   }
 }
 
 export async function loadPageData(): Promise<PageData> {
-  if (window.ARCHSPEC) return window.ARCHSPEC;
+  if (window.CONSEQA) return window.CONSEQA;
 
-  const response = await fetch("archspec.json");
+  const response = await fetch("conseqa.json");
 
   if (!response.ok) {
     throw new Error(
       `no page data: ${response.status} ${response.statusText}. ` +
-        "Run `npm run data` to generate public/archspec.json, or open a " +
-        "file produced by archspec-viz.",
+        "Run `npm run data` to generate public/conseqa.json, or open a " +
+        "file produced by conseqa-viz.",
     );
   }
 

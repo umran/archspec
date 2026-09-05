@@ -1,4 +1,4 @@
-//! archspec-viz: renders an Archspec model as a self-contained,
+//! conseqa-viz: renders an Conseqa model as a self-contained,
 //! interactive HTML presentation layer.
 //!
 //! The output is a single file with no external requests: system graph
@@ -6,7 +6,7 @@
 //! subscriptions, and requests routing via topics), per-operation
 //! program drill-down (steps → transactions → transitions), and
 //! interactive state-machine graphs. The model checker's obligation
-//! report (`archspec::analyzer::report`) can be overlaid — computed
+//! report (`conseqa::analyzer::report`) can be overlaid — computed
 //! in-process with `--verify`, or loaded with `--report` — to mark
 //! obligations proven, disproven, or unknown. The front end itself is
 //! the React application in `viz/`, embedded as a built bundle.
@@ -18,7 +18,7 @@ mod report;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use archspec::analyzer::{Diagnostic, Severity};
+use conseqa::analyzer::{Diagnostic, Severity};
 
 struct Args {
     model: PathBuf,
@@ -32,10 +32,10 @@ struct Args {
 }
 
 const USAGE: &str = "\
-archspec-viz — interactive visualization for Archspec models
+conseqa-viz — interactive visualization for Conseqa models
 
 USAGE:
-    archspec-viz <MODEL.yaml> [OPTIONS]
+    conseqa-viz <MODEL.yaml> [OPTIONS]
 
 OPTIONS:
     --out <PATH>       Output path. Defaults to <MODEL>.html, or stdout
@@ -79,11 +79,11 @@ fn run(args: &Args) -> Result<(), String> {
     let source = std::fs::read_to_string(&args.model)
         .map_err(|error| format!("cannot read {}: {error}", args.model.display()))?;
 
-    let model = archspec::parser::yaml::parse(&source)
+    let model = conseqa::parser::yaml::parse(&source)
         .map_err(|error| format!("cannot parse {}: {error}", args.model.display()))?;
 
     if args.validate {
-        for error in archspec::analyzer::validate(&model) {
+        for error in conseqa::analyzer::validate(&model) {
             report_diagnostic(&Diagnostic::from(error));
         }
     }
@@ -106,7 +106,7 @@ fn run(args: &Args) -> Result<(), String> {
     let prover_report = if args.verify {
         Some(report::obligations(
             &model,
-            &archspec::analyzer::verification::verify(&model),
+            &conseqa::analyzer::verification::verify(&model),
         ))
     } else {
         match &args.report {
@@ -137,7 +137,7 @@ fn run(args: &Args) -> Result<(), String> {
         args.model
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "archspec model".to_string())
+            .unwrap_or_else(|| "conseqa model".to_string())
     });
 
     if args.json {

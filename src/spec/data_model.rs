@@ -15,7 +15,7 @@ pub struct DataModel {
 /// A logical class of persistent object instances.
 ///
 /// Object-history requirements (a `linearizable` flag on the object)
-/// are deliberately absent: Archspec does not yet model the
+/// are deliberately absent: Conseqa does not yet model the
 /// replication, routing, and availability facts from which such a
 /// requirement could be proved, so the DSL currently models transaction
 /// and operation correctness without declaring end-to-end persistent

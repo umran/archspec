@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use archspec::spec::{
+use conseqa::spec::{
     Effect, Id, Input, MessageSelector, Model, OperationStep, TransactionStep, TransitionSideEffect,
 };
 
@@ -500,7 +500,7 @@ fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>
 
 /// For one operation: effect id → program steps that execute it,
 /// either directly or by executing an intent that names it.
-fn collect_effect_executions(op: &archspec::spec::Operation) -> BTreeMap<Id, Vec<String>> {
+fn collect_effect_executions(op: &conseqa::spec::Operation) -> BTreeMap<Id, Vec<String>> {
     let mut executions: BTreeMap<Id, Vec<String>> = BTreeMap::new();
 
     for (location, step) in op.program.steps_with_locations() {
@@ -529,9 +529,9 @@ fn collect_effect_executions(op: &archspec::spec::Operation) -> BTreeMap<Id, Vec
 /// Uniform view over operation-declared and transition-owned effects.
 #[derive(Debug, Clone, Copy)]
 enum ResolvedEffect<'a> {
-    Publication(&'a archspec::spec::PublicationEffect),
-    Request(&'a archspec::spec::RequestEffect),
-    External(&'a archspec::spec::ExternalEffect),
+    Publication(&'a conseqa::spec::PublicationEffect),
+    Request(&'a conseqa::spec::RequestEffect),
+    External(&'a conseqa::spec::ExternalEffect),
 }
 
 impl<'a> From<&'a Effect> for ResolvedEffect<'a> {
@@ -581,40 +581,38 @@ fn to_tag<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
-fn concurrency_label(value: &archspec::spec::LaneConcurrency) -> String {
+fn concurrency_label(value: &conseqa::spec::LaneConcurrency) -> String {
     match value {
-        archspec::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
-        archspec::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
-        archspec::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
+        conseqa::spec::LaneConcurrency::Unspecified => "unspecified".to_string(),
+        conseqa::spec::LaneConcurrency::Bounded(n) => format!("bounded({n})"),
+        conseqa::spec::LaneConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn operation_concurrency_label(value: &archspec::spec::OperationConcurrency) -> String {
+fn operation_concurrency_label(value: &conseqa::spec::OperationConcurrency) -> String {
     match value {
-        archspec::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
-        archspec::spec::OperationConcurrency::Bounded(n) => {
+        conseqa::spec::OperationConcurrency::Unspecified => "unspecified".to_string(),
+        conseqa::spec::OperationConcurrency::Bounded(n) => {
             format!("bounded({n})")
         }
-        archspec::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
+        conseqa::spec::OperationConcurrency::Unbounded => "unbounded".to_string(),
     }
 }
 
-fn idempotency_label(value: &archspec::spec::IdempotencyGuarantee) -> String {
+fn idempotency_label(value: &conseqa::spec::IdempotencyGuarantee) -> String {
     match value {
-        archspec::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
-        archspec::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
-        archspec::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => {
-            "deduplicated_by".to_string()
-        }
+        conseqa::spec::IdempotencyGuarantee::Unspecified => "unspecified".to_string(),
+        conseqa::spec::IdempotencyGuarantee::NotDeduplicated => "not_deduplicated".to_string(),
+        conseqa::spec::IdempotencyGuarantee::DeduplicatedBy { .. } => "deduplicated_by".to_string(),
     }
 }
 
-fn topic_ordering_label(value: &archspec::spec::TopicOrdering) -> String {
+fn topic_ordering_label(value: &conseqa::spec::TopicOrdering) -> String {
     match value {
-        archspec::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
-        archspec::spec::TopicOrdering::Unordered => "unordered".to_string(),
-        archspec::spec::TopicOrdering::Global => "global".to_string(),
-        archspec::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
+        conseqa::spec::TopicOrdering::Unspecified => "unspecified".to_string(),
+        conseqa::spec::TopicOrdering::Unordered => "unordered".to_string(),
+        conseqa::spec::TopicOrdering::Global => "global".to_string(),
+        conseqa::spec::TopicOrdering::Keyed(_) => "keyed".to_string(),
     }
 }
 
@@ -626,7 +624,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/flash_checkout.yaml");
 
-        archspec::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
+        conseqa::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
             .expect("fixture parses")
     }
 

@@ -10,7 +10,7 @@ use crate::spec::Id;
 /// exactly one of an `Ok` payload shaped by `ok` or an `Err` payload
 /// shaped by `err.schema`.
 ///
-/// Mutual exclusivity is structural. Archspec models the algebraic
+/// Mutual exclusivity is structural. Conseqa models the algebraic
 /// outcome, not any language's API around it.
 ///
 /// `Err` is a *logical* returned outcome — a synchronous interaction
@@ -137,7 +137,7 @@ pub enum ErrorDisposition {
     /// does not terminally resolve the logical interaction; another
     /// attempt is semantically admitted. It does not say a retry
     /// occurs, succeeds, or returns the same error — those are
-    /// execution semantics Archspec does not model here.
+    /// execution semantics Conseqa does not model here.
     Retryable,
 }
 

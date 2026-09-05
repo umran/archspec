@@ -1,5 +1,5 @@
 {
-  "name": "archspec-viz-ui",
+  "name": "conseqa-viz-ui",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json",
-    "data": "cd .. && cargo run --quiet --bin archspec-viz -- tests/fixtures/video_streaming.yaml --verify --json --out viz/public/archspec.json"
+    "data": "cd .. && cargo run --quiet --bin conseqa-viz -- tests/fixtures/video_streaming.yaml --verify --json --out viz/public/conseqa.json"
   },
   "dependencies": {
     "@cloudflare/kumo": "^2.12.0",

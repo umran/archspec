@@ -52,7 +52,7 @@ pub struct ExternalEffect {
     pub idempotency: IdempotencyGuarantee,
 
     /// The synchronous result the boundary returns, declared for the
-    /// same reason: Archspec cannot inspect beyond it. `None` means no
+    /// same reason: Conseqa cannot inspect beyond it. `None` means no
     /// synchronous result is modeled.
     ///
     /// The contract declares the result's shape and the error's
