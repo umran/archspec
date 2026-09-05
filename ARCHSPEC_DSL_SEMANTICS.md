@@ -1,8 +1,7 @@
 # Archspec DSL Semantics
 
-**Status:** Normative semantic contract for the current DSL and the V1 verifiers.  
-**Source of truth inspected:** the operation-execution revision (`operation-execution-revision`, implementing `ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md`), 2026-09-04.  
-**Implementation namespace:** `src/spec/`.
+**Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
+**Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
 This document defines what an Archspec declaration means, what it does **not** mean, and what a verifier may soundly infer from it. It is intentionally stricter than a field reference: the purpose is to prevent the analyzer, an LLM author, and a human reader from silently assigning different meanings to the same declaration.
 
@@ -287,7 +286,7 @@ Object identity is what selector precision, insert uniqueness, alias and interfe
 
 ### Object-history requirements are deferred
 
-A `DataObject` declares no requirements. The former `ObjectRequirements.history` surface, with its `linearizable` member, is removed from the active DSL (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §3).
+A `DataObject` declares no requirements; in particular, no object-history requirement (such as a `linearizable` obligation) exists in the active DSL.
 
 The reason is scope, not doubt about the property. Linearizability is a meaningful correctness property even for a single logical store, but an object-history requirement becomes provable only once the model exposes the facts it rests on — replica topology, authoritative write location, read routing, quorum and leader guarantees, propagation lag, partition and failure assumptions, real-time observation boundaries — and Archspec does not yet model any of them. Keeping the requirement would have introduced an object-history proof domain with nothing to discharge it from.
 
@@ -444,7 +443,7 @@ It executes only when a program step references it.
 
 `operation.program` is the operation's single control structure: a block of steps executed in order, in which a decision — `match_result` over a bound effect result, or `branch` over an ordinary predicate — nests further blocks, and every reachable path ends at an explicit terminal: `return`, constructing a request input's declared result, or `complete`, returning nothing.
 
-The structure is acyclic by construction. There are no loops; iteration is deliberately deferred (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §40).
+The structure is acyclic by construction. There are no loops; iteration is deliberately deferred (§27).
 
 An invocation traverses one path through the program: one arm at each decision, one terminal. Alternative paths exist only where a decision selects between them, and the DSL exposes what each decision rests on. There is no unexplained selection among alternative complete flows.
 
@@ -499,11 +498,11 @@ result:
 
 The contract belongs to the input rather than to the operation. An operation may expose several request inputs, and a `RequestEffect` already targets one specific `operation + input`, from which it inherits this contract (§13.2). Subscription inputs have no synchronous result.
 
-`Err` is a **logical** outcome, not an interrupted execution (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §12). `Err(CardDeclined)` means a synchronous interaction completed and reported a modeled failure; it is conclusive. A crash, a timeout, a lost connection, or uncertainty about whether a remote completed is not an `Err` payload — it is the idempotency and recoverability problem of §9. The two must not be conflated.
+`Err` is a **logical** outcome, not an interrupted execution. `Err(CardDeclined)` means a synchronous interaction completed and reported a modeled failure; it is conclusive. A crash, a timeout, a lost connection, or uncertainty about whether a remote completed is not an `Err` payload — it is the idempotency and recoverability problem of §9. The two must not be conflated.
 
 ### `ErrorDisposition`
 
-The disposition declares whether observing the contract's `Err` terminally resolves the **logical interaction** — one logical request, or one logical external execution — or conclusively ends only the observing attempt (`CONSEQO_REVISION_V3_AMENDMENT_B_EXTERNAL_IDEMPOTENCY_RETRYABLE_ERRORS.md`):
+The disposition declares whether observing the contract's `Err` terminally resolves the **logical interaction** — one logical request, or one logical external execution — or conclusively ends only the observing attempt:
 
 - `terminal` — observing this `Err` terminally resolves the logical interaction with the declared error payload.
 - `retryable` — observing this `Err` conclusively ends the current attempt but does not terminally resolve the logical interaction; another attempt is **semantically admitted**. It does not say a retry occurs, is guaranteed, succeeds, returns a different result, or happens promptly — those are execution semantics Archspec does not model here, and V1 deliberately introduces no retry policy, loop, attempt count, or backoff.
@@ -656,7 +655,7 @@ Arbitrarily serializing concurrent inputs can satisfy a serialization requiremen
 
 Where preserving the required order entails preventing later invocations from overtaking earlier ones, the proof must also establish the necessary execution serialization.
 
-V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order and re-dispatches a failed delivery at its head, and lane concurrency `bounded(1)` stops overtaking. Redelivery therefore cannot invert the precedence: a failure-driven redelivery precedes every later message of its lane, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas. See `ARCHSPEC_ORDERING_DRAFT.md`.
+V1 recognizes one precedence source: the order the key's subscription topic declares (§6) — a keyed topic's per-key order, when the ordering key is established to carry the topic key for every admitted schema (the key identity of §4), or a global topic's order for any key. A request input has no precedence source, and a key not sourced from an input selects no population; both are unproven. The mechanism is the §8.2 composition: same-key deliveries enter one lane (`by_topic_key` on a keyed topic, or `single_lane`), a lane dispatches in delivery order and re-dispatches a failed delivery at its head, and lane concurrency `bounded(1)` stops overtaking. Redelivery therefore cannot invert the precedence: a failure-driven redelivery precedes every later message of its lane, and a duplicate of an already completed message is a repeated attempt at a logical invocation that took effect in order — what that attempt does is the idempotency requirement's obligation, not ordering's, and the proof records which requirement answers for it or that none does. Vacuously discharged: a subscription admitting no message schemas.
 
 ### Serialization versus ordering
 
@@ -692,7 +691,7 @@ V1 discharges the requirement over each **admitted path** of the program — a p
 - **Effect leg.** Every effect-executing step must be duplicate-safe per the §13 rules, since even a recovered intent may be executed again (§14) — and those rules follow the work an attempt causes into other operations: a request is safe only when its target collapses duplicate invocations, a publication only when every modeled consumer collapses duplicate deliveries, each through its own proven requirement.
 - **Control leg.** Every decision on the path must replay (§16): the matched result replay-stable, or the branch condition deterministic over replay-stable roots, so that every attempt in the class traverses the same path. When a controlling observation may differ between attempts, a retry may do different work, and V1 has no compatibility argument for the two histories; the decision is an obstacle.
 
-A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint, so a cycle whose members each collapse the others' duplicates is proven and marked coinductive (§13.2). Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt. See `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`.
+A verdict therefore covers the cascade the operation starts, and V1 computes the mutually dependent verdicts as a greatest fixpoint (below), so a cycle whose members each collapse the others' duplicates is proven and marked coinductive. Result consistency is the separate result-replay obligation below; its verdicts feed in only where a decision rests on a request effect's result. Vacuously discharged: an empty population; no admitted path, so an attempt performs no modeled work; and a triggering subscription with `at_most_once` delivery whose payload is identity-pinned by the key (§18) — same-class messages are then one logical message delivered at most once, so a class holds at most one attempt.
 
 ### `ResultReplayRequirement::replay_consistent`
 
@@ -714,6 +713,12 @@ Vacuously discharged: a key triggered by a subscription, or a program none of wh
 No replay-stability requirement is declared for the result.
 
 This does not waive the operation's idempotency requirement for side effects.
+
+### Fixpoints and coinductive proofs
+
+Request and consumer discharge make idempotency verdicts mutually dependent, and cycles — request cycles between operations, publication cycles through topics — are legal models. The same holds for result-replay verdicts through request effects. V1 computes each family's verdicts as a **greatest fixpoint**: every requirement with an admissible governing key is assumed, and whatever fails under that assumption is dropped until nothing more fails. The iteration is monotone — fewer assumptions never prove more — and terminates. A cycle whose members each pass their local checks under the mutual assumption is therefore proven, and the proof is marked *coinductive*; the least fixpoint is computed alongside, only to identify which proofs rest on such a cycle.
+
+*Soundness, by minimal counterexample.* Suppose some member of a self-consistent set `P` were violated: some execution in which duplicate attempts at one of its logical invocations cause distinguishable duplicate work. Among all such violations across `P`, take one whose duplicate work lies at the shortest causal distance from the duplicated attempts. That work is not on the invocation's own path — the state leg and the external and publication legs are discharged by local facts that assume nothing about `P`. So it lies downstream of a request or publication, and the local check establishes that the duplicates reached the target or consumer as payload-equal inputs, falling into one class of *its* requirement, which is in `P`. The duplicate work is then caused by duplicate attempts of that invocation, at a strictly shorter causal distance — contradicting the choice of the violation. Every causal chain in a real execution is finite, so no violation exists. The argument uses the downstream requirement only for what its local check provides — a key over the input that collapses payload-equal attempts — never for its verdict, which is why assuming the verdict is harmless. The result-replay analogue substitutes "return a different result" for "cause duplicate work": a differing observation would be a violation at strictly shorter causal distance.
 
 ### `RecoverabilityRequirement`
 
@@ -742,7 +747,7 @@ The keyed commit makes `E` *recoverable*, and the operation's idempotency requir
 
 The key identifies the retry-equivalence class in the same sense as §12: attempts sharing the key are attempts at the same logical invocation, so re-driving one of them continues that invocation rather than starting a new one.
 
-The requirement does not name a path. An invocation takes one path through the program (§7), and a resumed attempt reaching the terminal of any admitted path discharges the obligation. Which paths remain admissible after a partial execution is the open question recorded in the revision draft; the requirement is deliberately stated so as not to prejudge it.
+The requirement does not name a path. An invocation takes one path through the program (§7), and a resumed attempt reaching the terminal of any admitted path discharges the obligation. Which paths remain admissible after a partial execution is open question 7 (§27); the requirement is deliberately stated so as not to prejudge it.
 
 ### `completion: resumable`
 
@@ -760,7 +765,7 @@ V1 discharges this by **same-path continuation**: for every admitted path — on
 - consumed artifacts — an intent the path executes, which must be established at all; a transaction output referenced by a later transaction body or an effect derivation; the outputs the terminal result is derived from — are judged by the replay rules of §17 and §18, with references inside the establishing transaction exempt by atomicity, and a commit key judged by the re-encounter analysis rather than double-counted as consumption;
 - a decision is **never** an obstacle to progress. A retry not established to take the same arm follows whichever admitted path it then takes, and that path is analyzed on its own; the difference in work is idempotency's concern, not recoverability's.
 
-This is a sufficient route and deliberately does not prejudge which other paths a resumed attempt may take (`ARCHSPEC_FLOW_RESUMPTION_DRAFT.md`). A program with no path admitted for the triggering input cannot make progress for it, and the obligation is unproven — the deliberate asymmetry with idempotency, for which the same shape is vacuous.
+This is a sufficient route and deliberately does not prejudge which other paths a resumed attempt may take (§27 question 7). A program with no path admitted for the triggering input cannot make progress for it, and the obligation is unproven — the deliberate asymmetry with idempotency, for which the same shape is vacuous.
 
 `resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Archspec does not model.
 
@@ -999,7 +1004,7 @@ For an upstream idempotency requirement, a duplicate execution of a publication 
 1. the topic declares a keyed message identity mapping the published schema (§6) and the published instance is class-fixed — replay-deterministic for a direct execution, or an intent replay-available by route A or B of §17 — so that every attempt publishes the **same logical message**; and
 2. every modeled consumer of that message collapses duplicate deliveries of it. A consumer is an operation subscribing to the topic with a message selection admitting the schema; it collapses duplicates either through an idempotency requirement keyed from that subscription that is itself proven, or by receiving the subscription with `at_most_once` delivery, under which one logical message is delivered no more than once however often it is published.
 
-Condition 1 makes the duplicate no new logical work *at the topic*: at most it raises delivery multiplicity. Condition 2 makes it no new logical work anywhere the model can see. Delivery multiplicity is a degree of freedom the topic contract admits, but the work a redelivery causes in a consumer is still work the upstream attempt caused, and the requirement's "must not cause" is transitive: an operation whose retries double a downstream card charge is not idempotent, however faithfully it republishes one message. A consumer the model does not contain is outside the proof, which is conditional on the model's closed world of consumers (§1.3). Producer and consumer verdicts are mutually dependent; V1 computes them together with request discharge (§13.2) as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven — a publication cycle through topics no less than a request cycle — by the minimal-counterexample argument of `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1, and such proofs are marked coinductive.
+Condition 1 makes the duplicate no new logical work *at the topic*: at most it raises delivery multiplicity. Condition 2 makes it no new logical work anywhere the model can see. Delivery multiplicity is a degree of freedom the topic contract admits, but the work a redelivery causes in a consumer is still work the upstream attempt caused, and the requirement's "must not cause" is transitive: an operation whose retries double a downstream card charge is not idempotent, however faithfully it republishes one message. A consumer the model does not contain is outside the proof, which is conditional on the model's closed world of consumers (§1.3). Producer and consumer verdicts are mutually dependent; V1 computes them together with request discharge (§13.2) as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven — a publication cycle through topics no less than a request cycle — by the minimal-counterexample argument of §9, and such proofs are marked coinductive.
 
 `idempotency_key_propagation` plays no role in this discharge: a class-fixed instance already makes every duplicate payload-equal, so a consumer's key evaluates equally across them whichever fields it reads. Propagation remains lineage for the consumer's analysis (§12) and deduplicates nothing on the publishing side.
 
@@ -1033,11 +1038,11 @@ No retry fact is available.
 
 A request effect's synchronous result is `target.input`'s declared `result` (§8.1): executing the effect yields exactly the `Result<Ok, Err>` the targeted input returns. The schemas are not redeclared on the effect; an execution site binding the result observes that type.
 
-Whether repeated executions observe the *same* result is a separate question with one V1 answer (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §32): the bound result is replay-stable exactly when the request instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement keyed from the targeted input with `result: replay_consistent` that is itself proven (§9). Payload-equal duplicates then fall into one class of that requirement, which returns the same variant and a replay-equivalent payload to each of them. Idempotency-key propagation remains lineage only; it proves neither duplicate safety nor result consistency.
+Whether repeated executions observe the *same* result is a separate question with one V1 answer: the bound result is replay-stable exactly when the request instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement keyed from the targeted input with `result: replay_consistent` that is itself proven (§9, §18). Payload-equal duplicates then fall into one class of that requirement, which returns the same variant and a replay-equivalent payload to each of them. Idempotency-key propagation remains lineage only; it proves neither duplicate safety nor result consistency.
 
 ### Duplicate request
 
-A duplicate execution of a request effect invokes the target again, and nothing admits invocation multiplicity by default — the asymmetry with duplicate publication is deliberate: a request identity on the target input fixes payload consistency, but only a mechanism collapses invocations. The duplicate is safe exactly when the instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement, keyed from the targeted input, that is itself proven: payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation. V1 computes these mutually dependent verdicts as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven, by the minimal-counterexample argument of `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1, and such proofs are marked coinductive.
+A duplicate execution of a request effect invokes the target again, and nothing admits invocation multiplicity by default — the asymmetry with duplicate publication is deliberate: a request identity on the target input fixes payload consistency, but only a mechanism collapses invocations. The duplicate is safe exactly when the instance is class-fixed, the effect's schema is the targeted input's schema, and the target operation declares an idempotency requirement, keyed from the targeted input, that is itself proven: payload-equal duplicates then fall into one class of that requirement, which collapses them to the work of a single logical invocation. V1 computes these mutually dependent verdicts as a greatest fixpoint: a cycle of requirements that each collapse the others' duplicates is proven, by the minimal-counterexample argument of §9, and such proofs are marked coinductive.
 
 ## 13.3 External effect
 
@@ -1100,7 +1105,7 @@ An effect intent is a **logical transaction artifact** describing an intended ef
 
 An effect intent is not inherently synonymous with a durable database record, and declaring one does not establish it. `EstablishEffectIntent` establishes the logical artifact as part of a transaction execution.
 
-The current `IntentExecutionSemantics::{Unspecified, Recoverable}` model is superseded by this revision. An intent declaration does not imply an invisible independent executor or independent rediscovery mechanism.
+An intent declaration does not imply an invisible independent executor or independent rediscovery mechanism: execution happens only through an `execute_effect_intent` program step, and retry availability only through the §17 routes.
 
 ### Intent derivation
 
@@ -1148,7 +1153,7 @@ It represents **data** — a reservation id, a selected account, remaining stock
 
 A transaction output does **not** imply an operation result, success or failure, effect execution, idempotency, database storage, or memoization. It is semantically separate from transaction idempotency: establishing an output does not, by itself, prevent the enclosing transaction from executing or committing again. It is not inherently synonymous with a durable database record; its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit (below).
 
-A transaction output is intentionally generic and is not a `Result`. Outputs remain schema-shaped; `Result<Ok, Err>` is reserved for request results and synchronous effect results (§8.1, §13). If a future architecture requires result-typed outputs, the type model is to be extended deliberately rather than by coupling that concern into `TransactionOutput` (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §35).
+A transaction output is intentionally generic and is not a `Result`. Outputs remain schema-shaped; `Result<Ok, Err>` is reserved for request results and synchronous effect results (§8.1, §13). If a future architecture requires result-typed outputs, the type model is to be extended deliberately rather than by coupling that concern into `TransactionOutput`.
 
 ### `EstablishTransactionOutput`
 
@@ -1337,7 +1342,7 @@ Validation establishes that the program is structurally coherent. It performs no
 7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription). The outcome's derivation roots must be definitely available under rules 3–5.
 8. **Ownership.** Referenced transactions, effects, and intents belong to the operation; every value reference respects §11 scope.
 
-Rules 3–5 are a **forward definite-availability analysis** over the block structure (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §28–§29):
+Rules 3–5 are a **forward definite-availability analysis** over the block structure:
 
 ```text
 Available(entry)      = {}
@@ -1350,9 +1355,9 @@ A predecessor arm that terminates imposes no constraint on the join. `Establishe
 
 ### Paths and path admission
 
-An invocation traverses one **path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Verification analyzes the program path by path — a path is exactly the linear sequence the retired invocation flows were, plus the decisions that selected it — so the forward replay pass of §18 applies unchanged, and what a decision rests on is judged where it is taken.
+An invocation traverses one **path** through the program: the linear sequence of its steps, the arm taken at each decision, and the terminal reached. Verification analyzes the program path by path — a path is a linear sequence of steps plus the decisions that selected it — so the forward replay pass of §18 applies to each path unchanged, and what a decision rests on is judged where it is taken.
 
-A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based and is the direct generalization of the retired admitted-flow rule; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association was an open decision of the revision (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §46.5) and is deliberately not resolved here by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
+A path is **admitted for input `i`** iff its terminal is `complete`, or `return` for `i`. A path returning another request input's result is not one an invocation of `i` completes. Admission is terminal-based; the DSL adds no explicit entry or path-admission concept associating a triggering input with a control entry. That association is open question 10 (§27) and is deliberately not resolved by inventing one: an operation with several request inputs distinguishes their paths by the `return` each takes, and a subscription-triggered invocation is admitted to every path ending at `complete`.
 
 A path that falls off the end of its block with no terminal is rejected by validation (rule 1). Verification, which is not promised a valid model, admits such a path conservatively so its work is still analyzed, and recoverability records it as an obstacle.
 
@@ -1379,7 +1384,7 @@ Transaction-read results are excluded: they remain local to the transaction exec
 
 ### Decision replay
 
-A retry traverses declared control. Whether it takes the same arm at a decision is a fact the checker establishes or records as a gap (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §30). Relative to a governing key (§12), a decision **replays** — every attempt in a class takes the same arm — when:
+A retry traverses declared control. Whether it takes the same arm at a decision is a fact the checker establishes or records as a gap. Relative to a governing key (§12), a decision **replays** — every attempt in a class takes the same arm — when:
 
 - for a `branch`: the condition is deterministic (not `unspecified` anywhere) **and** every root it observes is replay-stable under §18. The same roots then yield the same predicate value; or
 - for a `match_result`: the matched result is replay-stable under §18, so the variant is fixed across the class.
@@ -1530,7 +1535,7 @@ This is especially important for lock-order/deadlock analysis, transaction-read 
 
 ### `Derivation`
 
-The revised DSL introduces a small provenance declaration for opaque value computation:
+The DSL declares opaque value computation through a small provenance vocabulary:
 
 ```rust
 pub enum Derivation {
@@ -1668,11 +1673,11 @@ steps with the same context and reach the same judgments about them.
 
 ### Transaction read results
 
-A `Read` should identify a transaction-local result so later steps in the same transaction can reference fields from that result through `ValueSource::TransactionRead`.
+A `Read` names a transaction-local result so later steps in the same transaction can reference fields from that result through `ValueSource::TransactionRead`.
 
 A transaction-read result is an observation of transaction state, not a replay-stability guarantee.
 
-Validation should require that a transaction-read source:
+Validation requires that a transaction-read source:
 
 - refers to a read in the same transaction;
 - refers only to fields selected by that read; and
@@ -1773,7 +1778,7 @@ Reads the selected object instances.
 
 `fields` describes the read set visible to conflict analysis.
 
-The revised model should also name the transaction-local read result so later steps in the same transaction can use it as deterministic provenance.
+The step names the transaction-local read result (§18) so later steps in the same transaction can use it as deterministic provenance.
 
 #### `FieldSelection::all`
 
@@ -1789,7 +1794,7 @@ Reads only the listed field paths for the modeled semantics.
 
 Mutates the listed fields of the selected object instances.
 
-The revised model should declare the provenance of the values written through `Derivation`.
+The step declares the provenance of the values written through `Derivation` (§18).
 
 A deterministic derivation describes value computation, not replayability by itself. Natural replay analysis must additionally establish replay stability of the selected target and all derivation roots (§18).
 
@@ -1799,11 +1804,11 @@ A write whose derivation is `Unspecified` normally leaves natural replayability 
 
 Creates a new instance of the declared object type.
 
-The revised model should declare inserted-value provenance through `Derivation` but must **not** redeclare object identity.
+The step declares inserted-value provenance through `Derivation` but does **not** redeclare object identity.
 
-`DataObject.identity` already defines the strict non-empty logical identity of every object instance. Two distinct successful inserts cannot create two logical instances with the same complete identity. A separate `AcquireUniqueClaim`/`UniqueClaim` primitive is therefore redundant and is removed by the revised model.
+`DataObject.identity` already defines the strict non-empty logical identity of every object instance. Two distinct successful inserts cannot create two logical instances with the same complete identity; no separate unique-claim primitive exists.
 
-Whether retrying a conflicting insert can participate in a natural replayability proof depends on the final duplicate-identity/insert outcome semantics. Until that behavior is explicitly defined, V1 must not infer full transaction replayability merely from object identity uniqueness.
+Whether retrying a conflicting insert can participate in a natural replayability proof depends on duplicate-identity insert outcome semantics that are deliberately undefined — open question 4 (§27). Until they are defined, V1 must not infer transaction replayability merely from object identity uniqueness, and a transaction containing an `Insert` is never proven naturally replayable.
 
 ### `Delete`
 
@@ -1855,7 +1860,7 @@ Program order between separate `Lock` steps is itself relevant to the lock-order
 
 A `by` order within one selector does not automatically reconcile contradictory order between two separately declared lock steps.
 
-The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 of `ARCHSPEC_SEMANTICS_REVISION_DRAFT.md` §27, and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about locks.
+The current DSL therefore cannot declare a deadlock-safe acquisition of several specific instances of one object: a selector admits no disjunction, so one lock step cannot name them, and no fact orders separate steps. The locking facts the DSL lacks are open question 8 (§27), and the model-wide deadlock checker that would consume them is question 9; no V1 verifier reasons about locks.
 
 ---
 
@@ -1903,7 +1908,7 @@ A transaction containing any `Transition` is **not naturally replayable** under 
 
 A successful transition changes the state against which its own precondition was evaluated, so re-executing the transaction cannot generally be assumed to reproduce the same transaction outcome or transaction artifacts. A transition that rejects a second application may provide an at-most-once state-mutation gate, but that is not natural replayability: suppressing the second mutation reproduces neither the outputs nor the intents of the original execution, and the gate must not be promoted into replayability.
 
-This limitation is a **proof fact, not a structural validity rule** (`CONSEQO_REVISION_V3_AMENDMENT_A_TRANSITION_DEDUP_RELAXATION.md`). A transition-containing transaction may declare any `IdempotencyGuarantee` permitted for other transactions — `unspecified`, `not_deduplicated`, or `deduplicated_by { key }` — and none of them is a validation concern; `unspecified` and `not_deduplicated` keep their §17 distinction. `DeduplicatedBy { key }` provides the durable recovery route: after the first successful logical commit, a later same-key encounter resolves the prior `Commit(T,K)` rather than reapplying the transition, and restores the exact retained transaction artifacts.
+This limitation is a **proof fact, not a structural validity rule**. A transition-containing transaction may declare any `IdempotencyGuarantee` permitted for other transactions — `unspecified`, `not_deduplicated`, or `deduplicated_by { key }` — and none of them is a validation concern; `unspecified` and `not_deduplicated` keep their §17 distinction. `DeduplicatedBy { key }` provides the durable recovery route: after the first successful logical commit, a later same-key encounter resolves the prior `Commit(T,K)` rather than reapplying the transition, and restores the exact retained transaction artifacts.
 
 Where an idempotency, result-replay, or recoverability obligation depends on replay or recovery of a transition-containing transaction, the analyzer proves a sufficient route from the actual declarations: it assumes neither natural replayability nor durable keyed recovery, and the recovery route holds only when `deduplicated_by` is declared over a key the §18 rules make stable. Failing to establish a route leaves the relevant requirement unproven; it does not make the transaction invalid, and the diagnostics report the missing proof facts rather than prescribing `deduplicated_by` as the one legal architecture. A transition transaction over which nothing declares a retry obligation needs no key at all. A retry may also legitimately observe the durably transitioned state and take a different admitted path; what that divergence does is judged by decision replay (§16) and idempotency, not by structural validation. No requirement or guarantee is ever synthesized merely because a transaction contains a transition.
 
@@ -1973,7 +1978,7 @@ When the transaction declares `DeduplicatedBy { key }`, these derivations are ev
 
 `TransactionOutput` and `EffectIntent` are the two principal framework-level **logical transaction artifacts**. Neither is an inherently durable primitive.
 
-They have deliberately different jobs (`ARCHSPEC_OPERATION_EXECUTION_REVISION_DRAFT_V3.md` §6):
+They have deliberately different jobs:
 
 - a **`TransactionOutput`** is a typed logical value deliberately exported from a transaction into subsequent operation control. It represents **data**.
 - an **`EffectIntent`** is a captured logical effect instance intended for later execution. It represents **pending logical work**.
@@ -2062,3 +2067,58 @@ When declaring a requirement, ask:
 > What observable property would make the architecture wrong if it failed?
 
 Keep that requirement separate from the mechanism expected to satisfy it. The solver's job is to connect the two.
+
+---
+
+## 27. Open questions and deferred semantics
+
+What the DSL deliberately does not yet decide. Every entry is scoped so that resolving it can only extend what can be stated and proven — never invalidate a V1 verdict. The questions keep the numbering under which diagnostics, code comments, and fixture notes cite them; resolved questions are recorded in a line so the numbering stays meaningful.
+
+1. **Artifact-level keys** — *Resolved.* Transaction artifacts carry no independent logical identity or key: a `TransactionOutput` or `EffectIntent` is identified by its declaration, and its retry availability comes only from the §17 routes of its establishing transaction.
+
+2. **Artifact derivation granularity** — *Resolved.* The `Derivation` at an establishment or execution site describes the complete constructed instance (§13, §14); no finer per-field lineage surface exists.
+
+3. **Replay-stable provenance roots** — *Resolved.* The rules are §18 in their entirety: stability is definitional (governing-key components), declared (a request or message identity pinned by the governing key), or derived (keyed-commit recovery, natural-replay reconstruction, effect-result stability, congruence); everything else is `Unknown`.
+
+4. **Insert failure semantics** — *Open.* The outcome of attempting to insert an already-existing `DataObject.identity` — and how it affects the enclosing transaction and path admissibility — is normatively undefined. Until it is defined, a transaction containing an `Insert` is never proven naturally replayable (§20), which is `Unknown`, not a violation.
+
+5. **Transition natural replay** — *Open.* V1 never replays a transition-containing transaction naturally, whatever its declared guarantee (§22); the durable recovery route through `deduplicated_by` is the only proven route. A later solver may investigate whether restricted transition patterns admit a sound natural-replay argument — for instance, a transition whose re-encounter against the durably transitioned state is provably outcome-equivalent — but no such inference is permitted in V1.
+
+6. **Effect execution completion state** — *Open.* Intent reconstruction and recovery are kept separate from durable tracking of whether the underlying effect has executed or completed. V1 records the §14 uncertainty — a recovered intent may re-execute, and an effect may have succeeded before a crash without that success being durably known — and models no execution-state artifact. What minimum completion-state vocabulary a later revision needs, and whether it is a transaction artifact, a boundary guarantee, or both, is undecided.
+
+7. **Alternative-path continuation** — *Open; V1 stance adopted.* Recoverability is proven by same-path continuation (§9): for every admitted path, re-driving that path from its first step reaches its terminal, and a decision is never an obstacle to progress. This is a sufficient route that neither uses nor forbids continuation along a *different* admitted path after a partial execution; which other paths a resumed attempt may legitimately follow, and what preconditions make one applicable, remains unresolved. A resolution may add routes; it cannot invalidate same-path proofs.
+
+8. **Locking expressivity** — *Open; earmarked for implementation.* A `Lock` is one selector, a mode, and an acquisition order within that selector (§21). That surface cannot state the facts a deadlock argument needs, and the gaps are these:
+
+   - *Instance sets.* `SelectorPredicate` admits only `all`, `eq`, and `and` — no disjunction, no set membership — so one lock step cannot name several specific instances of an object. `tx.transfer_stock` in `tests/fixtures/flash_checkout.yaml` locks its source and destination `stock` rows as two steps for exactly this reason. Needs `or`/`in` over a field (with §19's provenance rules extended to them), or a lock step with several targets.
+   - *Cross-step and cross-object order.* `LockOrder::by` orders acquisition only inside one step; between steps the only fact is program order, which is data-relative for a transfer (source before destination), and nothing orders locks on different objects ("`order` before `stock`"). Needs a transaction-level lock order — a sequence of objects, each with a field order — or a data-model-level ordering convention that transactions cite.
+   - *Order-domain compatibility.* §21 permits deadlock reasoning only between "compatible order domains" without defining them. Needs a definition: same object, one declared order a common prefix of the other, same directions; or one declared total order per object.
+   - *Preconditions and distinctness.* Selectors reference input values, so whether two of them address one instance or two depends on the inputs, and nothing can state `source_warehouse_id ≠ destination_warehouse_id`. Needs a decision on input preconditions; without them the degenerate same-instance case of a transfer is unstatable and its two writes conflict.
+   - *Upgrades.* A `shared` then `exclusive` lock on one target within a transaction is the classic deadlock (two holders both upgrading); the DSL allows writing it and gives it no semantics. Needs one: conversion or a second lock.
+   - *Implicit locks.* Engines take row locks on `Write`/`Delete` and gap locks on `Insert` under the stronger isolation levels; the DSL models only explicit `Lock` steps. Needs either implicit-lock facts per isolation level (a `Write` acquires `exclusive` on its selector at its program point) or a stated assumption that only declared locks count — which makes every proof conditional on the engine's conformance to that assumption.
+   - *Predicate versus instance locks.* Whether a lock on `all` or on a partial identity covers instances inserted later (a predicate lock) or only current ones is unspecified; serialization and deadlock reasoning both depend on it.
+   - *Wait policy.* No lock-wait timeout, `nowait`, or `skip locked` fact; these decide whether a circular wait deadlocks or aborts. Absent one, a checker must treat every cycle as a deadlock.
+
+   No V1 proof credits a lock — the serialization checker deliberately declines the lock route — so each of these can only add what can be stated and proven, never invalidate a verdict.
+
+9. **Model-wide deadlock checker** — *Open; earmarked for implementation; depends on 8 to be useful.* A model-wide analysis, not a per-operation requirement: locks live in transactions, and a deadlock is a property of every transaction the model admits concurrently on one data model. The analysis, per data model:
+
+   1. *Collect* every explicit lock step of every transaction in every operation — object, selector, mode, declared order, program position — and, once question 8 settles it, the implicit locks its isolation level implies.
+   2. *Abstract* each lock to a class: the object and the shape of its selector (full identity, partial identity, `all`), with selector values carried as canonical paths, so that two classes are *disjoint* only when provably so (distinct literals, or identities pinned to different canonical values) and otherwise *may overlap*. Two classes *conflict* when they may overlap and are not both `shared`.
+   3. *Order* the classes: within a transaction, program order between steps and the `by` order within a step give a per-transaction acquisition order over conflicting classes; a multi-instance step with `order: unspecified` contributes no order among its own instances.
+   4. *Admit* concurrency: two transactions can overlap unless a declared fact says otherwise — `bounded(1)` on an operation, a proven serialization requirement for same-key invocations, lane concurrency. The serialization verdicts already compute most of this.
+   5. *Decide.* The union of the admitted transactions' acquisition orders over conflicting classes is acyclic: **proven**, citing the global order it found. A cycle whose every edge is a declared fact, whose transactions are admitted concurrently, and whose classes may overlap: **disproven**, with a counterexample trace — "T1 holds A, requests B; T2 holds B, requests A" — the checker's first disproven verdict, consistent with §1.2 because it is built from declarations, not from their absence. Anything else — an `unspecified` order on a multi-instance class, an unspecified concurrency bound, overlap that cannot be decided — is **unknown**, with the lock steps it hinges on as evidence.
+
+   To settle alongside: whether deadlock freedom is declared (a data-model requirement, keeping the rule that requirements are obligations) or standing; a `data_model` subject kind for the report; the rendering of a disproven obligation with its trace; and the wait-policy assumption of question 8. Until question 8 lands, the analysis is implementable but would return unknown for nearly every real model, the transfer pattern included — which is still the honest answer.
+
+10. **Input-specific path admission** — *Open; V1 stance adopted.* An operation may declare several inputs, and its one program does not say which input an invocation entered through. V1 relates a path to an input only through its terminal (§16): a path is admitted for triggering input `i` iff it ends at `complete` or at `return` for `i`. This is sufficient but weaker than the model knows: a `complete`-terminated path is admitted for every input, including a request input whose invocations then return nothing; a program with two request inputs cannot state that a step is reachable only through one of them, so both populations are analyzed over it; and a `return` for another input excludes a path without saying what an `i`-invocation does instead. An explicit entry concept — a per-input entry block, an `entry` step naming the inputs that may reach the steps it dominates, or a validation rule that every request input has at least one `return` — would let validation reject a program that returns nothing for a request input, let each population analyze only the steps it can reach, and give path admission a declared rather than inferred basis. Any resolution refines admission and so can only remove paths from an analysis, never add work to a proven one.
+
+11. **External effect result replay** — *Resolved.* For a result-bearing external effect, `deduplicated_by` fixes the interaction's terminal result (§13.3), and `ResultType.err` declares an `ErrorDisposition` (§8.1); a terminal external result over a class-fixed key is a replay-stable root (§18 rule 6). Still open from that resolution: heterogeneous per-error-class dispositions inside one result contract, and any retry-execution vocabulary that would consume `retryable`.
+
+### Deferred surfaces
+
+- **Loops.** The program is acyclic (§7). Iteration requires semantics for iteration identity, repeated transaction artifacts, repeated effect-result bindings, effect multiplicity, termination, ordering between iterations, recovery from partial iteration progress, and bounded analyzer state; none are defined. The expressivity the program model was built to solve is branching and intermediate observations, not iteration.
+- **Object-history requirements.** No object-level history requirement (such as linearizability) exists; §5 states the scope rule and what its absence does not weaken. To be reconsidered as a coherent family when Archspec models distributed persistence and availability.
+- **Process completion.** Recoverability's `guaranteed` obliges one operation to reach its terminal. That a multi-operation process — a saga across the trigger graph — reaches its end state is a distinct liveness property with no declaration; it needs new surface (the trigger graph is its natural consumer), not a stronger reading of `guaranteed`.
+- **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
+- **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, concurrency bounds — but no performance semantics exist in the model.

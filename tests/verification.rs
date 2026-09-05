@@ -2568,7 +2568,7 @@ fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
     }
 }
 
-/// The external substrate of the Amendment B result-replay tests:
+/// The external substrate of the terminal-result replay tests:
 /// `transfer_stock` charges an external provider that deduplicates by
 /// the governing `sku` key, matches the result, and returns each
 /// terminal variant's payload from the corresponding bound result.
@@ -3891,7 +3891,7 @@ fn consumer_checks_record_producer_lineage() {
 }
 
 // ---------------------------------------------------------------------------
-// Amendment A: transition transactions without keyed deduplication
+// Transition transactions without keyed deduplication
 // ---------------------------------------------------------------------------
 
 #[test]

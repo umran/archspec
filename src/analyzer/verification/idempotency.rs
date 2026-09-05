@@ -1,5 +1,5 @@
 //! Verification of operation idempotency requirements (§9 of the
-//! semantics contract; `ARCHSPEC_EFFECT_SAFETY_DRAFT.md`).
+//! semantics contract).
 //!
 //! > Repeated attempts representing the same logical invocation must
 //! > not cause externally distinguishable duplicate logical work
@@ -29,7 +29,7 @@
 //!   consumer of that message collapsing duplicate deliveries of it:
 //!   a proven idempotency requirement keyed from the subscription, or
 //!   `at_most_once` delivery of the one logical message.
-//! - **Control leg**: every decision on the path must replay (§30) — a
+//! - **Control leg**: every decision on the path must replay (§16) — a
 //!   matched result replay-stable, or a branch condition deterministic
 //!   over stable roots — so a retry traverses the same path. When a
 //!   controlling observation may differ, the retry may do different
@@ -45,7 +45,7 @@
 //! nothing more fails. A cycle through request targets or message
 //! consumers whose members each pass their local checks is therefore
 //! proven, and the proof is marked coinductive
-//! (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1).
+//! (§9).
 //!
 //! Result consistency is the separate result-replay obligation and is
 //! not re-checked here; its verdicts feed in only where a decision
@@ -97,7 +97,7 @@ pub struct IdempotencyCheck {
     /// requirements it reaches through request targets or message
     /// consumers, and theirs hold only with it: the greatest fixpoint
     /// admits such a cycle by the minimal-counterexample argument of
-    /// `ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1.
+    /// the minimal-counterexample argument of §9.
     #[serde(default)]
     pub coinductive: bool,
 
@@ -419,7 +419,7 @@ struct Scope<'a> {
 /// admissible governing key is assumed, and whatever fails under that
 /// assumption is dropped until nothing more fails, so a cycle of
 /// requirements that each collapse the others' duplicates proves
-/// (`ARCHSPEC_EFFECT_SAFETY_DRAFT.md` §4.1). The least fixpoint is
+/// (§9). The least fixpoint is
 /// computed alongside to mark which proofs rest on such a cycle.
 pub fn check(model: &Model, consistent: &BTreeSet<(Id, Id)>) -> Vec<IdempotencyCheck> {
     let graph = TriggerGraph::new(model);
