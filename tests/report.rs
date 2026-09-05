@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use archspec::{
+use conseqa::{
     analyzer::{
         report::{self, Property, ProverReport, Status},
         verification,
@@ -167,7 +167,7 @@ fn fixture_report_matches_the_checker() {
     assert_eq!(
         stored, expected,
         "tests/fixtures/flash_checkout.report.json is stale; regenerate it \
-         with `cargo run --bin archspec -- tests/fixtures/flash_checkout.yaml \
+         with `cargo run --bin conseqa -- tests/fixtures/flash_checkout.yaml \
          --report tests/fixtures/flash_checkout.report.json`"
     );
 }

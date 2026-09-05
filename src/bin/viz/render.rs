@@ -8,7 +8,7 @@
 //! changing the front end; the built file is committed so `cargo`
 //! needs no Node toolchain.
 
-use archspec::spec::Model;
+use conseqa::spec::Model;
 use serde::Serialize;
 
 use crate::graph;
@@ -16,8 +16,8 @@ use crate::report::ProverReport;
 
 const BUNDLE: &str = include_str!("../../../viz/dist/index.html");
 
-const DATA_PLACEHOLDER: &str = "/*__ARCHSPEC_DATA__*/";
-const TITLE_PLACEHOLDER: &str = "<title>archspec</title>";
+const DATA_PLACEHOLDER: &str = "/*__CONSEQA_DATA__*/";
+const TITLE_PLACEHOLDER: &str = "<title>conseqa</title>";
 
 #[derive(Serialize)]
 struct PageData<'a> {
@@ -66,10 +66,10 @@ pub fn render(model: &Model, report: Option<&ProverReport>, title: &str) -> Resu
     }
 
     Ok(BUNDLE
-        .replace(DATA_PLACEHOLDER, &format!("window.ARCHSPEC = {json};"))
+        .replace(DATA_PLACEHOLDER, &format!("window.CONSEQA = {json};"))
         .replace(
             TITLE_PLACEHOLDER,
-            &format!("<title>{} · archspec</title>", escape_html(title)),
+            &format!("<title>{} · conseqa</title>", escape_html(title)),
         ))
 }
 
@@ -88,10 +88,9 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/flash_checkout.yaml");
 
-        let model = archspec::parser::yaml::parse(
-            &std::fs::read_to_string(path).expect("fixture readable"),
-        )
-        .expect("fixture parses");
+        let model =
+            conseqa::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
+                .expect("fixture parses");
 
         let html = render(&model, None, "smoke </script> test").expect("renders");
 
@@ -99,9 +98,9 @@ mod tests {
         assert!(!html.contains(DATA_PLACEHOLDER));
         assert!(!html.contains(TITLE_PLACEHOLDER));
 
-        assert!(html.contains("window.ARCHSPEC"));
+        assert!(html.contains("window.CONSEQA"));
         assert!(html.contains("operation.create_order"));
-        assert!(html.contains("<title>smoke &lt;/script&gt; test · archspec</title>"));
+        assert!(html.contains("<title>smoke &lt;/script&gt; test · conseqa</title>"));
 
         // No unescaped close tag may survive inside the data block:
         // the bundle's own script closers are the only ones present.
@@ -116,15 +115,14 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal.yaml");
 
-        let mut model = archspec::parser::yaml::parse(
-            &std::fs::read_to_string(path).expect("fixture readable"),
-        )
-        .expect("fixture parses");
+        let mut model =
+            conseqa::parser::yaml::parse(&std::fs::read_to_string(path).expect("fixture readable"))
+                .expect("fixture parses");
 
         // A `<!--` followed by `<script` inside script data would put
         // the HTML parser into the double-escaped state, where the
         // template's real close tag no longer ends the element.
-        if let Some(archspec::spec::Schema::Canonical(schema)) = model.schemas.values_mut().next() {
+        if let Some(conseqa::spec::Schema::Canonical(schema)) = model.schemas.values_mut().next() {
             schema.description = Some("Beware <!-- of <script> tricks".to_string());
         } else {
             panic!("fixture has a canonical schema");

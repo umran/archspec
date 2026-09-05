@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use archspec::{
+use conseqa::{
     analyzer::{
         DiagnosticCode, Severity, VerificationCode, validation,
         verification::{
@@ -92,14 +92,14 @@ fn block(steps: Vec<OperationStep>) -> OperationBlock {
 }
 
 /// A request effect from `caller` into `target`'s request input.
-fn request_effect(target: &str, input: &str, schema: &str) -> archspec::spec::Effect {
-    archspec::spec::Effect::Request(archspec::spec::RequestEffect {
-        target: archspec::spec::RequestTarget {
+fn request_effect(target: &str, input: &str, schema: &str) -> conseqa::spec::Effect {
+    conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+        target: conseqa::spec::RequestTarget {
             operation: id(target),
             input: id(input),
         },
         schema: id(schema),
-        retry: archspec::spec::RetrySemantics::Unspecified,
+        retry: conseqa::spec::RetrySemantics::Unspecified,
         idempotency_key_propagation: vec![],
     })
 }
@@ -1979,7 +1979,7 @@ fn guaranteed_completion_needs_a_modeled_driver() {
         "operation.apply_payment",
         "input.apply_payment.captured",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     assert!(validation::validate(&model).is_empty());
 
@@ -1990,7 +1990,7 @@ fn guaranteed_completion_needs_a_modeled_driver() {
         RecoverabilityVerdict::Unproven {
             obstacles: vec![RecoverabilityObstacle::NoModeledRetryDriver {
                 input: id("input.apply_payment.captured"),
-                delivery: Some(archspec::spec::DeliverySemantics::AtMostOnce),
+                delivery: Some(conseqa::spec::DeliverySemantics::AtMostOnce),
             }],
         }
     );
@@ -2031,13 +2031,13 @@ fn inbound_repeatable_request_supplies_the_driver() {
         .effects
         .insert(
             id("effect.transfer_stock.create_order"),
-            archspec::spec::Effect::Request(archspec::spec::RequestEffect {
-                target: archspec::spec::RequestTarget {
+            conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+                target: conseqa::spec::RequestTarget {
                     operation: id("operation.create_order"),
                     input: id("input.create_order.request"),
                 },
                 schema: id("schema.CreateOrderRequest"),
-                retry: archspec::spec::RetrySemantics::MayRepeat,
+                retry: conseqa::spec::RetrySemantics::MayRepeat,
                 idempotency_key_propagation: vec![],
             }),
         );
@@ -2398,7 +2398,7 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 
     // Declare the payment provider's own idempotency: the card charge
     // deduplicates by the propagated event id.
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -2474,7 +2474,7 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 fn unstable_external_deduplication_key_is_an_obstacle() {
     let mut model = load_flash_checkout();
 
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -2512,7 +2512,7 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
 fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
     let mut model = load_flash_checkout();
 
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -2580,7 +2580,7 @@ fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) 
 
     operation.effects.insert(
         id("effect.transfer_stock.charge"),
-        archspec::spec::Effect::External(ExternalEffect {
+        conseqa::spec::Effect::External(ExternalEffect {
             name: "payments.charge".into(),
             idempotency: IdempotencyGuarantee::DeduplicatedBy {
                 key: ikey("input.transfer_stock.request", &[&["sku"]]),
@@ -2767,7 +2767,7 @@ fn an_undeduplicated_external_result_gains_no_stability() {
 
     charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
 
-    let Some(archspec::spec::Effect::External(charge)) = model
+    let Some(conseqa::spec::Effect::External(charge)) = model
         .operations
         .get_mut(&id("operation.transfer_stock"))
         .unwrap()
@@ -2843,7 +2843,7 @@ fn single_delivery_discharges_idempotency_vacuously() {
         "operation.reserve_inventory",
         "input.reserve_inventory.created",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     assert!(validation::validate(&model).is_empty());
 
@@ -2872,7 +2872,7 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
         "operation.reserve_inventory",
         "input.reserve_inventory.created",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     // transfer_stock forwards a class-fixed request into create_order,
     // whose own idempotency requirement is proven; the fixpoint's
@@ -2884,13 +2884,13 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
 
     operation.effects.insert(
         id("effect.transfer_stock.forward"),
-        archspec::spec::Effect::Request(archspec::spec::RequestEffect {
-            target: archspec::spec::RequestTarget {
+        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+            target: conseqa::spec::RequestTarget {
                 operation: id("operation.create_order"),
                 input: id("input.create_order.request"),
             },
             schema: id("schema.CreateOrderRequest"),
-            retry: archspec::spec::RetrySemantics::MayRepeat,
+            retry: conseqa::spec::RetrySemantics::MayRepeat,
             idempotency_key_propagation: vec![],
         }),
     );
@@ -2969,13 +2969,13 @@ fn cyclic_request_dependencies_prove_coinductively() {
 
     transfer.effects.insert(
         id("effect.transfer_stock.cancel"),
-        archspec::spec::Effect::Request(archspec::spec::RequestEffect {
-            target: archspec::spec::RequestTarget {
+        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+            target: conseqa::spec::RequestTarget {
                 operation: id("operation.cancel_order"),
                 input: id("input.cancel_order.request"),
             },
             schema: id("schema.CancelOrderRequest"),
-            retry: archspec::spec::RetrySemantics::Unspecified,
+            retry: conseqa::spec::RetrySemantics::Unspecified,
             idempotency_key_propagation: vec![],
         }),
     );
@@ -3004,13 +3004,13 @@ fn cyclic_request_dependencies_prove_coinductively() {
 
     cancel.effects.insert(
         id("effect.cancel_order.transfer"),
-        archspec::spec::Effect::Request(archspec::spec::RequestEffect {
-            target: archspec::spec::RequestTarget {
+        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+            target: conseqa::spec::RequestTarget {
                 operation: id("operation.transfer_stock"),
                 input: id("input.transfer_stock.request"),
             },
             schema: id("schema.TransferStockRequest"),
-            retry: archspec::spec::RetrySemantics::Unspecified,
+            retry: conseqa::spec::RetrySemantics::Unspecified,
             idempotency_key_propagation: vec![],
         }),
     );
@@ -3084,7 +3084,7 @@ fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
     // leg is its cascade: PaymentCaptured reaches apply_payment, whose
     // own requirement the fixpoint proves in its first round, so the
     // second round discharges the publication.
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -3177,7 +3177,7 @@ fn at_most_once_consumers_collapse_duplicates_by_delivery() {
         "operation.reserve_inventory",
         "input.reserve_inventory.created",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     model
         .operations
@@ -3477,7 +3477,7 @@ fn a_match_on_a_consistent_request_result_is_idempotent() {
         "operation.reserve_inventory",
         "input.reserve_inventory.created",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     forward_transfer_to_create_order(&mut model);
 
@@ -3615,7 +3615,7 @@ fn at_most_once_delivery_records_single_delivery() {
         "operation.reserve_inventory",
         "input.reserve_inventory.created",
     )
-    .delivery = archspec::spec::DeliverySemantics::AtMostOnce;
+    .delivery = conseqa::spec::DeliverySemantics::AtMostOnce;
 
     let verdict = ordering_verdict(&model, "operation.reserve_inventory", 0);
 
@@ -3643,7 +3643,7 @@ fn request_inputs_have_no_precedence_source() {
         .unwrap()
         .requirements
         .ordering
-        .push(archspec::spec::OrderingRequirement {
+        .push(conseqa::spec::OrderingRequirement {
             key: input_key("input.create_order.request", &["idempotency_key"]),
         });
 
@@ -3721,7 +3721,7 @@ fn a_global_topic_orders_any_key_through_a_single_lane() {
         .topics
         .get_mut(&id("topic.order_events"))
         .unwrap()
-        .ordering = archspec::spec::TopicOrdering::Global;
+        .ordering = conseqa::spec::TopicOrdering::Global;
 
     // by_topic_key has no key domain to route by on a global topic.
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
@@ -3741,7 +3741,7 @@ fn a_global_topic_orders_any_key_through_a_single_lane() {
         "input.apply_payment.captured",
     )
     .dispatch
-    .routing = archspec::spec::DispatchRouting::SingleLane;
+    .routing = conseqa::spec::DispatchRouting::SingleLane;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
@@ -3768,7 +3768,7 @@ fn an_unordered_topic_provides_no_precedence() {
         .topics
         .get_mut(&id("topic.order_events"))
         .unwrap()
-        .ordering = archspec::spec::TopicOrdering::Unordered;
+        .ordering = conseqa::spec::TopicOrdering::Unordered;
 
     let verdict = ordering_verdict(&model, "operation.apply_payment", 0);
 
@@ -3779,7 +3779,7 @@ fn an_unordered_topic_provides_no_precedence() {
                 if obstacles.iter().any(|obstacle| matches!(
                     obstacle,
                     verification::OrderingObstacle::TopicOrderingProvidesNoPrecedence {
-                        declared: archspec::spec::TopicOrdering::Unordered,
+                        declared: conseqa::spec::TopicOrdering::Unordered,
                         ..
                     }
                 ))
@@ -3820,11 +3820,11 @@ fn duplicate_delivery_without_a_keyed_requirement_is_noted() {
     );
 
     assert!(report.diagnostics().iter().any(|diagnostic| {
-        diagnostic.severity == archspec::analyzer::Severity::Warning
+        diagnostic.severity == conseqa::analyzer::Severity::Warning
             && matches!(
                 diagnostic.code,
-                archspec::analyzer::DiagnosticCode::Verification(
-                    archspec::analyzer::VerificationCode::DuplicateDeliveryUnchecked
+                conseqa::analyzer::DiagnosticCode::Verification(
+                    conseqa::analyzer::VerificationCode::DuplicateDeliveryUnchecked
                 )
             )
     }));
@@ -3863,7 +3863,7 @@ fn consumer_checks_record_producer_lineage() {
     );
 
     // Without the declaration the identity rests on the topic alone.
-    let archspec::spec::Effect::Publication(publication) = model
+    let conseqa::spec::Effect::Publication(publication) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()

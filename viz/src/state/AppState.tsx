@@ -68,7 +68,7 @@ interface AppState {
 
 const Context = createContext<AppState | null>(null);
 
-const THEME_KEY = "archspec-viz-theme";
+const THEME_KEY = "conseqa-viz-theme";
 
 function initialTheme(): Theme {
   const stored = window.localStorage.getItem(THEME_KEY);
@@ -81,7 +81,7 @@ export interface AppStateProviderProps {
   /**
    * Colour mode, when a host owns it.
    *
-   * The self-contained page `archspec-viz` writes has no host, so the
+   * The self-contained page `conseqa-viz` writes has no host, so the
    * app manages the mode itself: it restores the stored choice, sets
    * `data-mode` on the document, and offers a toggle. Embedded in an
    * application that has a colour mode of its own, that would be a
@@ -143,7 +143,7 @@ export function AppStateProvider({ data, theme: hostTheme, children }: AppStateP
   }, [ownTheme, themeControllable]);
 
   useEffect(() => {
-    document.title = `${data.title} · archspec`;
+    document.title = `${data.title} · conseqa`;
   }, [data.title]);
 
   const setTheme = useCallback(

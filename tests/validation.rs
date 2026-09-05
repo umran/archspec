@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use archspec::{
+use conseqa::{
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
@@ -274,7 +274,7 @@ fn rejects_publication_schema_not_carried_by_topic() {
         .get_mut(&id("effect.cancel_order.publish_cancelled"))
         .unwrap();
 
-    let archspec::spec::Effect::Publication(publication) = effect else {
+    let conseqa::spec::Effect::Publication(publication) = effect else {
         panic!("expected publication effect");
     };
 
@@ -1663,7 +1663,7 @@ fn rejects_request_result_schema_that_does_not_exist() {
 fn rejects_external_result_schema_that_does_not_exist() {
     let mut model = load_flash_checkout();
 
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -1720,7 +1720,7 @@ fn rejects_a_result_binding_on_a_publication() {
 fn rejects_a_result_binding_on_an_external_effect_without_a_contract() {
     let mut model = load_flash_checkout();
 
-    let Some(archspec::spec::Effect::External(card)) = model
+    let Some(conseqa::spec::Effect::External(card)) = model
         .operations
         .get_mut(&id("operation.charge_payment"))
         .unwrap()
@@ -2450,7 +2450,7 @@ fn intent_execution_evaluates_the_effect_declarations_roots() {
         .get_mut(&id("transition.order.mark_paid"))
         .unwrap();
 
-    let archspec::spec::TransitionSideEffect::Publication(paid) = transition
+    let conseqa::spec::TransitionSideEffect::Publication(paid) = transition
         .side_effects
         .get_mut(&id("effect.order.paid"))
         .unwrap()
@@ -2459,14 +2459,14 @@ fn intent_execution_evaluates_the_effect_declarations_roots() {
     };
 
     paid.idempotency_key_propagation
-        .push(archspec::spec::IdempotencyKeyPropagation {
-            source: archspec::spec::IdempotencyKey {
+        .push(conseqa::spec::IdempotencyKeyPropagation {
+            source: conseqa::spec::IdempotencyKey {
                 components: vec![ValueRef {
                     source: ValueSource::TransactionOutput(id("output.apply_payment.receipt")),
                     path: path(&["order_id"]),
                 }],
             },
-            target: archspec::spec::IdempotencyKey {
+            target: conseqa::spec::IdempotencyKey {
                 components: vec![ValueRef {
                     source: ValueSource::Effect(id("effect.order.paid")),
                     path: path(&["event_id"]),
@@ -2517,7 +2517,7 @@ fn a_nested_match_keeps_the_enclosing_arms_variant_selection() {
 
     matched.ok.steps.insert(
         0,
-        OperationStep::MatchResult(archspec::spec::MatchResult {
+        OperationStep::MatchResult(conseqa::spec::MatchResult {
             result: id("result.charge_payment.card"),
             ok: OperationBlock::default(),
             err: OperationBlock::default(),

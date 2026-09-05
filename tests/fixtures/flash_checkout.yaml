@@ -775,7 +775,7 @@ operations:
         # rows as separate steps in program order with no acquisition
         # order between them, so a concurrent transfer in the opposite
         # direction may deadlock. The DSL cannot yet say otherwise and
-        # no checker yet looks (ARCHSPEC_DSL_SEMANTICS.md §27,
+        # no checker yet looks (CONSEQA_DSL_SEMANTICS.md §27,
         # questions 8 and 9).
         - kind: lock
           target:

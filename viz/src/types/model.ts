@@ -1,4 +1,4 @@
-// TypeScript mirror of the serialized `archspec::spec::Model`. Shapes
+// TypeScript mirror of the serialized `conseqa::spec::Model`. Shapes
 // follow the serde conventions in `src/spec/`: internally tagged enums
 // carry `kind`, maps are plain objects keyed by id.
 

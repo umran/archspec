@@ -1,4 +1,4 @@
-// Mirror of `archspec::analyzer::report`: the obligation report.
+// Mirror of `conseqa::analyzer::report`: the obligation report.
 
 import type { Id } from "./model";
 

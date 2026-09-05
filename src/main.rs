@@ -1,4 +1,4 @@
-//! archspec: validates an Archspec model and verifies its declared
+//! conseqa: validates an Conseqa model and verifies its declared
 //! requirements.
 //!
 //! Validation errors are fatal: verification is meaningful only over a
@@ -6,12 +6,12 @@
 //! unproven obligations are reported as notes with the checker's
 //! evidence, never as errors — and the full obligation report, with
 //! proofs rendered as the facts they rely on, can be written as JSON
-//! for tooling such as archspec-viz.
+//! for tooling such as conseqa-viz.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use archspec::analyzer::{self, Diagnostic, Severity, report};
+use conseqa::analyzer::{self, Diagnostic, Severity, report};
 
 struct Args {
     model: PathBuf,
@@ -19,14 +19,14 @@ struct Args {
 }
 
 const USAGE: &str = "\
-archspec — validate and verify an Archspec model
+conseqa — validate and verify an Conseqa model
 
 USAGE:
-    archspec <MODEL.yaml> [OPTIONS]
+    conseqa <MODEL.yaml> [OPTIONS]
 
 OPTIONS:
     --report <PATH>    Write the obligation report (JSON), consumable
-                       by archspec-viz --report.
+                       by conseqa-viz --report.
     -h, --help         Show this help.
 ";
 
@@ -53,7 +53,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     let source = std::fs::read_to_string(&args.model)
         .map_err(|error| format!("cannot read {}: {error}", args.model.display()))?;
 
-    let model = archspec::parser::yaml::parse(&source)
+    let model = conseqa::parser::yaml::parse(&source)
         .map_err(|error| format!("cannot parse {}: {error}", args.model.display()))?;
 
     let errors = analyzer::validate(&model);

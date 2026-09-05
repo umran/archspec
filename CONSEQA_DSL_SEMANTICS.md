@@ -1,15 +1,15 @@
-# Archspec DSL Semantics
+# Conseqa DSL Semantics
 
 **Status:** Normative semantic contract for the DSL and the V1 verifiers — the single authoritative semantics document. The design drafts and revision documents that preceded it are retired; their normative content is consolidated here, and what they left open is §27.  
 **Implementation namespace:** `src/spec/` (surface), `src/analyzer/` (validation and verification).
 
-This document defines what an Archspec declaration means, what it does **not** mean, and what a verifier may soundly infer from it. It is intentionally stricter than a field reference: the purpose is to prevent the analyzer, an LLM author, and a human reader from silently assigning different meanings to the same declaration.
+This document defines what an Conseqa declaration means, what it does **not** mean, and what a verifier may soundly infer from it. It is intentionally stricter than a field reference: the purpose is to prevent the analyzer, an LLM author, and a human reader from silently assigning different meanings to the same declaration.
 
 ---
 
 ## 1. Interpretation model
 
-Archspec describes a **logical architecture**, not a deployment manifest and not executable code.
+Conseqa describes a **logical architecture**, not a deployment manifest and not executable code.
 
 A declaration belongs to one of three semantic categories:
 
@@ -50,7 +50,7 @@ Even these declarations describe guarantees, not necessarily observed runtime be
 
 ### 1.3 Requirements are conditional on model conformance
 
-Any proof produced by Archspec is conditional on the real implementation satisfying the declarations used by the proof. A proof based on `serializable`, deterministic provenance, or `deduplicated_by`, for example, is invalid if the concrete implementation does not actually provide those semantics.
+Any proof produced by Conseqa is conditional on the real implementation satisfying the declarations used by the proof. A proof based on `serializable`, deterministic provenance, or `deduplicated_by`, for example, is invalid if the concrete implementation does not actually provide those semantics.
 
 ### 1.4 Canonical form and shorthand
 
@@ -94,7 +94,7 @@ The current DSL assigns no ordering, compatibility, migration, or version-negoti
 
 `Id` is a logical identifier, serialized as a string.
 
-Archspec uses one common ID type rather than entity-specific Rust ID types. The semantic kind of a reference is determined by context and structural validation.
+Conseqa uses one common ID type rather than entity-specific Rust ID types. The semantic kind of a reference is determined by context and structural validation.
 
 IDs should be treated as stable logical names, not as runtime addresses, URLs, database keys, or deployment identifiers unless a higher layer explicitly gives them that meaning.
 
@@ -288,7 +288,7 @@ Object identity is what selector precision, insert uniqueness, alias and interfe
 
 A `DataObject` declares no requirements; in particular, no object-history requirement (such as a `linearizable` obligation) exists in the active DSL.
 
-The reason is scope, not doubt about the property. Linearizability is a meaningful correctness property even for a single logical store, but an object-history requirement becomes provable only once the model exposes the facts it rests on — replica topology, authoritative write location, read routing, quorum and leader guarantees, propagation lag, partition and failure assumptions, real-time observation boundaries — and Archspec does not yet model any of them. Keeping the requirement would have introduced an object-history proof domain with nothing to discharge it from.
+The reason is scope, not doubt about the property. Linearizability is a meaningful correctness property even for a single logical store, but an object-history requirement becomes provable only once the model exposes the facts it rests on — replica topology, authoritative write location, read routing, quorum and leader guarantees, propagation lag, partition and failure assumptions, real-time observation boundaries — and Conseqa does not yet model any of them. Keeping the requirement would have introduced an object-history proof domain with nothing to discharge it from.
 
 Nothing else is weakened by the removal:
 
@@ -298,9 +298,9 @@ Nothing else is weakened by the removal:
 
 The scope rule for this iteration is:
 
-> Archspec models transaction and operation correctness without declaring end-to-end persistent-object history consistency requirements.
+> Conseqa models transaction and operation correctness without declaring end-to-end persistent-object history consistency requirements.
 
-Object-history requirements are to be reconsidered, as a coherent family rather than an isolated flag, when Archspec begins modeling distributed persistence and availability. Their exact vocabulary is not predeclared here.
+Object-history requirements are to be reconsidered, as a coherent family rather than an isolated flag, when Conseqa begins modeling distributed persistence and availability. Their exact vocabulary is not predeclared here.
 
 ---
 
@@ -494,7 +494,7 @@ result:
     disposition: unspecified
 ```
 
-`ResultType { ok, err }` names the `Ok` schema and the `Err` contract — `ErrorResultType { schema, disposition }`. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Archspec models the algebraic outcome, not any language's API around it. A bare schema id is accepted as shorthand for the `Err` contract and means `disposition: unspecified`; because `unspecified` is epistemic, no shorthand or default may silently declare `terminal` or `retryable`, and canonical serialization always emits the disposition.
+`ResultType { ok, err }` names the `Ok` schema and the `Err` contract — `ErrorResultType { schema, disposition }`. The result is a tagged sum holding exactly one of `Ok(ok_payload)` or `Err(err_payload)`; mutual exclusivity is structural. Conseqa models the algebraic outcome, not any language's API around it. A bare schema id is accepted as shorthand for the `Err` contract and means `disposition: unspecified`; because `unspecified` is epistemic, no shorthand or default may silently declare `terminal` or `retryable`, and canonical serialization always emits the disposition.
 
 The contract belongs to the input rather than to the operation. An operation may expose several request inputs, and a `RequestEffect` already targets one specific `operation + input`, from which it inherits this contract (§13.2). Subscription inputs have no synchronous result.
 
@@ -505,7 +505,7 @@ The contract belongs to the input rather than to the operation. An operation may
 The disposition declares whether observing the contract's `Err` terminally resolves the **logical interaction** — one logical request, or one logical external execution — or conclusively ends only the observing attempt:
 
 - `terminal` — observing this `Err` terminally resolves the logical interaction with the declared error payload.
-- `retryable` — observing this `Err` conclusively ends the current attempt but does not terminally resolve the logical interaction; another attempt is **semantically admitted**. It does not say a retry occurs, is guaranteed, succeeds, returns a different result, or happens promptly — those are execution semantics Archspec does not model here, and V1 deliberately introduces no retry policy, loop, attempt count, or backoff.
+- `retryable` — observing this `Err` conclusively ends the current attempt but does not terminally resolve the logical interaction; another attempt is **semantically admitted**. It does not say a retry occurs, is guaranteed, succeeds, returns a different result, or happens promptly — those are execution semantics Conseqa does not model here, and V1 deliberately introduces no retry policy, loop, attempt count, or backoff.
 - `unspecified` — no usable fact. Nothing about terminality or retryability may be inferred (§1.1).
 
 `Ok` is terminal by definition; no `Ok` disposition exists. A retryable `Err` remains a *logical, conclusive* outcome of its attempt — the distinction from crashes and timeouts above is untouched.
@@ -767,7 +767,7 @@ V1 discharges this by **same-path continuation**: for every admitted path — on
 
 This is a sufficient route and deliberately does not prejudge which other paths a resumed attempt may take (§27 question 7). A program with no path admitted for the triggering input cannot make progress for it, and the obligation is unproven — the deliberate asymmetry with idempotency, for which the same shape is vacuous.
 
-`resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Archspec does not model.
+`resumable` does **not** oblige the architecture to actually re-drive the invocation. It is the right declaration when the retry driver lies outside the model — most commonly a request input whose caller Conseqa does not model.
 
 ### `completion: guaranteed`
 
@@ -1046,7 +1046,7 @@ A duplicate execution of a request effect invokes the target again, and nothing 
 
 ## 13.3 External effect
 
-An external effect marks a boundary beyond which Archspec does not inspect implementation structure.
+An external effect marks a boundary beyond which Conseqa does not inspect implementation structure.
 
 `name` is descriptive.
 
@@ -1079,7 +1079,7 @@ Duplicate-work collapse and terminal-result stability are two consequences of th
 
 ### `ExternalEffect.result`
 
-Because Archspec cannot inspect beyond the boundary, an external effect may declare the synchronous result the boundary returns:
+Because Conseqa cannot inspect beyond the boundary, an external effect may declare the synchronous result the boundary returns:
 
 ```yaml
 result:
@@ -2040,7 +2040,7 @@ The solver must preserve these distinctions:
 
 ---
 
-## 25. What a successful Archspec proof means
+## 25. What a successful Conseqa proof means
 
 A successful proof should be read as:
 
@@ -2050,7 +2050,7 @@ It should **not** be read as:
 
 > The implementation is universally correct.
 
-Archspec proves selected application-level properties over a declared abstraction. Its strength comes from making the abstraction explicit and forcing correctness arguments to state which facts they depend on.
+Conseqa proves selected application-level properties over a declared abstraction. Its strength comes from making the abstraction explicit and forcing correctness arguments to state which facts they depend on.
 
 ---
 
@@ -2118,7 +2118,7 @@ What the DSL deliberately does not yet decide. Every entry is scoped so that res
 ### Deferred surfaces
 
 - **Loops.** The program is acyclic (§7). Iteration requires semantics for iteration identity, repeated transaction artifacts, repeated effect-result bindings, effect multiplicity, termination, ordering between iterations, recovery from partial iteration progress, and bounded analyzer state; none are defined. The expressivity the program model was built to solve is branching and intermediate observations, not iteration.
-- **Object-history requirements.** No object-level history requirement (such as linearizability) exists; §5 states the scope rule and what its absence does not weaken. To be reconsidered as a coherent family when Archspec models distributed persistence and availability.
+- **Object-history requirements.** No object-level history requirement (such as linearizability) exists; §5 states the scope rule and what its absence does not weaken. To be reconsidered as a coherent family when Conseqa models distributed persistence and availability.
 - **Process completion.** Recoverability's `guaranteed` obliges one operation to reach its terminal. That a multi-operation process — a saga across the trigger graph — reaches its end state is a distinct liveness property with no declaration; it needs new surface (the trigger graph is its natural consumer), not a stronger reading of `guaranteed`.
 - **Retry execution.** `ErrorDisposition::retryable` states that another attempt is semantically admitted (§8.1); nothing models the mechanism that performs one — no retry policy, loop, attempt count, backoff, or timeout. A retry-execution revision may consume the disposition.
 - **Performance overlay.** The correctness vocabulary deliberately exposes distinctions a future probabilistic layer could consume — terminal versus retryable outcomes, attempt populations, concurrency bounds — but no performance semantics exist in the model.
