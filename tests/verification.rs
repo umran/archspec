@@ -20,16 +20,16 @@ use conseqa::{
     },
     parser::yaml,
     spec::{
-        Arm, Branch, CompletionRequirement, Condition, Derivation, DispatchRouting,
+        Arm, Branch, CompletionRequirement, Condition, Derivation, DispatchRouting, Effect,
         ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
         ExternalEffect, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey,
         IdempotencyRequirement, Input, LaneConcurrency, Literal, MatchResult, MessageIdentity,
         MessageSelector, Model, ObjectSelector, OperationBlock, OperationConcurrency,
         OperationStep, RecoverabilityRequirement, RequestIdentity, RequestInput, ResultOutcome,
-        ResultReplayRequirement, ResultType, ResultVariant, Return, RunTransaction, Schema,
-        SchemaFragment, SelectorPredicate, SelectorValue, SerializationRequirement,
-        SubscriptionInput, TopicOrdering, Transaction, TransactionIsolation, TransactionOutput,
-        TransactionStep, ValueRef, ValueSource, Write,
+        ResultReplayRequirement, ResultType, ResultVariant, Return, Schema, SchemaFragment,
+        SelectorPredicate, SelectorValue, SerializationRequirement, SubscriptionInput,
+        TopicOrdering, Transaction, TransactionIsolation, TransactionStep, ValueRef, ValueSource,
+        Write,
     },
 };
 
@@ -52,17 +52,31 @@ fn program_mut<'a>(model: &'a mut Model, operation: &str) -> &'a mut OperationBl
     &mut model.operations.get_mut(&id(operation)).unwrap().program
 }
 
-fn run(transaction: &str) -> OperationStep {
-    OperationStep::Transaction(RunTransaction {
-        transaction: id(transaction),
-    })
+/// Mutable access to an operation's inline transaction, wherever it
+/// sits in the program.
+fn transaction_mut<'a>(
+    model: &'a mut Model,
+    operation: &str,
+    transaction: &str,
+) -> &'a mut Transaction {
+    program_mut(model, operation)
+        .transaction_mut(&id(transaction))
+        .unwrap_or_else(|| {
+            panic!("`{operation}` should declare inline transaction `{transaction}`")
+        })
 }
 
-fn execute(effect: &str, values: Derivation, result: Option<&str>) -> OperationStep {
+fn execute(
+    effect_id: &str,
+    effect: Effect,
+    values: Derivation,
+    bind: Option<&str>,
+) -> OperationStep {
     OperationStep::ExecuteEffect(ExecuteEffect {
-        effect: id(effect),
+        effect_id: id(effect_id),
+        effect,
         values,
-        result: result.map(id),
+        bind: bind.map(id),
     })
 }
 
@@ -118,9 +132,25 @@ fn linearize_charge_payment(model: &mut Model) {
         panic!("expected the card charge");
     };
 
-    card.result = None;
+    card.bind = None;
 
     program.steps.extend(matched.ok.steps);
+}
+
+/// Mutable access to the card charge's inline external contract, which
+/// lives at the first step of charge_payment's program.
+fn charge_card_mut(model: &mut Model) -> &mut ExternalEffect {
+    let OperationStep::ExecuteEffect(step) =
+        &mut program_mut(model, "operation.charge_payment").steps[0]
+    else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    let Effect::External(card) = &mut step.effect else {
+        panic!("card charge should be an external effect");
+    };
+
+    card
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -779,13 +809,7 @@ fn unavailable_result_root(verdict: &ResultReplayVerdict) -> (&Vec<ReplayGap>, &
 }
 
 fn create_order_transaction(model: &mut Model) -> &mut Transaction {
-    model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap()
+    transaction_mut(model, "operation.create_order", "tx.create_order.new")
 }
 
 /// Replaces create_order's transaction body with a naturally
@@ -815,7 +839,8 @@ fn make_create_order_natural(model: &mut Model) {
             ]),
         }),
         TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
-            output: id("output.create_order"),
+            bind: id("output.create_order"),
+            schema: id("schema.CreateOrderResponse"),
             values: deterministic(vec![input_key("input.create_order.request", &["order_id"])]),
         }),
     ];
@@ -1059,23 +1084,17 @@ fn identified_payload_stabilizes_commit_key() {
 fn chained_artifact_recovery_is_class_fixed() {
     let mut model = load_flash_checkout();
 
-    // A second keyed transaction whose commit key is a field of the
-    // first transaction's recovered result.
+    // A second keyed inline transaction whose commit key is a field of
+    // the first transaction's recovered result.
     let operation = model
         .operations
         .get_mut(&id("operation.create_order"))
         .unwrap();
 
-    operation.transaction_outputs.insert(
-        id("output.create_order.receipt"),
-        TransactionOutput {
-            schema: id("schema.CreateOrderResponse"),
-        },
-    );
-
-    operation.transactions.insert(
-        id("tx.create_order.receipt"),
-        Transaction {
+    operation.program.steps.insert(
+        1,
+        OperationStep::Transaction(Transaction {
+            id: id("tx.create_order.receipt"),
             data_model: None,
             isolation: TransactionIsolation::Unspecified,
             idempotency: IdempotencyGuarantee::DeduplicatedBy {
@@ -1085,20 +1104,16 @@ fn chained_artifact_recovery_is_class_fixed() {
             },
             steps: vec![TransactionStep::EstablishTransactionOutput(
                 EstablishTransactionOutput {
-                    output: id("output.create_order.receipt"),
+                    bind: id("output.create_order.receipt"),
+                    schema: id("schema.CreateOrderResponse"),
                     values: deterministic(vec![input_key(
                         "input.create_order.request",
                         &["order_id"],
                     )]),
                 },
             )],
-        },
+        }),
     );
-
-    operation
-        .program
-        .steps
-        .insert(1, run("tx.create_order.receipt"));
 
     operation.program.steps[3] = return_ok(
         "input.create_order.request",
@@ -1213,32 +1228,23 @@ fn governing_key_mixing_sources_is_inadmissible() {
 fn read_dependent_result_is_not_reconstructible() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.transfer_stock"),
-        TransactionOutput {
-            schema: id("schema.TransferStockResponse"),
-        },
-    );
-
-    operation
-        .transactions
-        .get_mut(&id("tx.transfer_stock"))
-        .unwrap()
+    transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock")
         .steps
         .push(TransactionStep::EstablishTransactionOutput(
             EstablishTransactionOutput {
-                output: id("output.transfer_stock"),
+                bind: id("output.transfer_stock"),
+                schema: id("schema.TransferStockResponse"),
                 values: deterministic(vec![ValueRef {
                     source: ValueSource::TransactionRead(id("read.transfer_stock.source_stock")),
                     path: path(&["on_hand"]),
                 }]),
             },
         ));
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
 
     operation.program.steps[1] = return_ok(
         "input.transfer_stock.request",
@@ -1310,7 +1316,10 @@ fn output_never_established_is_conservatively_unproven() {
 }
 
 /// Wraps create_order's whole program in a branch on the request's
-/// `amount`, both arms running the same steps.
+/// `amount`: the original steps become the `then` arm, and the
+/// `otherwise` arm returns directly from the governing key — inline
+/// declarations are single-producer, so the arms cannot run the same
+/// steps.
 fn branch_create_order_on_amount(model: &mut Model, condition: Condition) {
     let program = program_mut(model, "operation.create_order");
 
@@ -1318,8 +1327,14 @@ fn branch_create_order_on_amount(model: &mut Model, condition: Condition) {
 
     program.steps = vec![OperationStep::Branch(Branch {
         condition,
-        then: block(steps.clone()),
-        otherwise: Some(block(steps)),
+        then: block(steps),
+        otherwise: Some(block(vec![return_ok(
+            "input.create_order.request",
+            deterministic(vec![input_key(
+                "input.create_order.request",
+                &["idempotency_key"],
+            )]),
+        )])),
     })];
 }
 
@@ -1448,18 +1463,14 @@ fn forward_transfer_to_create_order(model: &mut Model) {
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    operation.effects.insert(
-        id("effect.transfer_stock.forward"),
-        request_effect(
-            "operation.create_order",
-            "input.create_order.request",
-            "schema.CreateOrderRequest",
-        ),
-    );
-
     operation.program.steps = vec![
         execute(
             "effect.transfer_stock.forward",
+            request_effect(
+                "operation.create_order",
+                "input.create_order.request",
+                "schema.CreateOrderRequest",
+            ),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
             Some("result.transfer_stock.forward"),
         ),
@@ -1631,18 +1642,14 @@ fn cyclic_result_dependencies_prove_coinductively() {
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    transfer.effects.insert(
-        id("effect.transfer_stock.cancel"),
-        request_effect(
-            "operation.cancel_order",
-            "input.cancel_order.request",
-            "schema.CancelOrderRequest",
-        ),
-    );
-
     transfer.program.steps = vec![
         execute(
             "effect.transfer_stock.cancel",
+            request_effect(
+                "operation.cancel_order",
+                "input.cancel_order.request",
+                "schema.CancelOrderRequest",
+            ),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
             Some("result.transfer_stock.cancel"),
         ),
@@ -1678,18 +1685,14 @@ fn cyclic_result_dependencies_prove_coinductively() {
         .get_mut(&id("operation.cancel_order"))
         .unwrap();
 
-    cancel.effects.insert(
-        id("effect.cancel_order.transfer"),
-        request_effect(
-            "operation.transfer_stock",
-            "input.transfer_stock.request",
-            "schema.TransferStockRequest",
-        ),
-    );
-
     cancel.program.steps = vec![
         execute(
             "effect.cancel_order.transfer",
+            request_effect(
+                "operation.transfer_stock",
+                "input.transfer_stock.request",
+                "schema.TransferStockRequest",
+            ),
             deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
             Some("result.cancel_order.transfer"),
         ),
@@ -2024,22 +2027,26 @@ fn inbound_repeatable_request_supplies_the_driver() {
         }
     );
 
-    model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .effects
+    // A modeled caller declares the repeatable request at an inline
+    // execution site.
+    program_mut(&mut model, "operation.transfer_stock")
+        .steps
         .insert(
-            id("effect.transfer_stock.create_order"),
-            conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
-                target: conseqa::spec::RequestTarget {
-                    operation: id("operation.create_order"),
-                    input: id("input.create_order.request"),
-                },
-                schema: id("schema.CreateOrderRequest"),
-                retry: conseqa::spec::RetrySemantics::MayRepeat,
-                idempotency_key_propagation: vec![],
-            }),
+            1,
+            execute(
+                "effect.transfer_stock.create_order",
+                conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+                    target: conseqa::spec::RequestTarget {
+                        operation: id("operation.create_order"),
+                        input: id("input.create_order.request"),
+                    },
+                    schema: id("schema.CreateOrderRequest"),
+                    retry: conseqa::spec::RetrySemantics::MayRepeat,
+                    idempotency_key_propagation: vec![],
+                }),
+                Derivation::Unspecified,
+                None,
+            ),
         );
 
     assert!(validation::validate(&model).is_empty());
@@ -2066,12 +2073,15 @@ fn inbound_repeatable_request_supplies_the_driver() {
 fn an_unestablished_intent_is_conservatively_unproven() {
     let mut model = load_flash_checkout();
 
-    create_order_transaction(&mut model)
+    // The intent executes ahead of the transaction that establishes
+    // it: its producer exists in the program, but no earlier step of
+    // the path establishes the binding.
+    program_mut(&mut model, "operation.create_order")
         .steps
-        .retain(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)));
+        .swap(0, 1);
 
-    // Validation now rejects an intent executed where no path
-    // establishes it; verification stays total on the shape.
+    // Validation rejects an intent executed where no path has
+    // established it; verification stays total on the shape.
     assert!(!validation::validate(&model).is_empty());
 
     let verdict = recoverability_verdict(&model, "operation.create_order", 0);
@@ -2398,15 +2408,7 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 
     // Declare the payment provider's own idempotency: the card charge
     // deduplicates by the propagated event id.
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
+    let card = charge_card_mut(&mut model);
 
     card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
         key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
@@ -2474,15 +2476,7 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 fn unstable_external_deduplication_key_is_an_obstacle() {
     let mut model = load_flash_checkout();
 
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
+    let card = charge_card_mut(&mut model);
 
     card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
         key: IdempotencyKey {
@@ -2512,15 +2506,7 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
 fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
     let mut model = load_flash_checkout();
 
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
+    let card = charge_card_mut(&mut model);
 
     card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
         key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
@@ -2578,26 +2564,22 @@ fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) 
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    operation.effects.insert(
-        id("effect.transfer_stock.charge"),
-        conseqa::spec::Effect::External(ExternalEffect {
-            name: "payments.charge".into(),
-            idempotency: IdempotencyGuarantee::DeduplicatedBy {
-                key: ikey("input.transfer_stock.request", &[&["sku"]]),
-            },
-            result: Some(ResultType {
-                ok: id("schema.ChargeAccepted"),
-                err: ErrorResultType {
-                    schema: id("schema.ChargeDeclined"),
-                    disposition,
-                },
-            }),
-        }),
-    );
-
     operation.program.steps = vec![
         execute(
             "effect.transfer_stock.charge",
+            conseqa::spec::Effect::External(ExternalEffect {
+                name: "payments.charge".into(),
+                idempotency: IdempotencyGuarantee::DeduplicatedBy {
+                    key: ikey("input.transfer_stock.request", &[&["sku"]]),
+                },
+                result: Some(ResultType {
+                    ok: id("schema.ChargeAccepted"),
+                    err: ErrorResultType {
+                        schema: id("schema.ChargeDeclined"),
+                        disposition,
+                    },
+                }),
+            }),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
             Some("result.transfer_stock.charge"),
         ),
@@ -2767,13 +2749,13 @@ fn an_undeduplicated_external_result_gains_no_stability() {
 
     charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
 
-    let Some(conseqa::spec::Effect::External(charge)) = model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.transfer_stock.charge"))
+    let OperationStep::ExecuteEffect(step) =
+        &mut program_mut(&mut model, "operation.transfer_stock").steps[0]
     else {
+        panic!("expected the charge execute_effect step");
+    };
+
+    let Effect::External(charge) = &mut step.effect else {
         panic!("the charge should be an external effect");
     };
 
@@ -2882,22 +2864,18 @@ fn request_discharge_needs_a_proven_target_through_the_fixpoint() {
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    operation.effects.insert(
-        id("effect.transfer_stock.forward"),
-        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
-            target: conseqa::spec::RequestTarget {
-                operation: id("operation.create_order"),
-                input: id("input.create_order.request"),
-            },
-            schema: id("schema.CreateOrderRequest"),
-            retry: conseqa::spec::RetrySemantics::MayRepeat,
-            idempotency_key_propagation: vec![],
-        }),
-    );
-
     operation.program.steps = vec![
         execute(
             "effect.transfer_stock.forward",
+            conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+                target: conseqa::spec::RequestTarget {
+                    operation: id("operation.create_order"),
+                    input: id("input.create_order.request"),
+                },
+                schema: id("schema.CreateOrderRequest"),
+                retry: conseqa::spec::RetrySemantics::MayRepeat,
+                idempotency_key_propagation: vec![],
+            }),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
             None,
         ),
@@ -2967,22 +2945,18 @@ fn cyclic_request_dependencies_prove_coinductively() {
         .get_mut(&id("operation.transfer_stock"))
         .unwrap();
 
-    transfer.effects.insert(
-        id("effect.transfer_stock.cancel"),
-        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
-            target: conseqa::spec::RequestTarget {
-                operation: id("operation.cancel_order"),
-                input: id("input.cancel_order.request"),
-            },
-            schema: id("schema.CancelOrderRequest"),
-            retry: conseqa::spec::RetrySemantics::Unspecified,
-            idempotency_key_propagation: vec![],
-        }),
-    );
-
     transfer.program.steps = vec![
         execute(
             "effect.transfer_stock.cancel",
+            conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+                target: conseqa::spec::RequestTarget {
+                    operation: id("operation.cancel_order"),
+                    input: id("input.cancel_order.request"),
+                },
+                schema: id("schema.CancelOrderRequest"),
+                retry: conseqa::spec::RetrySemantics::Unspecified,
+                idempotency_key_propagation: vec![],
+            }),
             deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
             None,
         ),
@@ -3002,22 +2976,18 @@ fn cyclic_request_dependencies_prove_coinductively() {
         .get_mut(&id("operation.cancel_order"))
         .unwrap();
 
-    cancel.effects.insert(
-        id("effect.cancel_order.transfer"),
-        conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
-            target: conseqa::spec::RequestTarget {
-                operation: id("operation.transfer_stock"),
-                input: id("input.transfer_stock.request"),
-            },
-            schema: id("schema.TransferStockRequest"),
-            retry: conseqa::spec::RetrySemantics::Unspecified,
-            idempotency_key_propagation: vec![],
-        }),
-    );
-
     cancel.program.steps = vec![
         execute(
             "effect.cancel_order.transfer",
+            conseqa::spec::Effect::Request(conseqa::spec::RequestEffect {
+                target: conseqa::spec::RequestTarget {
+                    operation: id("operation.transfer_stock"),
+                    input: id("input.transfer_stock.request"),
+                },
+                schema: id("schema.TransferStockRequest"),
+                retry: conseqa::spec::RetrySemantics::Unspecified,
+                idempotency_key_propagation: vec![],
+            }),
             deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
             None,
         ),
@@ -3058,11 +3028,13 @@ fn cyclic_request_dependencies_prove_coinductively() {
     // A member failing locally fails the cycle with it: with an
     // unspecified instance, cancel_order's request leg is unsafe, and
     // transfer_stock's target is no longer proven.
-    program_mut(&mut model, "operation.cancel_order").steps[0] = execute(
-        "effect.cancel_order.transfer",
-        Derivation::Unspecified,
-        None,
-    );
+    let OperationStep::ExecuteEffect(forward) =
+        &mut program_mut(&mut model, "operation.cancel_order").steps[0]
+    else {
+        panic!("expected the forwarded request");
+    };
+
+    forward.values = Derivation::Unspecified;
 
     let verdict = idempotency_verdict(&model, "operation.transfer_stock", 0);
 
@@ -3084,15 +3056,7 @@ fn publication_cascade_needs_collapsing_consumers_through_the_fixpoint() {
     // leg is its cascade: PaymentCaptured reaches apply_payment, whose
     // own requirement the fixpoint proves in its first round, so the
     // second round discharges the publication.
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
+    let card = charge_card_mut(&mut model);
 
     card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
         key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
@@ -3405,9 +3369,9 @@ fn no_admitted_path_is_vacuously_idempotent() {
 fn an_unstable_branch_decision_defeats_idempotency() {
     let mut model = load_flash_checkout();
 
-    // apply_payment branches on the captured amount, both arms doing
-    // the same work. The topic identity pins `amount`, so the decision
-    // replays and the proof records it.
+    // apply_payment branches on the captured amount, working in one
+    // arm and completing directly in the other. The topic identity
+    // pins `amount`, so the decision replays and the proof records it.
     let program = program_mut(&mut model, "operation.apply_payment");
 
     let steps = std::mem::take(&mut program.steps);
@@ -3417,8 +3381,8 @@ fn an_unstable_branch_decision_defeats_idempotency() {
             value: input_key("input.apply_payment.captured", &["amount"]),
             equals: SelectorValue::Literal(Literal::Int(0)),
         },
-        then: block(steps.clone()),
-        otherwise: Some(block(steps)),
+        then: block(steps),
+        otherwise: Some(block(vec![OperationStep::Complete])),
     })];
 
     assert!(validation::validate(&model).is_empty());
@@ -3863,14 +3827,17 @@ fn consumer_checks_record_producer_lineage() {
     );
 
     // Without the declaration the identity rests on the topic alone.
-    let conseqa::spec::Effect::Publication(publication) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.publish_captured"))
-        .unwrap()
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
     else {
+        panic!("expected the card match");
+    };
+
+    let OperationStep::ExecuteEffect(captured) = &mut matched.ok.steps[0] else {
+        panic!("expected the capture publication");
+    };
+
+    let Effect::Publication(publication) = &mut captured.effect else {
         panic!("publish_captured should be a publication");
     };
 
@@ -3902,14 +3869,8 @@ fn a_transition_without_keyed_recovery_is_unknown_not_invalid() {
     // guarantee; what it loses is every replay route, so the
     // obligations over it settle unproven with the missing facts
     // recorded — never as a validation error.
-    model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap()
-        .idempotency = IdempotencyGuarantee::NotDeduplicated;
+    transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment").idempotency =
+        IdempotencyGuarantee::NotDeduplicated;
 
     assert!(validation::validate(&model).is_empty());
 
@@ -3966,22 +3927,7 @@ fn a_transition_established_output_without_recovery_defeats_result_replay() {
     // the terminal returns: structurally valid, and the result-replay
     // obligation over it is unknown because the output is
     // replay-available by neither route.
-    let operation = model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.cancel_order"),
-        TransactionOutput {
-            schema: id("schema.CancelOrderResponse"),
-        },
-    );
-
-    let transaction = operation
-        .transactions
-        .get_mut(&id("tx.cancel_order"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
@@ -3989,10 +3935,16 @@ fn a_transition_established_output_without_recovery_defeats_result_replay() {
         .steps
         .push(TransactionStep::EstablishTransactionOutput(
             EstablishTransactionOutput {
-                output: id("output.cancel_order"),
+                bind: id("output.cancel_order"),
+                schema: id("schema.CancelOrderResponse"),
                 values: deterministic(vec![input_key("input.cancel_order.request", &["order_id"])]),
             },
         ));
+
+    let operation = model
+        .operations
+        .get_mut(&id("operation.cancel_order"))
+        .unwrap();
 
     operation.program.steps[2] = return_ok(
         "input.cancel_order.request",

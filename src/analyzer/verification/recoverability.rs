@@ -427,31 +427,29 @@ fn analyze_path(
                 // Cross-step consumption is judged against the
                 // context before this transaction; same-transaction
                 // references are exempt by atomicity.
-                if let Some(body) = analysis_transaction(analysis, transaction) {
-                    let mut established_here: BTreeSet<&Id> = BTreeSet::new();
+                let mut established_here: BTreeSet<&Id> = BTreeSet::new();
 
-                    for inner in &body.steps {
-                        for root in inner.roots() {
-                            let ValueSource::TransactionOutput(artifact) = &root.source else {
-                                continue;
-                            };
+                for inner in &transaction.steps {
+                    for root in inner.roots() {
+                        let ValueSource::TransactionOutput(artifact) = &root.source else {
+                            continue;
+                        };
 
-                            if !established_here.contains(artifact) {
-                                require_artifact(
-                                    &reference,
-                                    transaction,
-                                    artifact,
-                                    &context.artifacts,
-                                    &mut artifacts,
-                                    &mut reported,
-                                    obstacles,
-                                );
-                            }
+                        if !established_here.contains(artifact) {
+                            require_artifact(
+                                &reference,
+                                &transaction.id,
+                                artifact,
+                                &context.artifacts,
+                                &mut artifacts,
+                                &mut reported,
+                                obstacles,
+                            );
                         }
+                    }
 
-                        if let TransactionStep::EstablishTransactionOutput(establish) = inner {
-                            established_here.insert(&establish.output);
-                        }
+                    if let TransactionStep::EstablishTransactionOutput(establish) = inner {
+                        established_here.insert(&establish.bind);
                     }
                 }
 
@@ -464,7 +462,7 @@ fn analyze_path(
                         (Err(recovery), Err(reconstruction)) => {
                             obstacles.push(RecoverabilityObstacle::TransactionNotResolvable {
                                 path: reference.clone(),
-                                transaction: (*transaction).clone(),
+                                transaction: transaction.id.clone(),
                                 recovery: recovery.clone(),
                                 reconstruction: reconstruction.clone(),
                             });
@@ -475,13 +473,13 @@ fn analyze_path(
 
                     if let Some(resolution) = resolution {
                         transactions.push(TransactionResolution {
-                            transaction: (*transaction).clone(),
+                            transaction: transaction.id.clone(),
                             resolution,
                         });
                     }
                 } else {
                     transactions.push(TransactionResolution {
-                        transaction: (*transaction).clone(),
+                        transaction: transaction.id.clone(),
                         resolution: Resolution::TerminalStep,
                     });
                 }
@@ -558,14 +556,6 @@ fn analyze_path(
     })
 }
 
-/// The transaction body a traced step executed.
-fn analysis_transaction<'a>(
-    analysis: &ReplayAnalysis<'a>,
-    transaction: &Id,
-) -> Option<&'a crate::spec::Transaction> {
-    analysis.operation().transactions.get(transaction)
-}
-
 /// Records a consumed artifact's availability, or the obstacle
 /// explaining why the resumption cannot supply it. Each artifact is
 /// judged once per path.
@@ -630,7 +620,7 @@ fn find_driver(
 
         Some(Input::Request(_)) => {
             for (caller_id, caller) in &model.operations {
-                for (effect_id, effect) in &caller.effects {
+                for (effect_id, effect) in caller.program.effect_declarations() {
                     if let Effect::Request(request) = effect
                         && &request.target.operation == operation_id
                         && &request.target.input == input

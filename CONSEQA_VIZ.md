@@ -37,14 +37,17 @@ around them. Edges are the model's information routes:
 - client requests: clients → operation, for request inputs no modeled
   operation invokes
 
-A dashed edge is a *declared but unexecuted* capability: the effect
-exists on the operation but no step of its program executes it; a solid
-edge's detail names the program steps that do, by location. Effects owned
-by state-machine transitions are attributed to the operations that
-execute them through intents and marked "via transition". Click
-anything for a structured detail panel; double-click an operation to
-drill in. The top bar's filter box dims non-matching vertices, and a
-fit control in the canvas corner re-centres the graph.
+Operation-owned effects are derived directly from the program — its
+inline `execute_effect` sites and `establish_effect_intent` sites —
+never from a separate declaration inventory. A dashed edge is a
+*declared but unexecuted* effect: an established intent no program
+step executes; a solid edge's detail names the program steps that
+execute the effect, by location. Effects owned by state-machine
+transitions are attributed to the operations whose transactions bind
+them through transition applications and marked "via transition".
+Click anything for a structured detail panel; double-click an
+operation to drill in. The top bar's filter box dims non-matching
+vertices, and a fit control in the canvas corner re-centres the graph.
 
 **Operation view** (`#/op/<id>`). A page header (name, copyable id,
 description, and a fact strip: service, concurrency, transaction and
@@ -61,14 +64,15 @@ so there are no tabs and the route carries no query: `#/op/<id>` lands
 on it directly, and an old `?flow=` query is tolerated and ignored.
 The program is a Kumo `Flow` diagram: steps in order with connectors
 drawn between them, each card carrying its location as the checker
-names it (`3`, `3.ok.1` — one-based, arm-qualified). Transaction steps
-expand in place into their transaction's steps (reads, writes,
-inserts, deletes, locks, transitions, transaction-output and
-effect-intent establishments), each with its selector, provenance, and
-a full detail panel; execute-effect and execute-intent steps are
-badged with the effect's kind (publication, request, external) and,
-when they bind a result, with the binding's id and its `Result<Ok,
-Err>` schemas; `match_result` and `branch` cards show their arms side
+names it (`3`, `3.ok.1` — one-based, arm-qualified). Inline
+transaction steps carry their stable id and expand in place into their
+body (reads with their binds, writes, inserts, deletes, locks,
+transitions with their intent bindings, transaction-output and
+effect-intent binders), each with its selector, provenance, and a full
+detail panel; execute-effect steps carry their inline contract and,
+like execute-intent steps, are badged with the effect's kind
+(publication, request, external) and, when they bind a result, with
+the binding and its `Result<Ok, Err>` schemas; `match_result` and `branch` cards show their arms side
 by side — `ok` / `err`, or `then` / `otherwise` with the condition
 rendered as text — each arm a nested sequence of the same step cards;
 `return` cards name the request input and the variant and provenance
@@ -94,13 +98,15 @@ deep link or history navigation selects what the address bar names.
 ## Panels
 
 **Detail panel.** Every model entity — service, operation, topic,
-schema, data object, state machine, state, transition, input, effect,
-intent, transaction output, result binding, transaction, transaction
-step, program step, requirement, or graph edge — opens a detail panel
-organized into
-collapsible, counted sections (execution, inputs, declared effects,
-requirements, obligations, …) with key/value grids, typed badges, and
-clickable ids that open the referenced entity in place.
+schema, data object, state machine, state, transition, input, inline
+effect, intent binding, transaction-output binding, result binding,
+inline transaction, transaction step, program step, requirement, or
+graph edge — opens a detail panel organized into collapsible, counted
+sections (execution, inputs, inline effects, requirements,
+obligations, …) with key/value grids, typed badges, and clickable ids
+that open the referenced entity in place. The entities are resolved
+from the program, which is the source of truth for every
+operation-owned execution occurrence.
 
 **Top bar.** Model name and revision, breadcrumbs for the current
 page, the id filter on the system view, and — when a report is loaded

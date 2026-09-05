@@ -11,8 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Arm, Condition, Derivation, Id, OperationBlock, OperationStep, ResultOutcome, ResultVariant,
-    StepLocation,
+    Arm, Condition, Derivation, Effect, Id, OperationBlock, OperationStep, ResultOutcome,
+    ResultVariant, StepLocation, Transaction,
 };
 
 /// One path through the program: its linear steps in order and the
@@ -25,22 +25,24 @@ pub struct Path<'a> {
 
 #[derive(Debug, Clone)]
 pub enum PathStep<'a> {
+    /// The inline transaction declared and executed at this step.
     Transaction {
         location: StepLocation,
-        transaction: &'a Id,
+        transaction: &'a Transaction,
     },
 
     ExecuteEffect {
         location: StepLocation,
-        effect: &'a Id,
+        effect_id: &'a Id,
+        effect: &'a Effect,
         values: &'a Derivation,
-        result: Option<&'a Id>,
+        bind: Option<&'a Id>,
     },
 
     ExecuteEffectIntent {
         location: StepLocation,
         intent: &'a Id,
-        result: Option<&'a Id>,
+        bind: Option<&'a Id>,
     },
 
     /// The path takes one arm of a decision here.
@@ -190,10 +192,10 @@ fn walk<'a>(
 
         for mut prefix in open {
             match step {
-                OperationStep::Transaction(step) => {
+                OperationStep::Transaction(transaction) => {
                     prefix.push(PathStep::Transaction {
                         location: location.clone(),
-                        transaction: &step.transaction,
+                        transaction,
                     });
 
                     next.push(prefix);
@@ -202,9 +204,10 @@ fn walk<'a>(
                 OperationStep::ExecuteEffect(step) => {
                     prefix.push(PathStep::ExecuteEffect {
                         location: location.clone(),
+                        effect_id: &step.effect_id,
                         effect: &step.effect,
                         values: &step.values,
-                        result: step.result.as_ref(),
+                        bind: step.bind.as_ref(),
                     });
 
                     next.push(prefix);
@@ -214,7 +217,7 @@ fn walk<'a>(
                     prefix.push(PathStep::ExecuteEffectIntent {
                         location: location.clone(),
                         intent: &step.intent,
-                        result: step.result.as_ref(),
+                        bind: step.bind.as_ref(),
                     });
 
                     next.push(prefix);

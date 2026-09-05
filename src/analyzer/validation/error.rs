@@ -151,39 +151,13 @@ pub enum ValidationError {
         actual_object: Id,
     },
 
-    /// A `StateTransition` step's `effect_values` keys do not exactly
+    /// A `StateTransition` step's `effect_intents` keys do not exactly
     /// match the side effects declared by the applied transition.
-    TransitionEffectValuesMismatch {
+    TransitionEffectIntentsMismatch {
         transaction: Id,
         transition: Id,
         missing: Vec<Id>,
         unexpected: Vec<Id>,
-    },
-
-    /// A transition side effect is established implicitly by the
-    /// transition and must not be established explicitly.
-    TransitionEffectIntentExplicitlyEstablished {
-        transaction: Id,
-        intent: Id,
-        effect: Id,
-    },
-
-    /// An operation declares more than one effect intent for the same
-    /// transition side effect, leaving the implicitly established
-    /// artifact without a single logical identity.
-    AmbiguousTransitionEffectIntent {
-        operation: Id,
-        effect: Id,
-        intents: Vec<Id>,
-    },
-
-    /// An operation declares an effect intent for a transition side
-    /// effect, but applies no transition that could establish it.
-    UnestablishableTransitionEffectIntent {
-        operation: Id,
-        intent: Id,
-        effect: Id,
-        transition: Id,
     },
 
     EmptyObjectIdentity {
@@ -883,7 +857,7 @@ impl From<ValidationError> for Diagnostic {
                 }
             }
 
-            ValidationError::TransitionEffectValuesMismatch {
+            ValidationError::TransitionEffectIntentsMismatch {
                 transaction,
                 transition,
                 missing,
@@ -896,7 +870,8 @@ impl From<ValidationError> for Diagnostic {
                         subject: Some(effect.clone()),
                         message: format!(
                             "The transition declares side effect `{effect}`, \
-                             but the step provides no value derivation for it."
+                             but the step provides no intent binding and value \
+                             derivation for it."
                         ),
                     });
                 }
@@ -905,7 +880,7 @@ impl From<ValidationError> for Diagnostic {
                     evidence.push(Evidence {
                         subject: Some(effect.clone()),
                         message: format!(
-                            "The step provides a value derivation for \
+                            "The step provides an intent binding for \
                              `{effect}`, which is not a side effect declared \
                              by transition `{transition}`."
                         ),
@@ -914,97 +889,16 @@ impl From<ValidationError> for Diagnostic {
 
                 Diagnostic {
                     code: DiagnosticCode::Validation(
-                        ValidationCode::TransitionEffectValuesMismatch,
+                        ValidationCode::TransitionEffectIntentsMismatch,
                     ),
                     severity: Severity::Error,
                     subject: Some(transaction.clone()),
                     message: format!(
                         "Transaction `{transaction}` applies transition \
-                         `{transition}` with `effect_values` that do not \
+                         `{transition}` with `effect_intents` that do not \
                          exactly match the transition's declared side effects."
                     ),
                     evidence,
-                }
-            }
-
-            ValidationError::TransitionEffectIntentExplicitlyEstablished {
-                transaction,
-                intent,
-                effect,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::TransitionEffectIntentExplicitlyEstablished,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(transaction),
-                    message: format!(
-                        "Transaction establishes effect intent `{intent}`, but its \
-                         effect `{effect}` is a transition side effect."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(effect),
-                        message:
-                            "A transition side effect is established implicitly by a successful transition, not by an explicit establishment step."
-                                .to_string(),
-                    }],
-                }
-            }
-
-            ValidationError::AmbiguousTransitionEffectIntent {
-                operation,
-                effect,
-                intents,
-            } => {
-                let evidence = intents
-                    .iter()
-                    .map(|intent| Evidence {
-                        subject: Some(intent.clone()),
-                        message: format!(
-                            "`{intent}` claims the intent established by this \
-                             transition side effect."
-                        ),
-                    })
-                    .collect();
-
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::AmbiguousTransitionEffectIntent,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(operation.clone()),
-                    message: format!(
-                        "Operation `{operation}` declares more than one effect \
-                         intent for transition side effect `{effect}`."
-                    ),
-                    evidence,
-                }
-            }
-
-            ValidationError::UnestablishableTransitionEffectIntent {
-                operation,
-                intent,
-                effect,
-                transition,
-            } => {
-                Diagnostic {
-                    code: DiagnosticCode::Validation(
-                        ValidationCode::UnestablishableTransitionEffectIntent,
-                    ),
-                    severity: Severity::Error,
-                    subject: Some(operation.clone()),
-                    message: format!(
-                        "Operation `{operation}` declares effect intent \
-                         `{intent}` for transition side effect `{effect}`, but \
-                         applies no transition that would establish it."
-                    ),
-                    evidence: vec![Evidence {
-                        subject: Some(transition.clone()),
-                        message: format!(
-                            "No transaction in `{operation}` applies transition \
-                             `{transition}`, which owns this side effect."
-                        ),
-                    }],
                 }
             }
 

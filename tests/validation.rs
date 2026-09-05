@@ -8,13 +8,12 @@ use conseqa::{
     analyzer::validation::{self, ProgramUse, ReferenceKind, ValidationError},
     parser::yaml,
     spec::{
-        Arm, Branch, Condition, Derivation, EffectIntent, EstablishEffectIntent,
-        EstablishTransactionOutput, ExecuteEffect, FieldPath, Id, IdempotencyGuarantee, Input,
-        Literal, MessageIdentity, MessageSelector, Model, OperationBlock, OperationStep,
-        RequestIdentity, ResultOutcome, ResultVariant, Return, RunTransaction, Schema,
-        SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation, TopicOrdering,
-        Transaction, TransactionIsolation, TransactionOutput, TransactionStep, ValueRef,
-        ValueSource,
+        Arm, Branch, Condition, Derivation, EstablishTransactionOutput, FieldPath, Id,
+        IdempotencyGuarantee, Input, Literal, MessageIdentity, MessageSelector, Model,
+        OperationBlock, OperationStep, RequestIdentity, ResultOutcome, ResultVariant, Return,
+        Schema, SchemaFragment, SelectorValue, StateTransition, StepHop, StepLocation,
+        TopicOrdering, Transaction, TransactionIsolation, TransactionStep, TransitionEffectIntent,
+        ValueRef, ValueSource,
     },
 };
 
@@ -49,16 +48,31 @@ fn program_mut<'a>(model: &'a mut Model, operation: &str) -> &'a mut OperationBl
     &mut model.operations.get_mut(&id(operation)).unwrap().program
 }
 
-fn run(transaction: &str) -> OperationStep {
-    OperationStep::Transaction(RunTransaction {
-        transaction: id(transaction),
-    })
+/// Mutable access to an operation's inline transaction, wherever it
+/// sits in the program.
+fn transaction_mut<'a>(
+    model: &'a mut Model,
+    operation: &str,
+    transaction: &str,
+) -> &'a mut Transaction {
+    program_mut(model, operation)
+        .transaction_mut(&id(transaction))
+        .unwrap_or_else(|| {
+            panic!("`{operation}` should declare inline transaction `{transaction}`")
+        })
 }
 
 fn return_ok(request: &str, values: Derivation) -> OperationStep {
     OperationStep::Return(Return {
         request: id(request),
         outcome: ResultOutcome::Ok { values },
+    })
+}
+
+fn return_err(request: &str, values: Derivation) -> OperationStep {
+    OperationStep::Return(Return {
+        request: id(request),
+        outcome: ResultOutcome::Err { values },
     })
 }
 
@@ -160,22 +174,91 @@ fn rejects_reference_with_wrong_kind() {
 }
 
 #[test]
-fn rejects_program_using_transaction_owned_by_another_operation() {
+fn rejects_duplicate_inline_transaction_ids() {
     let mut model = load_flash_checkout();
 
-    program_mut(&mut model, "operation.reserve_inventory").steps[0] = run("tx.create_order.new");
+    // A second inline declaration under an existing transaction ID:
+    // one inline transaction declaration is one occurrence, so two
+    // sites need two IDs.
+    program_mut(&mut model, "operation.transfer_stock")
+        .steps
+        .insert(
+            1,
+            OperationStep::Transaction(Transaction {
+                id: id("tx.transfer_stock"),
+                data_model: None,
+                isolation: TransactionIsolation::Unspecified,
+                idempotency: IdempotencyGuarantee::Unspecified,
+                steps: Vec::new(),
+            }),
+        );
 
     let errors = validation::validate(&model);
 
-    assert_eq!(
-        errors,
-        vec![ValidationError::InvalidReferenceOwner {
-            subject: id("operation.reserve_inventory"),
-            reference: id("tx.create_order.new"),
-            expected_owner: id("operation.reserve_inventory"),
-            actual_owner: Some(id("operation.create_order")),
-        }]
-    );
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("tx.transfer_stock")
+    ));
+}
+
+#[test]
+fn rejects_duplicate_inline_effect_ids() {
+    let mut model = load_flash_checkout();
+
+    // Two execution sites declaring one effect_id: distinct sites are
+    // distinct effect occurrences and need distinct IDs.
+    let program = program_mut(&mut model, "operation.charge_payment");
+
+    let first = program.steps[0].clone();
+
+    let OperationStep::ExecuteEffect(mut step) = first else {
+        panic!("expected the card charge");
+    };
+
+    step.bind = None;
+
+    program.steps.insert(0, OperationStep::ExecuteEffect(step));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("effect.charge_payment.card")
+    ));
+}
+
+#[test]
+fn rejects_duplicate_binding_ids() {
+    let mut model = load_flash_checkout();
+
+    // Two producers of one binding: a binding is single-producer, so a
+    // second output binder under the same name collides.
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order.new");
+
+    let TransactionStep::EstablishTransactionOutput(establish) = transaction.steps[2].clone()
+    else {
+        panic!("expected the output binder");
+    };
+
+    transaction
+        .steps
+        .push(TransactionStep::EstablishTransactionOutput(establish));
+
+    let errors = validation::validate(&model);
+
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("output.create_order")
+    ));
 }
 
 #[test]
@@ -264,17 +347,13 @@ fn rejects_subscription_message_not_carried_by_topic() {
 fn rejects_publication_schema_not_carried_by_topic() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
-    let effect = operation
-        .effects
-        .get_mut(&id("effect.cancel_order.publish_cancelled"))
-        .unwrap();
+    let TransactionStep::EstablishEffectIntent(establish) = &mut transaction.steps[1] else {
+        panic!("expected the intent establishment");
+    };
 
-    let conseqa::spec::Effect::Publication(publication) = effect else {
+    let conseqa::spec::Effect::Publication(publication) = &mut establish.effect else {
         panic!("expected publication effect");
     };
 
@@ -345,15 +424,7 @@ fn rejects_topic_key_for_schema_not_on_topic() {
 fn rejects_transaction_access_without_data_model() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.cancel_order"))
-        .unwrap();
-
-    transaction.data_model = None;
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").data_model = None;
 
     let errors = validation::validate(&model);
 
@@ -370,15 +441,8 @@ fn rejects_transaction_access_without_data_model() {
 fn rejects_transaction_access_outside_declared_data_model() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.cancel_order"))
-        .unwrap();
-
-    transaction.data_model = Some(id("data.inventory"));
+    transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order").data_model =
+        Some(id("data.inventory"));
 
     let errors = validation::validate(&model);
 
@@ -417,13 +481,7 @@ fn rejects_state_transition_with_wrong_subject_object() {
         .objects
         .insert(shadow_id.clone(), shadow);
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
     let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
         panic!("expected transition step");
@@ -501,14 +559,8 @@ fn transition_transactions_accept_any_idempotency_guarantee() {
     ] {
         let mut model = load_flash_checkout();
 
-        model
-            .operations
-            .get_mut(&id("operation.apply_payment"))
-            .unwrap()
-            .transactions
-            .get_mut(&id("tx.apply_payment"))
-            .unwrap()
-            .idempotency = idempotency;
+        transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment").idempotency =
+            idempotency;
 
         let errors = validation::validate(&model);
 
@@ -517,16 +569,10 @@ fn transition_transactions_accept_any_idempotency_guarantee() {
 }
 
 #[test]
-fn transition_effect_values_coverage_is_independent_of_the_guarantee() {
+fn transition_effect_intents_coverage_is_independent_of_the_guarantee() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
     transaction.idempotency = IdempotencyGuarantee::Unspecified;
 
@@ -534,13 +580,19 @@ fn transition_effect_values_coverage_is_independent_of_the_guarantee() {
         panic!("expected the mark_paid transition step");
     };
 
-    transition.effect_values.clear();
+    transition.effect_intents.clear();
+
+    // Clearing the map removes the binding's one producer, so the
+    // intent execution must go with it.
+    program_mut(&mut model, "operation.apply_payment")
+        .steps
+        .remove(1);
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransitionEffectValuesMismatch {
+        vec![ValidationError::TransitionEffectIntentsMismatch {
             transaction: id("tx.apply_payment"),
             transition: id("transition.order.mark_paid"),
             missing: vec![id("effect.order.paid")],
@@ -550,62 +602,70 @@ fn transition_effect_values_coverage_is_independent_of_the_guarantee() {
 }
 
 #[test]
-fn rejects_explicit_establishment_of_transition_effect_intent() {
+fn rejects_an_inline_effect_shadowing_a_transition_side_effect() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap();
+    // An explicit establishment whose effect_id collides with the
+    // transition-owned declaration: the ID belongs to the state
+    // machine's namespace, so the inline site is a duplicate — the
+    // application site is the only place a transition side effect's
+    // intent is bound.
+    let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
     transaction
         .steps
         .push(TransactionStep::EstablishEffectIntent(
-            EstablishEffectIntent {
-                intent: id("intent.apply_payment.order_paid"),
+            conseqa::spec::EstablishEffectIntent {
+                bind: id("intent.apply_payment.order_paid.shadow"),
+                effect_id: id("effect.order.paid"),
+                effect: conseqa::spec::Effect::Publication(conseqa::spec::PublicationEffect {
+                    topic: id("topic.order_events"),
+                    schema: id("schema.OrderPaid"),
+                    idempotency_key_propagation: vec![],
+                }),
                 values: Derivation::Unspecified,
             },
         ));
 
     let errors = validation::validate(&model);
 
-    assert_eq!(
-        errors,
-        vec![
-            ValidationError::TransitionEffectIntentExplicitlyEstablished {
-                transaction: id("tx.apply_payment"),
-                intent: id("intent.apply_payment.order_paid"),
-                effect: id("effect.order.paid"),
-            }
-        ]
-    );
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("effect.order.paid")
+    ));
 }
 
 #[test]
-fn rejects_direct_execution_of_transition_side_effect() {
+fn rejects_direct_execution_shadowing_a_transition_side_effect() {
     let mut model = load_flash_checkout();
 
+    // A direct execution site declaring the transition side effect's
+    // ID collides with the state-machine declaration: the effect stays
+    // transition-owned, executed only through its bound intent.
     program_mut(&mut model, "operation.apply_payment").steps[1] =
-        OperationStep::ExecuteEffect(ExecuteEffect {
-            effect: id("effect.order.paid"),
+        OperationStep::ExecuteEffect(conseqa::spec::ExecuteEffect {
+            effect_id: id("effect.order.paid"),
+            effect: conseqa::spec::Effect::Publication(conseqa::spec::PublicationEffect {
+                topic: id("topic.order_events"),
+                schema: id("schema.OrderPaid"),
+                idempotency_key_propagation: vec![],
+            }),
             values: Derivation::Unspecified,
-            result: None,
+            bind: None,
         });
 
     let errors = validation::validate(&model);
 
-    assert_eq!(
-        errors,
-        vec![ValidationError::InvalidReferenceOwner {
-            subject: id("operation.apply_payment"),
-            reference: id("effect.order.paid"),
-            expected_owner: id("operation.apply_payment"),
-            actual_owner: Some(id("transition.order.mark_paid")),
-        }]
-    );
+    assert_eq!(errors.len(), 1);
+
+    assert!(matches!(
+        &errors[0],
+        ValidationError::DuplicateId { id: duplicate, .. }
+            if duplicate == &id("effect.order.paid")
+    ));
 }
 
 #[test]
@@ -635,13 +695,7 @@ fn rejects_transaction_read_used_outside_a_transaction() {
 fn rejects_transaction_read_from_another_transaction() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.transfer_stock"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.transfer_stock"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.transfer_stock", "tx.transfer_stock");
 
     let TransactionStep::Write(write) = &mut transaction.steps[3] else {
         panic!("expected the source-warehouse write");
@@ -670,13 +724,11 @@ fn rejects_transaction_read_from_another_transaction() {
 fn rejects_transaction_read_referenced_before_the_read() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.reserve_inventory"))
-        .unwrap();
+    let transaction = transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
 
     // Move the mutation ahead of the read it derives its values from.
     transaction.steps.swap(0, 1);
@@ -696,13 +748,11 @@ fn rejects_transaction_read_referenced_before_the_read() {
 fn rejects_reference_to_field_the_read_did_not_select() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.reserve_inventory"))
-        .unwrap();
+    let transaction = transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
 
     let TransactionStep::Write(write) = &mut transaction.steps[1] else {
         panic!("expected the stock write");
@@ -729,22 +779,20 @@ fn rejects_reference_to_field_the_read_did_not_select() {
 }
 
 #[test]
-fn rejects_transaction_read_result_colliding_with_another_id() {
+fn rejects_transaction_read_bind_colliding_with_another_id() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.reserve_inventory"))
-        .unwrap();
+    let transaction = transaction_mut(
+        &mut model,
+        "operation.reserve_inventory",
+        "tx.reserve_inventory",
+    );
 
     let TransactionStep::Read(read) = &mut transaction.steps[0] else {
         panic!("expected the stock read");
     };
 
-    read.result = id("object.stock");
+    read.bind = id("object.stock");
 
     let errors = validation::validate(&model);
 
@@ -894,13 +942,7 @@ fn rejects_transaction_read_in_recoverability_key() {
 /// Retarget the first component of `tx.reserve_inventory`'s write
 /// derivation, which is the fixture's provenance site.
 fn set_reserve_write_source(model: &mut Model, source: ValueSource, path: &[&str]) {
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.reserve_inventory"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.reserve_inventory"))
-        .unwrap();
+    let transaction = transaction_mut(model, "operation.reserve_inventory", "tx.reserve_inventory");
 
     let TransactionStep::Write(write) = &mut transaction.steps[1] else {
         panic!("expected the stock write");
@@ -1049,13 +1091,7 @@ fn accepts_value_ref_to_state_machine_subject_from_any_operation() {
 fn rejects_foreign_input_in_a_transaction_commit_key() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order.new");
 
     let IdempotencyGuarantee::DeduplicatedBy { key } = &mut transaction.idempotency else {
         panic!("expected a keyed transaction");
@@ -1074,68 +1110,6 @@ fn rejects_foreign_input_in_a_transaction_commit_key() {
             subject: id("tx.create_order.new"),
             source: id("input.apply_payment.captured"),
             owner: id("operation.apply_payment"),
-        }]
-    );
-}
-
-#[test]
-fn rejects_ambiguous_intents_for_one_transition_side_effect() {
-    let mut model = load_flash_checkout();
-
-    let operation = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap();
-
-    operation.effect_intents.insert(
-        id("intent.apply_payment.order_paid.duplicate"),
-        EffectIntent {
-            effect: id("effect.order.paid"),
-        },
-    );
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::AmbiguousTransitionEffectIntent {
-            operation: id("operation.apply_payment"),
-            effect: id("effect.order.paid"),
-            intents: vec![
-                id("intent.apply_payment.order_paid"),
-                id("intent.apply_payment.order_paid.duplicate"),
-            ],
-        }]
-    );
-}
-
-#[test]
-fn rejects_transition_effect_intent_the_operation_cannot_establish() {
-    let mut model = load_flash_checkout();
-
-    // cancel_order applies transition.order.cancel, never mark_paid,
-    // so it can never establish that transition's side effect.
-    model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap()
-        .effect_intents
-        .insert(
-            id("intent.cancel_order.order_paid"),
-            EffectIntent {
-                effect: id("effect.order.paid"),
-            },
-        );
-
-    let errors = validation::validate(&model);
-
-    assert_eq!(
-        errors,
-        vec![ValidationError::UnestablishableTransitionEffectIntent {
-            operation: id("operation.cancel_order"),
-            intent: id("intent.cancel_order.order_paid"),
-            effect: id("effect.order.paid"),
-            transition: id("transition.order.mark_paid"),
         }]
     );
 }
@@ -1236,15 +1210,9 @@ fn rejects_invalid_field_path_in_execute_effect_values() {
 }
 
 /// The fixture's `tx.apply_payment` transition step, whose
-/// `effect_values` map is the transition provenance site.
+/// `effect_intents` map is the transition binding site.
 fn apply_payment_transition(model: &mut Model) -> &mut StateTransition {
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap();
+    let transaction = transaction_mut(model, "operation.apply_payment", "tx.apply_payment");
 
     let TransactionStep::Transition(transition) = &mut transaction.steps[1] else {
         panic!("expected the mark_paid transition step");
@@ -1254,15 +1222,17 @@ fn apply_payment_transition(model: &mut Model) -> &mut StateTransition {
 }
 
 #[test]
-fn accepts_transition_effect_derivation_from_preceding_read() {
+fn accepts_transition_intent_derivation_from_preceding_read() {
     let mut model = load_flash_checkout();
 
     let transition = apply_payment_transition(&mut model);
 
-    let Some(Derivation::Deterministic { from }) =
-        transition.effect_values.get(&id("effect.order.paid"))
+    let Some(TransitionEffectIntent {
+        values: Derivation::Deterministic { from },
+        ..
+    }) = transition.effect_intents.get(&id("effect.order.paid"))
     else {
-        panic!("expected a deterministic transition effect derivation");
+        panic!("expected a deterministic transition intent derivation");
     };
 
     assert_eq!(
@@ -1276,22 +1246,22 @@ fn accepts_transition_effect_derivation_from_preceding_read() {
 }
 
 #[test]
-fn accepts_empty_effect_values_for_transition_without_side_effects() {
+fn accepts_empty_effect_intents_for_transition_without_side_effects() {
     let model = load_flash_checkout();
 
     let transaction = model
         .operations
         .get(&id("operation.cancel_order"))
         .unwrap()
-        .transactions
-        .get(&id("tx.cancel_order"))
+        .program
+        .transaction(&id("tx.cancel_order"))
         .unwrap();
 
     let TransactionStep::Transition(transition) = &transaction.steps[0] else {
         panic!("expected the cancel transition step");
     };
 
-    assert!(transition.effect_values.is_empty());
+    assert!(transition.effect_intents.is_empty());
 
     let errors = validation::validate(&model);
 
@@ -1299,16 +1269,22 @@ fn accepts_empty_effect_values_for_transition_without_side_effects() {
 }
 
 #[test]
-fn rejects_missing_transition_effect_derivation() {
+fn rejects_missing_transition_intent_binding() {
     let mut model = load_flash_checkout();
 
-    apply_payment_transition(&mut model).effect_values.clear();
+    apply_payment_transition(&mut model).effect_intents.clear();
+
+    // Clearing the map removes the binding's one producer, so the
+    // intent execution must go with it.
+    program_mut(&mut model, "operation.apply_payment")
+        .steps
+        .remove(1);
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransitionEffectValuesMismatch {
+        vec![ValidationError::TransitionEffectIntentsMismatch {
             transaction: id("tx.apply_payment"),
             transition: id("transition.order.mark_paid"),
             missing: vec![id("effect.order.paid")],
@@ -1318,18 +1294,22 @@ fn rejects_missing_transition_effect_derivation() {
 }
 
 #[test]
-fn rejects_extra_transition_effect_derivation() {
+fn rejects_extra_transition_intent_binding() {
     let mut model = load_flash_checkout();
 
-    apply_payment_transition(&mut model)
-        .effect_values
-        .insert(id("effect.order.unrelated"), Derivation::Unspecified);
+    apply_payment_transition(&mut model).effect_intents.insert(
+        id("effect.order.unrelated"),
+        TransitionEffectIntent {
+            bind: id("intent.apply_payment.unrelated"),
+            values: Derivation::Unspecified,
+        },
+    );
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransitionEffectValuesMismatch {
+        vec![ValidationError::TransitionEffectIntentsMismatch {
             transaction: id("tx.apply_payment"),
             transition: id("transition.order.mark_paid"),
             missing: vec![],
@@ -1339,32 +1319,30 @@ fn rejects_extra_transition_effect_derivation() {
 }
 
 #[test]
-fn rejects_transition_effect_derivation_owned_by_another_transition() {
+fn rejects_transition_intent_binding_owned_by_another_transition() {
     let mut model = load_flash_checkout();
 
     // transition.order.cancel declares no side effects, so mark_paid's
-    // side effect has no instance here for a derivation to describe.
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.cancel_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.cancel_order"))
-        .unwrap();
+    // side effect has no instance here for a binding to establish.
+    let transaction = transaction_mut(&mut model, "operation.cancel_order", "tx.cancel_order");
 
     let TransactionStep::Transition(transition) = &mut transaction.steps[0] else {
         panic!("expected the cancel transition step");
     };
 
-    transition
-        .effect_values
-        .insert(id("effect.order.paid"), Derivation::Unspecified);
+    transition.effect_intents.insert(
+        id("effect.order.paid"),
+        TransitionEffectIntent {
+            bind: id("intent.cancel_order.order_paid"),
+            values: Derivation::Unspecified,
+        },
+    );
 
     let errors = validation::validate(&model);
 
     assert_eq!(
         errors,
-        vec![ValidationError::TransitionEffectValuesMismatch {
+        vec![ValidationError::TransitionEffectIntentsMismatch {
             transaction: id("tx.cancel_order"),
             transition: id("transition.order.cancel"),
             missing: vec![],
@@ -1374,18 +1352,12 @@ fn rejects_transition_effect_derivation_owned_by_another_transition() {
 }
 
 #[test]
-fn rejects_transition_effect_derivation_referencing_later_read() {
+fn rejects_transition_intent_derivation_referencing_later_read() {
     let mut model = load_flash_checkout();
 
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.apply_payment"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.apply_payment", "tx.apply_payment");
 
-    // Move the transition ahead of the read its effect derivation
+    // Move the transition ahead of the read its intent derivation
     // depends on.
     transaction.steps.swap(0, 1);
 
@@ -1401,15 +1373,17 @@ fn rejects_transition_effect_derivation_referencing_later_read() {
 }
 
 #[test]
-fn rejects_transition_effect_derivation_field_not_selected() {
+fn rejects_transition_intent_derivation_field_not_selected() {
     let mut model = load_flash_checkout();
 
     let transition = apply_payment_transition(&mut model);
 
-    let Some(Derivation::Deterministic { from }) =
-        transition.effect_values.get_mut(&id("effect.order.paid"))
+    let Some(TransitionEffectIntent {
+        values: Derivation::Deterministic { from },
+        ..
+    }) = transition.effect_intents.get_mut(&id("effect.order.paid"))
     else {
-        panic!("expected a deterministic transition effect derivation");
+        panic!("expected a deterministic transition intent derivation");
     };
 
     // `status` resolves against the order schema, but the read selects
@@ -1429,15 +1403,17 @@ fn rejects_transition_effect_derivation_field_not_selected() {
 }
 
 #[test]
-fn rejects_invalid_field_path_in_transition_effect_derivation() {
+fn rejects_invalid_field_path_in_transition_intent_derivation() {
     let mut model = load_flash_checkout();
 
     let transition = apply_payment_transition(&mut model);
 
-    let Some(Derivation::Deterministic { from }) =
-        transition.effect_values.get_mut(&id("effect.order.paid"))
+    let Some(TransitionEffectIntent {
+        values: Derivation::Deterministic { from },
+        ..
+    }) = transition.effect_intents.get_mut(&id("effect.order.paid"))
     else {
-        panic!("expected a deterministic transition effect derivation");
+        panic!("expected a deterministic transition intent derivation");
     };
 
     from[1].path = FieldPath(vec!["does_not_exist".to_owned()]);
@@ -1659,21 +1635,27 @@ fn rejects_request_result_schema_that_does_not_exist() {
     );
 }
 
+/// Mutable access to the card charge's inline external contract, which
+/// lives at the first step of charge_payment's program.
+fn charge_card_mut(model: &mut Model) -> &mut conseqa::spec::ExternalEffect {
+    let OperationStep::ExecuteEffect(step) =
+        &mut program_mut(model, "operation.charge_payment").steps[0]
+    else {
+        panic!("expected the card-charge execute_effect step");
+    };
+
+    let conseqa::spec::Effect::External(card) = &mut step.effect else {
+        panic!("card charge should be an external effect");
+    };
+
+    card
+}
+
 #[test]
 fn rejects_external_result_schema_that_does_not_exist() {
     let mut model = load_flash_checkout();
 
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
-
-    card.result.as_mut().unwrap().ok = id("schema.missing");
+    charge_card_mut(&mut model).result.as_mut().unwrap().ok = id("schema.missing");
 
     let errors = validation::validate(&model);
 
@@ -1701,7 +1683,7 @@ fn rejects_a_result_binding_on_a_publication() {
         panic!("expected the capture publication");
     };
 
-    captured.result = Some(id("result.charge_payment.captured"));
+    captured.bind = Some(id("result.charge_payment.captured"));
 
     let errors = validation::validate(&model);
 
@@ -1720,17 +1702,7 @@ fn rejects_a_result_binding_on_a_publication() {
 fn rejects_a_result_binding_on_an_external_effect_without_a_contract() {
     let mut model = load_flash_checkout();
 
-    let Some(conseqa::spec::Effect::External(card)) = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap()
-        .effects
-        .get_mut(&id("effect.charge_payment.card"))
-    else {
-        panic!("card charge should be an external effect");
-    };
-
-    card.result = None;
+    charge_card_mut(&mut model).result = None;
 
     let errors = validation::validate(&model);
 
@@ -1758,7 +1730,7 @@ fn accepts_an_ignored_result() {
         panic!("expected the card charge");
     };
 
-    card.result = None;
+    card.bind = None;
 
     program.steps[1] = OperationStep::Complete;
 
@@ -1777,7 +1749,7 @@ fn rejects_a_match_on_a_result_no_step_declares() {
         panic!("expected the card charge");
     };
 
-    card.result = None;
+    card.bind = None;
 
     let errors = validation::validate(&model);
 
@@ -1897,18 +1869,15 @@ fn rejects_a_variant_payload_after_the_join() {
 }
 
 #[test]
-fn rejects_an_intent_executed_where_no_path_establishes_it() {
+fn rejects_an_intent_executed_before_its_producer_transaction() {
     let mut model = load_flash_checkout();
 
-    model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap()
+    // Bindings exist only after their producer: executing the intent
+    // ahead of the transaction that establishes it is a
+    // use-before-bind error, never resolved by the later producer.
+    program_mut(&mut model, "operation.create_order")
         .steps
-        .retain(|step| !matches!(step, TransactionStep::EstablishEffectIntent(_)));
+        .swap(0, 1);
 
     let errors = validation::validate(&model);
 
@@ -1916,7 +1885,7 @@ fn rejects_an_intent_executed_where_no_path_establishes_it() {
         errors,
         vec![ValidationError::TransactionArtifactNotAvailable {
             operation: id("operation.create_order"),
-            location: at(&[(1, None)]),
+            location: at(&[(0, None)]),
             artifact: id("intent.create_order.publish_created"),
             consumer: ProgramUse::EffectIntent {
                 intent: id("intent.create_order.publish_created"),
@@ -1926,44 +1895,39 @@ fn rejects_an_intent_executed_where_no_path_establishes_it() {
 }
 
 #[test]
-fn rejects_an_output_consumed_where_no_path_establishes_it() {
+fn an_output_with_no_producer_site_is_undeclared() {
     let mut model = load_flash_checkout();
 
-    model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap()
+    // Removing the binder removes the binding's declaration itself:
+    // the return's references no longer resolve at all.
+    transaction_mut(&mut model, "operation.create_order", "tx.create_order.new")
         .steps
         .retain(|step| !matches!(step, TransactionStep::EstablishTransactionOutput(_)));
 
     let errors = validation::validate(&model);
 
-    assert_eq!(
-        errors,
-        vec![ValidationError::TransactionArtifactNotAvailable {
-            operation: id("operation.create_order"),
-            location: at(&[(2, None)]),
-            artifact: id("output.create_order"),
-            consumer: ProgramUse::Return {
-                request: id("input.create_order.request"),
-            },
-        }]
+    assert!(!errors.is_empty());
+
+    assert!(
+        errors.iter().all(|error| matches!(
+            error,
+            ValidationError::UnknownReference {
+                reference,
+                expected: ReferenceKind::TransactionOutput,
+                ..
+            } if reference == &id("output.create_order")
+        )),
+        "expected unknown-reference errors for the unproduced binding, got:\n{errors:#?}"
     );
 }
 
-/// Wraps the first step of create_order's program in a branch on the
-/// request's `sku`, with the given arms.
-fn branch_create_order(
-    model: &mut Model,
-    then: Vec<OperationStep>,
-    otherwise: Option<Vec<OperationStep>>,
-) {
+/// Wraps the first step of create_order's program — its one inline
+/// transaction — in a branch on the request's `sku`: the transaction
+/// moves into the `then` arm, and `otherwise` supplies the other arm.
+fn branch_create_order(model: &mut Model, otherwise: Option<Vec<OperationStep>>) {
     let program = program_mut(model, "operation.create_order");
 
-    program.steps.remove(0);
+    let transaction = program.steps.remove(0);
 
     program.steps.insert(
         0,
@@ -1972,20 +1936,27 @@ fn branch_create_order(
                 value: input_ref("input.create_order.request", &["sku"]),
                 equals: SelectorValue::Literal(Literal::String("bundle".into())),
             },
-            then: OperationBlock { steps: then },
+            then: OperationBlock {
+                steps: vec![transaction],
+            },
             otherwise: otherwise.map(|steps| OperationBlock { steps }),
         }),
     );
 }
 
 #[test]
-fn accepts_an_artifact_established_on_every_arm() {
+fn accepts_an_artifact_established_on_every_falling_through_path() {
     let mut model = load_flash_checkout();
 
+    // The other arm terminates, so the join is reached only through
+    // the establishing arm: a terminated predecessor imposes no
+    // condition on the join.
     branch_create_order(
         &mut model,
-        vec![run("tx.create_order.new")],
-        Some(vec![run("tx.create_order.new")]),
+        Some(vec![return_err(
+            "input.create_order.request",
+            Derivation::Unspecified,
+        )]),
     );
 
     let errors = validation::validate(&model);
@@ -1997,7 +1968,7 @@ fn accepts_an_artifact_established_on_every_arm() {
 fn rejects_an_artifact_established_on_one_arm_only() {
     let mut model = load_flash_checkout();
 
-    branch_create_order(&mut model, vec![run("tx.create_order.new")], None);
+    branch_create_order(&mut model, None);
 
     let errors = validation::validate(&model);
 
@@ -2155,9 +2126,15 @@ fn rejects_duplicate_result_bindings() {
 
     let program = program_mut(&mut model, "operation.charge_payment");
 
-    let first = program.steps[0].clone();
+    // A second execution site binding the same result: the site gets
+    // its own effect_id, so the one collision is the binding's.
+    let OperationStep::ExecuteEffect(mut step) = program.steps[0].clone() else {
+        panic!("expected the card charge");
+    };
 
-    program.steps.insert(0, first);
+    step.effect_id = id("effect.charge_payment.card.retry");
+
+    program.steps.insert(0, OperationStep::ExecuteEffect(step));
 
     let errors = validation::validate(&model);
 
@@ -2200,51 +2177,36 @@ fn rejects_a_condition_root_out_of_scope() {
     );
 }
 
-/// Adds a second output to create_order, established by a new keyed
-/// transaction whose derivation reads the first output.
-fn add_receipt_transaction(model: &mut Model) {
-    let operation = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.create_order.receipt"),
-        TransactionOutput {
-            schema: id("schema.CreateOrderResponse"),
-        },
-    );
-
-    operation.transactions.insert(
-        id("tx.create_order.receipt"),
-        Transaction {
-            data_model: None,
-            isolation: TransactionIsolation::Unspecified,
-            idempotency: IdempotencyGuarantee::Unspecified,
-            steps: vec![TransactionStep::EstablishTransactionOutput(
-                EstablishTransactionOutput {
-                    output: id("output.create_order.receipt"),
-                    values: Derivation::Deterministic {
-                        from: vec![ValueRef {
-                            source: ValueSource::TransactionOutput(id("output.create_order")),
-                            path: path(&["order_id"]),
-                        }],
-                    },
+/// A second output for create_order: a new inline transaction whose
+/// binder's derivation reads the first output.
+fn receipt_transaction() -> OperationStep {
+    OperationStep::Transaction(Transaction {
+        id: id("tx.create_order.receipt"),
+        data_model: None,
+        isolation: TransactionIsolation::Unspecified,
+        idempotency: IdempotencyGuarantee::Unspecified,
+        steps: vec![TransactionStep::EstablishTransactionOutput(
+            EstablishTransactionOutput {
+                bind: id("output.create_order.receipt"),
+                schema: id("schema.CreateOrderResponse"),
+                values: Derivation::Deterministic {
+                    from: vec![ValueRef {
+                        source: ValueSource::TransactionOutput(id("output.create_order")),
+                        path: path(&["order_id"]),
+                    }],
                 },
-            )],
-        },
-    );
+            },
+        )],
+    })
 }
 
 #[test]
 fn accepts_an_output_consumed_by_a_later_transaction() {
     let mut model = load_flash_checkout();
 
-    add_receipt_transaction(&mut model);
-
     program_mut(&mut model, "operation.create_order")
         .steps
-        .insert(1, run("tx.create_order.receipt"));
+        .insert(1, receipt_transaction());
 
     let errors = validation::validate(&model);
 
@@ -2255,11 +2217,9 @@ fn accepts_an_output_consumed_by_a_later_transaction() {
 fn rejects_an_output_consumed_by_a_transaction_before_it_is_available() {
     let mut model = load_flash_checkout();
 
-    add_receipt_transaction(&mut model);
-
     program_mut(&mut model, "operation.create_order")
         .steps
-        .insert(0, run("tx.create_order.receipt"));
+        .insert(0, receipt_transaction());
 
     let errors = validation::validate(&model);
 
@@ -2280,20 +2240,9 @@ fn rejects_an_output_consumed_by_a_transaction_before_it_is_available() {
 fn a_same_transaction_output_reference_needs_only_step_order() {
     let mut model = load_flash_checkout();
 
-    let operation = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.create_order.receipt"),
-        TransactionOutput {
-            schema: id("schema.CreateOrderResponse"),
-        },
-    );
-
     let establish = TransactionStep::EstablishTransactionOutput(EstablishTransactionOutput {
-        output: id("output.create_order.receipt"),
+        bind: id("output.create_order.receipt"),
+        schema: id("schema.CreateOrderResponse"),
         values: Derivation::Deterministic {
             from: vec![ValueRef {
                 source: ValueSource::TransactionOutput(id("output.create_order")),
@@ -2304,10 +2253,7 @@ fn a_same_transaction_output_reference_needs_only_step_order() {
 
     // After the step that establishes the first output: satisfied by
     // atomicity, whatever the program guarantees at entry.
-    let transaction = operation
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order.new");
 
     transaction.steps.push(establish.clone());
 
@@ -2316,13 +2262,7 @@ fn a_same_transaction_output_reference_needs_only_step_order() {
     assert!(errors.is_empty(), "expected no errors, got:\n{errors:#?}");
 
     // Before it: the reference reads an output no step has produced.
-    let transaction = model
-        .operations
-        .get_mut(&id("operation.create_order"))
-        .unwrap()
-        .transactions
-        .get_mut(&id("tx.create_order.new"))
-        .unwrap();
+    let transaction = transaction_mut(&mut model, "operation.create_order", "tx.create_order.new");
 
     transaction.steps.pop();
     transaction.steps.insert(0, establish);
@@ -2348,43 +2288,32 @@ fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
 
     // A transaction reading the provider's ok payload, executed only
     // inside the ok arm.
-    let operation = model
-        .operations
-        .get_mut(&id("operation.charge_payment"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.charge_payment.authorization"),
-        TransactionOutput {
-            schema: id("schema.ChargeAccepted"),
-        },
-    );
-
-    operation.transactions.insert(
-        id("tx.charge_payment.record"),
-        Transaction {
-            data_model: None,
-            isolation: TransactionIsolation::Unspecified,
-            idempotency: IdempotencyGuarantee::Unspecified,
-            steps: vec![TransactionStep::EstablishTransactionOutput(
-                EstablishTransactionOutput {
-                    output: id("output.charge_payment.authorization"),
-                    values: Derivation::Deterministic {
-                        from: vec![ValueRef {
-                            source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
-                            path: path(&["authorization_id"]),
-                        }],
-                    },
+    let record = OperationStep::Transaction(Transaction {
+        id: id("tx.charge_payment.record"),
+        data_model: None,
+        isolation: TransactionIsolation::Unspecified,
+        idempotency: IdempotencyGuarantee::Unspecified,
+        steps: vec![TransactionStep::EstablishTransactionOutput(
+            EstablishTransactionOutput {
+                bind: id("output.charge_payment.authorization"),
+                schema: id("schema.ChargeAccepted"),
+                values: Derivation::Deterministic {
+                    from: vec![ValueRef {
+                        source: ValueSource::EffectResultOk(id("result.charge_payment.card")),
+                        path: path(&["authorization_id"]),
+                    }],
                 },
-            )],
-        },
-    );
+            },
+        )],
+    });
 
-    let OperationStep::MatchResult(matched) = &mut operation.program.steps[1] else {
+    let OperationStep::MatchResult(matched) =
+        &mut program_mut(&mut model, "operation.charge_payment").steps[1]
+    else {
         panic!("expected the card match");
     };
 
-    matched.ok.steps.insert(0, run("tx.charge_payment.record"));
+    matched.ok.steps.insert(0, record.clone());
 
     let errors = validation::validate(&model);
 
@@ -2402,7 +2331,7 @@ fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
     matched.ok.steps.pop();
     matched.err.steps.pop();
 
-    program.steps.push(run("tx.charge_payment.record"));
+    program.steps.push(record);
     program.steps.push(OperationStep::Complete);
 
     let errors = validation::validate(&model);
@@ -2422,23 +2351,34 @@ fn accepts_a_variant_payload_in_a_transaction_used_inside_its_arm() {
 }
 
 #[test]
-fn intent_execution_evaluates_the_effect_declarations_roots() {
+fn transition_application_evaluates_the_side_effects_declaration_roots() {
     let mut model = load_flash_checkout();
 
     // The transition-owned effect gains a propagation rooted in an
-    // output the operation declares but never establishes; the intent
-    // execution is where the declaration is evaluated.
-    let operation = model
-        .operations
-        .get_mut(&id("operation.apply_payment"))
-        .unwrap();
-
-    operation.transaction_outputs.insert(
-        id("output.apply_payment.receipt"),
-        TransactionOutput {
-            schema: id("schema.OrderPaid"),
-        },
-    );
+    // output a later transaction establishes; the contract stays on
+    // the state machine, and the applying transaction is where its
+    // roots are evaluated — before the producer, so the reference is
+    // not definitely available there.
+    program_mut(&mut model, "operation.apply_payment")
+        .steps
+        .insert(
+            2,
+            OperationStep::Transaction(Transaction {
+                id: id("tx.apply_payment.receipt"),
+                data_model: None,
+                isolation: TransactionIsolation::Unspecified,
+                idempotency: IdempotencyGuarantee::Unspecified,
+                steps: vec![TransactionStep::EstablishTransactionOutput(
+                    EstablishTransactionOutput {
+                        bind: id("output.apply_payment.receipt"),
+                        schema: id("schema.OrderPaid"),
+                        values: Derivation::Deterministic {
+                            from: vec![input_ref("input.apply_payment.captured", &["order_id"])],
+                        },
+                    },
+                )],
+            }),
+        );
 
     let machine = model
         .state_machines
@@ -2480,10 +2420,10 @@ fn intent_execution_evaluates_the_effect_declarations_roots() {
         errors,
         vec![ValidationError::TransactionArtifactNotAvailable {
             operation: id("operation.apply_payment"),
-            location: at(&[(1, None)]),
+            location: at(&[(0, None)]),
             artifact: id("output.apply_payment.receipt"),
-            consumer: ProgramUse::EffectIntent {
-                intent: id("intent.apply_payment.order_paid"),
+            consumer: ProgramUse::Transaction {
+                transaction: id("tx.apply_payment"),
             },
         }]
     );

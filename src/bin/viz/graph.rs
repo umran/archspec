@@ -195,7 +195,7 @@ pub fn extract(model: &Model) -> Graph {
     let mut targeted_inputs: BTreeSet<(Id, Id)> = BTreeSet::new();
 
     for op in model.operations.values() {
-        for effect in op.effects.values() {
+        for (_, effect) in op.program.effect_declarations() {
             if let Effect::Request(request) = effect {
                 targeted_inputs.insert((
                     request.target.operation.clone(),
@@ -285,35 +285,38 @@ pub fn extract(model: &Model) -> Graph {
             }
         }
 
-        // Effects available to the operation: its own declarations
-        // plus transition-owned effects reachable through its intents.
+        // Effects available to the operation: its own inline
+        // declarations plus transition-owned effects reachable through
+        // its transition applications.
         let mut available: Vec<(Id, ResolvedEffect, Option<TransitionKey>)> = op
-            .effects
-            .iter()
+            .program
+            .effect_declarations()
+            .into_iter()
             .map(|(id, effect)| (id.clone(), ResolvedEffect::from(effect), None))
             .collect();
 
-        for intent in op.effect_intents.values() {
-            if op.effects.contains_key(&intent.effect) {
-                continue;
-            }
+        for (_, transaction) in op.program.transactions() {
+            for step in &transaction.steps {
+                let TransactionStep::Transition(step) = step else {
+                    continue;
+                };
 
-            if let Some(EffectOwner::Transition {
-                machine,
-                transition,
-            }) = effect_owners.get(&intent.effect)
-                && let Some(effect) = transition_effect(model, machine, transition, &intent.effect)
-            {
-                machines.insert(machine.clone());
+                for effect_id in step.effect_intents.keys() {
+                    if let Some(effect) =
+                        transition_effect(model, &step.machine, &step.transition, effect_id)
+                    {
+                        machines.insert(step.machine.clone());
 
-                available.push((
-                    intent.effect.clone(),
-                    effect,
-                    Some(TransitionKey {
-                        machine: machine.clone(),
-                        transition: transition.clone(),
-                    }),
-                ));
+                        available.push((
+                            effect_id.clone(),
+                            effect,
+                            Some(TransitionKey {
+                                machine: step.machine.clone(),
+                                transition: step.transition.clone(),
+                            }),
+                        ));
+                    }
+                }
             }
         }
 
@@ -372,8 +375,9 @@ pub fn extract(model: &Model) -> Graph {
             }
         }
 
-        // Machines referenced by transition steps in transactions.
-        for transaction in op.transactions.values() {
+        // Machines referenced by transition steps in inline
+        // transactions.
+        for (_, transaction) in op.program.transactions() {
             for step in &transaction.steps {
                 if let TransactionStep::Transition(transition) = step {
                     machines.insert(transition.machine.clone());
@@ -449,7 +453,7 @@ fn collect_effect_owners(model: &Model) -> BTreeMap<Id, EffectOwner> {
     let mut owners = BTreeMap::new();
 
     for (op_id, op) in &model.operations {
-        for effect_id in op.effects.keys() {
+        for (effect_id, _) in op.program.effect_declarations() {
             owners.insert(
                 effect_id.clone(),
                 EffectOwner::Operation {
@@ -480,14 +484,14 @@ fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>
     let mut refs: BTreeMap<String, Vec<TransitionRef>> = BTreeMap::new();
 
     for (op_id, op) in &model.operations {
-        for (tx_id, transaction) in &op.transactions {
+        for (_, transaction) in op.program.transactions() {
             for (index, step) in transaction.steps.iter().enumerate() {
                 if let TransactionStep::Transition(transition) = step {
                     refs.entry(format!("{}/{}", transition.machine, transition.transition))
                         .or_default()
                         .push(TransitionRef {
                             operation: op_id.clone(),
-                            transaction: tx_id.clone(),
+                            transaction: transaction.id.clone(),
                             step: index,
                         });
                 }
@@ -499,18 +503,39 @@ fn collect_transition_refs(model: &Model) -> BTreeMap<String, Vec<TransitionRef>
 }
 
 /// For one operation: effect id → program steps that execute it,
-/// either directly or by executing an intent that names it.
+/// either directly or by executing an intent binding that captured it.
 fn collect_effect_executions(op: &conseqa::spec::Operation) -> BTreeMap<Id, Vec<String>> {
+    // Intent binding → the effect it captured: an inline establishment
+    // site's effect_id, or a transition application's side-effect ID.
+    let mut intent_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
+
+    for (_, transaction) in op.program.transactions() {
+        for step in &transaction.steps {
+            match step {
+                TransactionStep::EstablishEffectIntent(establish) => {
+                    intent_effects.insert(&establish.bind, &establish.effect_id);
+                }
+
+                TransactionStep::Transition(transition) => {
+                    for (effect_id, intent) in &transition.effect_intents {
+                        intent_effects.insert(&intent.bind, effect_id);
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
+
     let mut executions: BTreeMap<Id, Vec<String>> = BTreeMap::new();
 
     for (location, step) in op.program.steps_with_locations() {
         let effect_id = match step {
-            OperationStep::ExecuteEffect(step) => Some(step.effect.clone()),
+            OperationStep::ExecuteEffect(step) => Some(step.effect_id.clone()),
 
-            OperationStep::ExecuteEffectIntent(step) => op
-                .effect_intents
-                .get(&step.intent)
-                .map(|intent| intent.effect.clone()),
+            OperationStep::ExecuteEffectIntent(step) => {
+                intent_effects.get(&step.intent).map(|id| (*id).clone())
+            }
 
             _ => None,
         };

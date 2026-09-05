@@ -11,7 +11,7 @@ import type { CSSProperties, ComponentPropsWithRef, ReactElement, ReactNode } fr
 
 import { commitGuarantee, delivery, isolation, laneConcurrency, requestIdentity, routing } from "../lib/explain";
 import { pathText, shortId } from "../lib/ids";
-import { effectDef, effectSummary, locationLabel, walkProgram, type StepHop } from "../lib/index";
+import { effectDef, effectSummary, locationLabel, operationTransactions, walkProgram, type StepHop } from "../lib/index";
 import { propertyMatchesRequirement, worstStatus } from "../lib/obligations";
 import { hashes } from "../lib/route";
 import { concurrencyText, conditionText, predicateText } from "../lib/text";
@@ -103,7 +103,7 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
   let note: string;
   switch (step.kind) {
     case "read":
-      kind = "read"; title = shortId(step.result);
+      kind = "read"; title = shortId(step.bind);
       note = `${shortId(step.target.object)} where ${predicateText(step.target.predicate)}`;
       break;
     case "write":
@@ -123,10 +123,12 @@ function TxStepRow({ step, index, txId, opId }: { step: TransactionStep; index: 
       kind = "transition"; title = shortId(step.transition); note = shortId(step.machine);
       break;
     case "establish_effect_intent":
-      kind = "establish intent"; title = shortId(step.intent); note = `values: ${step.values.kind}`;
+      kind = "establish intent"; title = shortId(step.bind);
+      note = `${shortId(step.effect_id)} · values: ${step.values.kind}`;
       break;
     case "establish_transaction_output":
-      kind = "establish output"; title = shortId(step.output); note = `values: ${step.values.kind}`;
+      kind = "establish output"; title = shortId(step.bind);
+      note = `${shortId(step.schema)} · values: ${step.values.kind}`;
       break;
   }
 
@@ -198,10 +200,6 @@ function DecisionArm({ opId, op, label, block, hops }: { opId: Id; op: Operation
 function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operation; block: OperationBlock; hops: StepHop[]; nested?: boolean }) {
   const { model, index, expandedTx, toggleTx } = useApp();
   const effectKind = (effectId: Id): EffectKind | null => effectDef(model, index, effectId)?.effect.kind ?? null;
-  const viaTransition = (effectId: Id) => {
-    const owner = index.get(effectId);
-    return !!owner && owner.kind === "effect" && owner.machine !== undefined;
-  };
 
   const stepCtx = (location: string): DetailContext => ({ step: { op: opId, location } });
 
@@ -212,49 +210,42 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
 
     switch (step.kind) {
       case "transaction": {
-        const tx = op.transactions[step.transaction];
         const expanded = expandedTx.has(location);
         return {
           key: location,
           element: (
-            <StepCard selKey={`tx:${step.transaction}`} detailId={step.transaction} stripe={STEP_STRIPE.tx}>
+            <StepCard selKey={`tx:${step.id}`} detailId={step.id} stripe={STEP_STRIPE.tx}>
               <div className="flex items-center justify-between gap-2">
                 <Badge variant="neutral">transaction</Badge>
-                <StatusChips obKey={`${opId}/${step.transaction}`} />
+                <StatusChips obKey={`${opId}/${step.id}`} />
               </div>
-              <StepTitle>{shortId(step.transaction)}</StepTitle>
-              {tx ? (
-                <>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                    <FactBadge fact={commitGuarantee(tx.idempotency)} />
-                    {tx.idempotency.kind === "deduplicated_by" && (
-                      <span>by <KeyComponents value={tx.idempotency.key} /></span>
-                    )}
+              <StepTitle>{shortId(step.id)}</StepTitle>
+              <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                <FactBadge fact={commitGuarantee(step.idempotency)} />
+                {step.idempotency.kind === "deduplicated_by" && (
+                  <span>by <KeyComponents value={step.idempotency.key} /></span>
+                )}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
+                <FactBadge fact={isolation(step.isolation)} />
+                {step.data_model && <span>on {shortId(step.data_model)}</span>}
+              </div>
+              <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(location)}>
+                <Collapsible.Trigger
+                  className="mt-2 flex w-full cursor-pointer items-center gap-1 text-xs text-kumo-link hover:underline"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <CaretRightIcon size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
+                  {step.steps.length} step{step.steps.length === 1 ? "" : "s"}
+                </Collapsible.Trigger>
+                <Collapsible.Panel>
+                  <div className="mt-1.5 space-y-0.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-1">
+                    {step.steps.map((ts, ti) => (
+                      <TxStepRow key={ti} step={ts} index={ti} txId={step.id} opId={opId} />
+                    ))}
                   </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-kumo-subtle">
-                    <FactBadge fact={isolation(tx.isolation)} />
-                    {tx.data_model && <span>on {shortId(tx.data_model)}</span>}
-                  </div>
-                  <Collapsible.Root open={expanded} onOpenChange={() => toggleTx(location)}>
-                    <Collapsible.Trigger
-                      className="mt-2 flex w-full cursor-pointer items-center gap-1 text-xs text-kumo-link hover:underline"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <CaretRightIcon size={12} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
-                      {tx.steps.length} step{tx.steps.length === 1 ? "" : "s"}
-                    </Collapsible.Trigger>
-                    <Collapsible.Panel>
-                      <div className="mt-1.5 space-y-0.5 rounded-md border border-kumo-hairline bg-kumo-elevated/40 p-1">
-                        {tx.steps.map((ts, ti) => (
-                          <TxStepRow key={ti} step={ts} index={ti} txId={step.transaction} opId={opId} />
-                        ))}
-                      </div>
-                    </Collapsible.Panel>
-                  </Collapsible.Root>
-                </>
-              ) : (
-                <div className="mt-1 text-xs text-kumo-danger">unresolved transaction</div>
-              )}
+                </Collapsible.Panel>
+              </Collapsible.Root>
             </StepCard>
           ),
         };
@@ -264,14 +255,14 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
         return {
           key: location,
           element: (
-            <StepCard selKey={`fx:${location}:${step.effect}`} detailId={step.effect} stripe={STEP_STRIPE.effect}>
+            <StepCard selKey={`fx:${location}:${step.effect_id}`} detailId={step.effect_id} stripe={STEP_STRIPE.effect}>
               <div className="flex flex-wrap items-center gap-1.5">
                 <Badge variant="neutral">execute effect</Badge>
-                <EffectKindBadge kind={effectKind(step.effect)} />
-                {step.result && <Badge variant="info">binds {shortId(step.result)}</Badge>}
+                <EffectKindBadge kind={step.effect.kind} />
+                {step.bind && <Badge variant="info">binds {shortId(step.bind)}</Badge>}
               </div>
-              <StepTitle>{shortId(step.effect)}</StepTitle>
-              <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect)}</div>
+              <StepTitle>{shortId(step.effect_id)}</StepTitle>
+              <div className="mt-1 text-xs text-kumo-subtle">{effectSummary(model, index, step.effect_id)}</div>
               <div className="mt-1 text-xs text-kumo-subtle">
                 instance: <Badge variant={step.values.kind === "deterministic" ? "info" : "warning"}>{step.values.kind}</Badge>
               </div>
@@ -280,17 +271,19 @@ function ProgramBlock({ opId, op, block, hops, nested }: { opId: Id; op: Operati
         };
 
       case "execute_effect_intent": {
-        const intent = op.effect_intents[step.intent];
-        const eff = intent?.effect;
+        const intent = index.get(step.intent);
+        const eff = intent?.kind === "intent" ? intent.effect : null;
+        const via = intent?.kind === "intent" && intent.via !== undefined;
+        const effKind = eff ? effectKind(eff) : null;
         return {
           key: location,
           element: (
             <StepCard selKey={`fi:${location}:${step.intent}`} detailId={step.intent} stripe={STEP_STRIPE.intent} dashed>
               <div className="flex flex-wrap items-center gap-1.5">
                 <Badge variant="neutral">execute intent</Badge>
-                <EffectKindBadge kind={eff ? effectKind(eff) : null} />
-                {eff && viaTransition(eff) && <Badge variant="info">via transition</Badge>}
-                {step.result && <Badge variant="info">binds {shortId(step.result)}</Badge>}
+                <EffectKindBadge kind={effKind} />
+                {via && <Badge variant="info">via transition</Badge>}
+                {step.bind && <Badge variant="info">binds {shortId(step.bind)}</Badge>}
               </div>
               <StepTitle>{shortId(step.intent)}</StepTitle>
               <div className="mt-1 text-xs text-kumo-subtle">{eff ? effectSummary(model, index, eff) : "unresolved intent"}</div>
@@ -569,10 +562,11 @@ export function OperationView({ id }: { id: string }) {
   const reqs = op.requirements;
   const requirementCount = reqs.serialization.length + reqs.ordering.length + reqs.idempotency.length + reqs.recoverability.length;
   const inputCount = Object.keys(op.inputs).length;
-  const transactionCount = Object.keys(op.transactions).length;
+  const transactions = operationTransactions(op);
+  const transactionCount = transactions.length;
   const stepCount = walkProgram(op.program).length;
   const machines = [...new Set(
-    Object.values(op.transactions).flatMap((tx) => tx.steps.flatMap((s) => (s.kind === "transition" ? [s.machine] : []))),
+    transactions.flatMap((tx) => tx.steps.flatMap((s) => (s.kind === "transition" ? [s.machine] : []))),
   )];
 
   return (

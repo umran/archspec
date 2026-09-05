@@ -78,7 +78,7 @@ impl<'a> TriggerGraph<'a> {
         let mut publications: BTreeMap<&'a Id, Vec<Producer<'a>>> = BTreeMap::new();
 
         for (operation, declaration) in &model.operations {
-            for (effect, declared) in &declaration.effects {
+            for (effect, declared) in declaration.program.effect_declarations() {
                 if let Effect::Publication(publication) = declared {
                     publications
                         .entry(&publication.topic)
@@ -195,7 +195,7 @@ pub fn returns_consistently(operation: &Operation, input: &Id) -> Option<usize> 
 }
 
 /// The effect contract behind an execution site, unifying
-/// operation-owned effects and transition side effects.
+/// operation-owned inline effects and transition side effects.
 #[derive(Debug, Clone, Copy)]
 pub enum EffectContract<'a> {
     Publication(&'a PublicationEffect),
@@ -203,32 +203,44 @@ pub enum EffectContract<'a> {
     External(&'a ExternalEffect),
 }
 
+impl<'a> From<&'a Effect> for EffectContract<'a> {
+    fn from(effect: &'a Effect) -> Self {
+        match effect {
+            Effect::Publication(publication) => Self::Publication(publication),
+            Effect::Request(request) => Self::Request(request),
+            Effect::External(external) => Self::External(external),
+        }
+    }
+}
+
+impl<'a> From<&'a TransitionSideEffect> for EffectContract<'a> {
+    fn from(effect: &'a TransitionSideEffect) -> Self {
+        match effect {
+            TransitionSideEffect::Publication(publication) => Self::Publication(publication),
+            TransitionSideEffect::Request(request) => Self::Request(request),
+        }
+    }
+}
+
 /// The contract of an effect executed by `operation`: one of its own
-/// effects, or a transition side effect reached through one of its
-/// intents.
+/// inline effect declarations, resolved from the program, or a
+/// transition side effect reached through one of its transition
+/// applications.
 pub fn effect_contract<'a>(
     model: &'a Model,
     operation: &'a Operation,
     effect: &Id,
 ) -> Option<EffectContract<'a>> {
-    if let Some(declared) = operation.effects.get(effect) {
-        return Some(match declared {
-            Effect::Publication(publication) => EffectContract::Publication(publication),
-            Effect::Request(request) => EffectContract::Request(request),
-            Effect::External(external) => EffectContract::External(external),
-        });
+    for (declared_id, declared) in operation.program.effect_declarations() {
+        if declared_id == effect {
+            return Some(EffectContract::from(declared));
+        }
     }
 
     for machine in model.state_machines.values() {
         for transition in machine.transitions.values() {
             if let Some(side_effect) = transition.side_effects.get(effect) {
-                return Some(match side_effect {
-                    TransitionSideEffect::Publication(publication) => {
-                        EffectContract::Publication(publication)
-                    }
-
-                    TransitionSideEffect::Request(request) => EffectContract::Request(request),
-                });
+                return Some(EffectContract::from(side_effect));
             }
         }
     }

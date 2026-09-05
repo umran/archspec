@@ -227,8 +227,15 @@ export type LockOrder =
   | { kind: "unspecified" }
   | { kind: "by"; terms: { field: FieldPath; direction: "ascending" | "descending" }[] };
 
+/** One transition side effect's application facts: the operation-local
+ *  intent binding and the instance derivation. */
+export interface TransitionEffectIntent {
+  bind: Id;
+  values: Derivation;
+}
+
 export type TransactionStep =
-  | { kind: "read"; result: Id; target: ObjectSelector; fields: FieldSelection }
+  | { kind: "read"; bind: Id; target: ObjectSelector; fields: FieldSelection }
   | { kind: "write"; target: ObjectSelector; fields: FieldPath[]; values: Derivation }
   | { kind: "insert"; object: Id; values: Derivation }
   | { kind: "delete"; target: ObjectSelector }
@@ -238,12 +245,15 @@ export type TransactionStep =
       machine: Id;
       transition: Id;
       subject: ObjectSelector;
-      effect_values: Record<Id, Derivation>;
+      effect_intents: Record<Id, TransitionEffectIntent>;
     }
-  | { kind: "establish_effect_intent"; intent: Id; values: Derivation }
-  | { kind: "establish_transaction_output"; output: Id; values: Derivation };
+  | { kind: "establish_effect_intent"; bind: Id; effect_id: Id; effect: Effect; values: Derivation }
+  | { kind: "establish_transaction_output"; bind: Id; schema: Id; values: Derivation };
 
+/** An inline transaction: declared and executed at the program step
+ *  that carries it. `id` is its stable logical identity. */
 export interface Transaction {
+  id: Id;
   data_model: Id | null;
   isolation: "unspecified" | "read_committed" | "snapshot" | "serializable";
   idempotency: IdempotencyGuarantee;
@@ -267,9 +277,9 @@ export interface OperationBlock {
 }
 
 export type OperationStep =
-  | { kind: "transaction"; transaction: Id }
-  | { kind: "execute_effect"; effect: Id; values: Derivation; result: Id | null }
-  | { kind: "execute_effect_intent"; intent: Id; result: Id | null }
+  | ({ kind: "transaction" } & Transaction)
+  | { kind: "execute_effect"; effect_id: Id; effect: Effect; values: Derivation; bind: Id | null }
+  | { kind: "execute_effect_intent"; intent: Id; bind: Id | null }
   | { kind: "match_result"; result: Id; ok: OperationBlock; err: OperationBlock }
   | { kind: "branch"; condition: Condition; then: OperationBlock; otherwise: OperationBlock | null }
   | { kind: "return"; request: Id; outcome: ResultOutcome }
@@ -286,14 +296,16 @@ export interface OperationRequirements {
 
 export type RequirementKind = keyof OperationRequirements;
 
+/** An operation: invocation sources, one causal program, requirements,
+ *  and execution facts. Transactions, direct effects, transaction
+ *  outputs, and effect intents are declared inline at the program or
+ *  transaction site that executes or establishes them — the program is
+ *  the source of truth for every operation-owned execution
+ *  occurrence. */
 export interface Operation {
   service: Id;
   description: string | null;
   inputs: Record<Id, Input>;
-  effects: Record<Id, Effect>;
-  effect_intents: Record<Id, { effect: Id }>;
-  transaction_outputs: Record<Id, { schema: Id }>;
-  transactions: Record<Id, Transaction>;
   program: OperationBlock;
   requirements: OperationRequirements;
   execution: { concurrency: Concurrency };

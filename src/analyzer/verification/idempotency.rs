@@ -761,19 +761,19 @@ fn analyze_path(
                 ..
             } => match (recovery, natural) {
                 (Ok(key), _) => transactions.push(TransactionRetrySafety {
-                    transaction: (*transaction).clone(),
+                    transaction: transaction.id.clone(),
                     route: RetryRoute::KeyedCommit { key: key.clone() },
                 }),
 
                 (Err(_), Ok(())) => transactions.push(TransactionRetrySafety {
-                    transaction: (*transaction).clone(),
+                    transaction: transaction.id.clone(),
                     route: RetryRoute::NaturalReplay,
                 }),
 
                 (Err(recovery), Err(reconstruction)) => {
                     obstacles.push(IdempotencyObstacle::TransactionNotRetrySafe {
                         path: reference.clone(),
-                        transaction: (*transaction).clone(),
+                        transaction: transaction.id.clone(),
                         recovery: recovery.clone(),
                         reconstruction: reconstruction.clone(),
                     });

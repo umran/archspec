@@ -413,7 +413,7 @@ This distinction is central to ambiguous-ordering analysis.
 
 An operation is a logical unit of application behavior owned by one service.
 
-Its declaration contains possible invocation sources, effects, transaction artifacts (effect intents and transaction outputs), transactions, one program, requirements, and execution facts.
+Its declaration contains possible invocation sources, one explicit causal program, requirements, and execution facts. Execution-local transactions, direct effects, transaction outputs, and effect intents are declared **at the program or transaction site that executes or establishes them**. They are not predeclared as operation-level capabilities or handles: the governing rule is that a semantic object existing because control reaches a particular execution site is declared at that site, and a separate shared declaration is kept only where the contract exists independently of any one execution occurrence — inputs, schemas, data models, topics, state machines and their transition side-effect contracts, requirements, and execution guarantees.
 
 `description` is documentation only and has no proof semantics.
 
@@ -425,19 +425,15 @@ A concrete invocation is associated with the input that triggered it. A `ValueRe
 
 Multiple input declarations do not mean that one invocation simultaneously receives all of them.
 
-### Declared effects are capabilities, not executions
+### Stable execution-site IDs versus bindings
 
-An effect appearing in `operation.effects` is an effect the operation **may execute**.
+Two kinds of names arise from inline declarations, and they are not the same thing.
 
-Declaration alone does not mean the effect occurs.
+Some inline occurrences carry a **stable execution-site ID**: `Transaction.id`, `ExecuteEffect.effect_id`, `EstablishEffectIntent.effect_id`. These IDs do not reference another declaration; each identifies the inline declaration itself — for keyed commit identity, value lineage, diagnostics, conformance, proof evidence, and visualization. A step's `StepLocation` (§16) is not a substitute: moving an inline transaction must not silently change its durable commit identity.
 
-Execution is represented by a program step — a direct `execute_effect`, or an `execute_effect_intent` of an intent a transaction established — that explicitly associates the effect with behavior (§16).
+**Bindings** name something produced by execution: a transaction read observation, a transaction output artifact, an effect-intent artifact, an effect result observation. Bindings are immutable, single-producer, operation-local, and scoped by the program and transaction structure (§16). There is no rebinding and no shadowing; a binding is not mutable storage and not a durability guarantee. This is not a general variable system — bindings are semantic names whose meaning is determined by the construct that introduces them.
 
-### Transactions are declarations, not executions
-
-A transaction in `operation.transactions` is an atomic unit available to the operation's program.
-
-It executes only when a program step references it.
+Every stable execution-site ID and every binding ID must be unique within the operation; the IDs live in the global namespace of §2, so two sites declaring one ID collide (`DuplicateId`). One inline transaction declaration is one transaction occurrence: two locations that genuinely execute transactions declare two inline transactions with distinct IDs. If authoring reuse is later desired, it belongs to a macro/template layer expanding before semantic analysis, not to a semantic transaction-call primitive.
 
 ### The program is one explicit causal control structure
 
@@ -860,13 +856,13 @@ A value reference is evaluated by some set of invocations, and may only name a s
 
 The evaluating invocations are determined by where the reference is declared:
 
-- a reference declared within an operation — in its requirements, its effects, its transactions, or its program — is evaluated by invocations of **that operation**;
+- a reference declared within an operation — in its requirements or anywhere in its program, transaction bodies and inline effect contracts included — is evaluated by invocations of **that operation**;
 - a reference declared on a state-machine transition side effect is evaluated by invocations of **whichever operation applies that transition**.
 
 From that scope:
 
-- `input`, `transaction_output`, `effect_result_ok`, and `effect_result_err` must name declarations of an admitted operation. An input, a transaction output, and a result binding each belong to exactly one operation: another operation's input is never the "current invocation's input payload", and another operation's output or bound result is never available to this invocation.
-- `effect` must name an effect of an admitted operation, or a transition side effect of a transition an admitted operation applies.
+- `input`, `transaction_output`, `effect_result_ok`, and `effect_result_err` must name declarations of an admitted operation. An input, a transaction-output binding, and a result binding each belong to exactly one operation: another operation's input is never the "current invocation's input payload", and another operation's output or bound result is never available to this invocation.
+- `effect` must name an inline effect occurrence of an admitted operation, or a transition side effect of a transition an admitted operation applies.
 - `state_machine_subject` is unrestricted. State machines are global, and any operation may address the persistent objects they govern.
 - `transaction_read` is restricted further, to the transaction execution that produces it. See §18.
 - `transaction_output`, `effect_result_ok`, and `effect_result_err` are restricted further still, to program points where control flow definitely provides them. See §16.
@@ -881,7 +877,9 @@ An input reference is not automatically replay-stable merely because two attempt
 
 ### `ValueSource::effect`
 
-References a field in the payload of a declared `PublicationEffect` or `RequestEffect`.
+References a field in the payload of a `PublicationEffect` or `RequestEffect`.
+
+For an operation-owned effect, the ID resolves to the inline occurrence that declares it: an `ExecuteEffect.effect_id` or an `EstablishEffectIntent.effect_id`. For a transition-owned effect it resolves, as before, to the state-machine transition side-effect declaration. This preserves the idempotency-key-propagation and value-lineage semantics without an operation effect registry.
 
 Declaring such a reference establishes value lineage only if the surrounding declaration states how the value is propagated. It does not mean the effect has already executed.
 
@@ -889,13 +887,13 @@ An external effect has no inspectable payload schema in the current DSL and ther
 
 ### `ValueSource::transaction_output`
 
-References a field of a `TransactionOutput` (§15): a typed value a transaction of the same operation exported into the operation's control.
+References a field of a transaction-output binding (§15): a typed value a transaction of the same operation exported into the operation's control. The ID resolves to the `establish_transaction_output` binder that produces it, whose declared `schema` the path resolves against.
 
 Availability is a matter of control flow. The reference is valid only at a program point where the output is **definitely available**: established or recovered by a transaction on every path reaching that point (§16). Within the establishing transaction itself, a later step may reference the output by step order. How the value reaches a retry — reconstruction by a naturally replayable establishing transaction, or recovery from an explicitly keyed commit — is the §17 question, and the source kind does not itself imply independent durable storage.
 
 ### `ValueSource::effect_result_ok` and `ValueSource::effect_result_err`
 
-Reference a field of the `Ok` or `Err` payload of a bound effect result (§13), where the id names the result binding of an `execute_effect` or `execute_effect_intent` step. The path resolves against the effect contract's `ok` or `err` schema respectively.
+Reference a field of the `Ok` or `Err` payload of a bound effect result (§13), where the id names the `bind` of an `execute_effect` or `execute_effect_intent` step. The path resolves against the effect contract's `ok` or `err` schema respectively.
 
 These are **operation-local observations** of the current attempt. They are not transaction artifacts, and they are not inherently durable. Each is available only inside the arm of a `match_result` on that binding that selects its variant: `effect_result_ok` in the `ok` arm, `effect_result_err` in the `err` arm. Neither survives the join after the match (§16).
 
@@ -907,9 +905,9 @@ The path is interpreted against that subject object's schema. Mutable subject st
 
 ### `ValueSource::transaction_read`
 
-References a field observed by a named `Read` earlier in the same transaction execution.
+References a field observed by a `Read` earlier in the same transaction execution, through the read's `bind`.
 
-Transaction-read results are transaction-local provenance sources. They are not durable cross-transaction artifacts and are not available to later transactions or program steps merely because the surrounding program continues. Information observed inside a transaction reaches later control only by being exported through a `TransactionOutput` (§15).
+Transaction-read bindings are transaction-local provenance sources. They are not durable cross-transaction artifacts and are not available to later transactions or program steps merely because the surrounding program continues. Information observed inside a transaction reaches later control only by being exported through a transaction output (§15).
 
 V1 permits them in the semantic model but does not use a provenance chain that reaches a transaction read to prove natural transaction replayability. See §18.
 
@@ -959,13 +957,15 @@ Effects describe work outside the operation's immediate transaction state.
 
 An effect declaration is a contract describing what kind of logical work occurs. Depending on effect kind, this includes information such as the destination or target, the schema, retry semantics, idempotency-key propagation, and external idempotency guarantees.
 
-It does not define how the values of a particular effect instance are computed. An effect instance is constructed at an execution or establishment site, and each such site declares the provenance of the values used to construct it:
+An operation-owned contract lives inline at its one execution or establishment site (§7); a transition-owned contract lives on the state-machine transition, shared by every operation applying it (§22). Either way the contract does not define how the values of a particular effect instance are computed. An effect instance is constructed at an execution or establishment site, and each such site declares the provenance of the values used to construct it:
 
-- a direct `execute_effect` program step declares `values` (§16);
-- an explicit `establish_effect_intent` transaction step declares `values` (§14);
-- a `transition` transaction step declares `effect_values`, one derivation per side effect of the applied transition (§22).
+- a direct `execute_effect` program step declares the contract and `values` (§16);
+- an explicit `establish_effect_intent` transaction step declares the contract and `values` (§14);
+- a `transition` transaction step declares `effect_intents`, one intent binding and one derivation per side effect of the applied transition (§22).
 
 `execute_effect_intent` consumes an already-established effect instance and therefore declares no derivation: the instance's values were fixed at establishment (§14).
+
+A contract's own value references — an external deduplication key, propagation components — are evaluated at the site's actual context: a direct effect's in the operation context immediately before the `execute_effect` step; an explicitly established intent's in the enclosing transaction context at the `establish_effect_intent` step, where they may use preceding transaction reads and outputs under the usual rules; a transition-owned effect's in the applying transaction context at the `transition` step (§22).
 
 ### Effect results
 
@@ -975,7 +975,7 @@ A synchronous effect may yield a first-class `Result<Ok, Err>` (§8.1). Which ef
 - a **request** inherits the result contract of the request input it targets, and never redeclares it (§13.2);
 - an **external** effect may declare `result: { ok, err }`, or declare none (§13.3).
 
-An execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique id (`result: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an operation-local observation of the current attempt, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
+An execution site — `execute_effect` or `execute_effect_intent` — may **bind** the result under an operation-unique binding (`bind: result.charge_payment.card`). The result type is inferred from the contract, never restated at the site. A result-bearing effect may be executed without a binding when the result is deliberately ignored; an effect with no synchronous result must not declare one (validation: `EffectHasNoResult`). The binding is an attempt-local observation, not a transaction artifact, and its variant payloads are reached through `effect_result_ok` / `effect_result_err` inside a `match_result` on it (§11, §16).
 
 The returned result is a separate semantic object from the outgoing effect payload. Stable outgoing values do not by themselves prove a stable returned result; effect-result replay is judged on its own (§18).
 
@@ -1099,69 +1099,30 @@ Relative to a governing key, a bound external result is therefore replay-stable 
 
 ## 14. Effect intents
 
-### `EffectIntent`
+### The intent binding
 
-An effect intent is a **logical transaction artifact** describing an intended effect execution.
+An effect intent is a **logical transaction artifact** describing an intended effect execution: a captured logical effect instance awaiting execution.
 
-An effect intent is not inherently synonymous with a durable database record, and declaring one does not establish it. `EstablishEffectIntent` establishes the logical artifact as part of a transaction execution.
+There is no standalone intent declaration. An intent exists because a transaction site establishes it, and the site introduces the operation-local **binding** under which the artifact is available to later control:
 
-An intent declaration does not imply an invisible independent executor or independent rediscovery mechanism: execution happens only through an `execute_effect_intent` program step, and retry availability only through the §17 routes.
+- an explicit `establish_effect_intent` transaction step (below); or
+- a `transition` transaction step, which binds one intent per side effect of the applied transition (§22).
 
-### Intent derivation
+An effect intent is not inherently synonymous with a durable database record. It implies no invisible independent executor or independent rediscovery mechanism: execution happens only through an `execute_effect_intent` program step, and retry availability only through the §17 routes.
 
-Establishing an intent constructs one logical instance of its effect. For `EstablishEffectIntent(I, D)`, where intent `I` refers to effect `E`:
+### `EstablishEffectIntent`
 
-1. one logical instance of `E` is constructed;
-2. its values are obtained according to derivation `D`;
-3. `I` is established as a transaction artifact representing that exact effect instance.
-
-`EstablishEffectIntent.values` is therefore the provenance declaration for the constructed instance.
-
-If the intent is deterministically derived from replay-stable provenance and the establishing transaction is naturally replayable, a retry may reconstruct the same logical intent without requiring the intent payload itself to have been durably materialized.
-
-If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exact intent produced by the first successful logical commit is retained with that commit and recovered when the transaction step is encountered again under the same key.
-
-### `ExecuteEffectIntent`
-
-A program step executing an intent performs or attempts the work represented by the logical intent available to the current invocation.
-
-`ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
-
-The effect instance was already constructed when the intent was established, so `ExecuteEffectIntent` declares no derivation and must never recompute or replace the intent's values.
-
-It may bind the effect's synchronous result, exactly as a direct execution does (§13): a request intent yields its target input's result, an intent of an external effect yields the declared one, an intent of a publication yields none and may not bind. Binding a result adds no outgoing-value derivation; the instance stays the one the transaction captured.
-
-Reconstructing or recovering the same intent does **not** prove that repeating the external effect is safe. A crash after an external effect succeeds but before completion is durably known may still lead to another effect attempt. Effect-level idempotency/retry semantics must handle that uncertainty.
-
----
-
-## 15. Transaction outputs and request results
-
-### `TransactionOutput`
-
-A transaction output is a logical transaction artifact shaped by a declared schema: a typed value a transaction deliberately exports into the enclosing operation's control.
+An `establish_effect_intent` transaction step declares an effect contract, constructs one concrete logical effect instance from `values`, and atomically establishes that captured instance as the `EffectIntent` artifact named by `bind`:
 
 ```yaml
-transaction_outputs:
-  output.create_order:
-    schema: schema.CreateOrderResponse
-```
-
-It represents **data** — a reservation id, a selected account, remaining stock, a routing decision, authorization metadata, a normalized version of the input. Later control may use it for branching, effect construction, another transaction, or terminal result construction. Its single meaning is:
-
-> This transaction deliberately exposes this typed logical value to the enclosing operation.
-
-A transaction output does **not** imply an operation result, success or failure, effect execution, idempotency, database storage, or memoization. It is semantically separate from transaction idempotency: establishing an output does not, by itself, prevent the enclosing transaction from executing or committing again. It is not inherently synonymous with a durable database record; its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit (below).
-
-A transaction output is intentionally generic and is not a `Result`. Outputs remain schema-shaped; `Result<Ok, Err>` is reserved for request results and synchronous effect results (§8.1, §13). If a future architecture requires result-typed outputs, the type model is to be extended deliberately rather than by coupling that concern into `TransactionOutput`.
-
-### `EstablishTransactionOutput`
-
-The transaction step `establish_transaction_output` establishes an operation-owned output within the surrounding transaction execution:
-
-```yaml
-- kind: establish_transaction_output
-  output: output.create_order
+- kind: establish_effect_intent
+  bind: intent.publish_created
+  effect_id: effect.publish_created
+  effect:
+    kind: publication
+    topic: topic.order_events
+    schema: schema.OrderCreated
+    idempotency_key_propagation: []
   values:
     kind: deterministic
     from:
@@ -1169,12 +1130,69 @@ The transaction step `establish_transaction_output` establishes an operation-own
         path: order_id
 ```
 
-For `EstablishTransactionOutput(O, D)`, the transaction:
+The step simultaneously:
 
-1. constructs a value shaped by `O.schema`;
-2. declares its provenance through `D`, evaluated in the transaction context at that step — it may reference operation-level values, artifacts available on entry, outputs established earlier in the same transaction, and preceding `transaction_read` results under the §18 rules;
-3. establishes `O` atomically with the transaction commit;
-4. makes `O` available to subsequent operation control after successful execution or commit recovery.
+1. declares the effect contract, identified by `effect_id` — the stable identity of the captured inline effect occurrence (§7), not a lookup into any registry;
+2. constructs the concrete logical effect instance according to `values`, the instance's provenance declaration;
+3. establishes that exact instance as the artifact bound by `bind`.
+
+The intent binding is not the effect declaration: `bind` names the artifact, `effect_id` names the captured logical effect site. The contract's own value references and the instance derivation are evaluated in the enclosing transaction context at this step, so they may use preceding transaction reads and outputs where the usual rules permit them (§13, §18).
+
+If the intent is deterministically derived from replay-stable provenance and the establishing transaction is naturally replayable, a retry may reconstruct the same logical intent without requiring the intent payload itself to have been durably materialized.
+
+If the establishing transaction is explicitly `DeduplicatedBy { key }`, the exact intent produced by the first successful logical commit is retained with that commit and recovered when the transaction step is encountered again under the same key.
+
+### `ExecuteEffectIntent`
+
+A program step executing an intent performs or attempts the work represented by the logical intent available to the current invocation. It consumes the **definitely available** binding (§16) and executes the exact captured instance.
+
+`ExecuteEffectIntent` is the modeled execution authority for the intent. Intent establishment alone does not execute the underlying effect.
+
+The effect instance was already constructed when the intent was established, so `ExecuteEffectIntent` declares no derivation and must never recompute or replace the intent's values.
+
+It may bind the effect's synchronous result under `bind`, exactly as a direct execution does (§13): a request intent yields its target input's result, an intent of an external effect yields the declared one, an intent of a publication yields none and may not bind. Binding a result adds no outgoing-value derivation; the instance stays the one the transaction captured.
+
+Reconstructing or recovering the same intent does **not** prove that repeating the external effect is safe, and executing it implies no exactly-once effect execution. A crash after an external effect succeeds but before completion is durably known may still lead to another effect attempt. Effect-level idempotency/retry semantics must handle that uncertainty.
+
+---
+
+## 15. Transaction outputs and request results
+
+### The transaction-output binding
+
+A transaction output is a logical transaction artifact shaped by a declared schema: a typed value a transaction deliberately exports into the enclosing operation's control.
+
+It represents **data** — a reservation id, a selected account, remaining stock, a routing decision, authorization metadata, a normalized version of the input. Later control may use it for branching, effect construction, another transaction, or terminal result construction. Its single meaning is:
+
+> This transaction deliberately exposes this typed logical value to the enclosing operation.
+
+There is no standalone output declaration: the `establish_transaction_output` binder declares in one place the artifact's binding, its schema, its producer transaction and step, and its derivation.
+
+A transaction output does **not** imply an operation result, success or failure, effect execution, idempotency, database storage, or memoization. It is semantically separate from transaction idempotency: establishing an output does not, by itself, prevent the enclosing transaction from executing or committing again. It is not inherently synonymous with a durable database record; its logical availability after retry may come from deterministic reconstruction or from durable retention by an explicitly keyed transaction commit (below).
+
+A transaction output is intentionally generic and is not a `Result`. Outputs remain schema-shaped; `Result<Ok, Err>` is reserved for request results and synchronous effect results (§8.1, §13). If a future architecture requires result-typed outputs, the type model is to be extended deliberately rather than by coupling that concern into the output binder.
+
+### `EstablishTransactionOutput`
+
+The transaction step `establish_transaction_output` declares and establishes an output within the surrounding transaction execution:
+
+```yaml
+- kind: establish_transaction_output
+  bind: output.create_order
+  schema: schema.CreateOrderResponse
+  values:
+    kind: deterministic
+    from:
+      - source: input:input.create_order.request
+        path: order_id
+```
+
+For `EstablishTransactionOutput(bind, schema, D)`, the transaction:
+
+1. constructs a value shaped by `schema`;
+2. declares its provenance through `D`, evaluated in the transaction context at that step — it may reference operation-level values, artifacts available on entry, outputs established earlier in the same transaction, and preceding `transaction_read` bindings under the §18 rules;
+3. establishes the artifact atomically with the transaction commit;
+4. makes `bind` available to subsequent operation control after successful execution or commit recovery.
 
 ### Transaction-output replay
 
@@ -1244,26 +1262,28 @@ No explicit recovery step exists for a transaction output or an effect intent; r
 
 ### `transaction`
 
-Executes or resolves the referenced operation-local transaction.
+Declares and executes one atomic transaction at that point in the operation program, or resolves its prior keyed commit. The step **is** the transaction: it carries the stable logical `id` together with the data-model boundary, isolation guarantee, idempotency guarantee, and ordered body (§17). The ID identifies the inline transaction for keyed commit recovery, conformance, proof evidence, and diagnostics; it is not a reference to another declaration.
 
-For an ordinary transaction, this means executing the transaction body.
+For an ordinary transaction, reaching the step means executing the transaction body.
 
-For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commit already exists, the step resolves that prior commit instead of committing the body again and restores the artifacts retained by that commit.
+For a transaction explicitly `DeduplicatedBy { key }`, if the same logical commit already exists, the step resolves that prior commit instead of committing the body again and restores the artifacts retained by that commit. The durable identity is conceptually `Commit(operation, id, K)` — which is why the ID, not the step's location, carries it: moving the step must not silently change durable commit identity.
 
 ### `execute_effect`
 
-Executes the referenced operation-owned logical effect directly.
+Declares one logical effect contract and one concrete execution site.
 
-For `ExecuteEffect(E, D)`, the step:
+For `ExecuteEffect(effect_id, E, D)`, reaching the step:
 
-1. constructs one logical instance of effect `E`;
+1. constructs one logical instance of the inline contract `E`;
 2. obtains its values according to derivation `D`;
 3. executes that effect instance;
-4. optionally binds the effect's synchronous result under `result` (§13).
+4. optionally binds the effect's synchronous result under `bind` (§13).
+
+`effect_id` identifies the inline effect occurrence itself; it is not a lookup into an operation-level effect registry, and it must be unique within the operation (§7). The distinction stands: `effect` is the logical contract, `values` the provenance of the concrete instance constructed here.
 
 `values` declares the provenance of the complete logical effect instance, for every effect kind, using the same `Derivation` vocabulary as transaction-level provenance declarations (§18). Unknown provenance must be declared explicitly as `unspecified` rather than omitted.
 
-Because the step occurs at program level rather than inside a transaction, the derivation is evaluated in the operation-level value context. It may not reference `transaction_read` results, which are local to a transaction execution (§18).
+Because the step occurs at program level rather than inside a transaction, the derivation — and the inline contract's own value references (§13) — are evaluated in the operation-level value context immediately before the step. Neither may reference `transaction_read` bindings, which are local to a transaction execution (§18).
 
 For natural replay idempotency, the analyzer must prove `D` replay-deterministic: `deterministic` plus replay-stable provenance roots (§18) establishes that a retry constructs the same logical effect instance. Effect payload stability, duplicate-execution safety, and effect-result stability remain three separate proof obligations. Validation checks only that the derivation's references and field paths are structurally coherent; replay stability is solver responsibility.
 
@@ -1335,23 +1355,33 @@ Validation establishes that the program is structurally coherent. It performs no
 
 1. **Termination.** Every reachable path ends at a `return` or `complete` (`ProgramNotTerminated`). A block whose last step is a decision terminates only if every arm of that decision terminates; a `branch` without `otherwise` never does.
 2. **Reachability.** No step follows a terminal — or a decision whose every arm terminates — in its block (`UnreachableProgramStep`, reported for the first dead step of a block).
-3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an executed effect's own declaration roots (an external deduplication key, propagation components). Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
+3. **Definite artifact availability.** A transaction artifact — transaction output or effect intent — may be consumed only at a program point where a transaction on **every** path reaching that point establishes or recovers it (`TransactionArtifactNotAvailable`). Consumers are: an `execute_effect_intent` of the intent; a `transaction_output` reference in an effect derivation, a branch condition, a `return` outcome, another transaction's commit key or body, or an effect contract's own roots at the site where they are evaluated (§13) — an external deduplication key, propagation components. Inside one transaction, a reference to an output that transaction establishes is satisfied by step order.
 4. **Definite result assignment.** A result binding may be matched or referenced only where an effect-executing step on every path reaching the point has bound it (`EffectResultNotBound`).
 5. **Variant scope.** `effect_result_ok:<r>` is legal only inside the `ok` arm of a `match_result` on `r`, `effect_result_err:<r>` only inside its `err` arm (`EffectResultVariantOutOfScope`). Field paths resolve against the variant's schema.
-6. **Result-binding contracts.** A binding is declared only by a step executing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication. Binding ids are globally unique and owned by the operation.
+6. **Result-binding contracts.** A binding is declared only by a step executing a result-bearing effect (`EffectHasNoResult`): a request, whose contract resolves through its target input; an external effect declaring `result`; never a publication.
 7. **Return target.** `return.request` names an operation-owned **request** input (`InvalidInputKind` for a subscription). The outcome's derivation roots must be definitely available under rules 3–5.
-8. **Ownership.** Referenced transactions, effects, and intents belong to the operation; every value reference respects §11 scope.
+8. **Identity.** Every inline `Transaction.id`, inline `effect_id`, and binding ID is unique (`DuplicateId`, §7); an `execute_effect_intent` names an intent binding produced by this operation's program; every value reference respects §11 scope.
 
-Rules 3–5 are a **forward definite-availability analysis** over the block structure:
+Rules 3–5 are a **forward definite-availability analysis** over the block structure, with producers discovered inline:
 
 ```text
+before Read(bind=r): r unavailable
+after Read(bind=r):  r available inside the same transaction
+transaction exit:    r unavailable
+
 Available(entry)      = {}
-Available(after T)    = Available(before T) ∪ EstablishedOrRecoveredBy(T)
+Available(after T)    = Available(before T) ∪ Artifacts(T)
 Available(after E→r)  = Available(before) ∪ {r}
 Available(join)       = ∩ Available(each predecessor that falls through)
 ```
 
-A predecessor arm that terminates imposes no constraint on the join. `EstablishedOrRecoveredBy(T)` is the transaction's explicitly established outputs and intents plus the operation's intents for the side effects of every transition it applies (§22). Variant selection is not joined at all: an arm selects its variant for its own extent only.
+`Artifacts(T)` is the transaction's explicitly bound outputs, its explicitly bound intents, and the transition intents it binds (§22). A predecessor arm that terminates imposes no constraint on the join. Variant selection is not joined at all: an arm selects its variant for its own extent only.
+
+Bindings exist only after their producer — there are **no forward references**. Using an output before its binder's transaction, executing an intent before the transaction that binds it, or matching a result before the step that binds it is a use-before-bind / not-definitely-available error; the validator never resolves an operation-wide declaration and hopes control eventually produces it. A producer existing somewhere in the operation does not make its binding globally available: a binding may be consumed only where every falling-through path to the consumer has produced it, subject to the stronger binding-kind scopes — transaction reads never leave their transaction, and result variant payloads remain local to their `match_result` arm.
+
+A binding has one syntactic producer and is never merged with a differently produced value from another arm: this model has no phi or merge construct. If two falling-through arms must produce different values for a later common consumer, keep the consumer inside each arm or restructure the program.
+
+Operation requirements live outside the causal execution body, so program-produced bindings are not in scope inside `Operation.requirements`: idempotency and recoverability governing keys define the invocation equivalence class from the triggering boundary, never from values the invocation later produces (§12).
 
 ### Paths and path admission
 
@@ -1401,9 +1431,9 @@ Program steps carry no ids. Diagnostics, proofs, and obstacles name a step by it
 
 ### `Transaction`
 
-A transaction is one atomic commit/abort unit.
+A transaction is one atomic commit/abort unit, declared inline at the program step that executes it (§16).
 
-Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
+`id` is the transaction's stable logical identity: unique within the operation, carried by the inline declaration itself, and the identity under which a keyed commit is durably recognized. Its object accesses are interpreted against its declared `data_model`. Its steps are logically ordered as written.
 
 Atomicity does not imply serializability, and serializability is a statement about committed transactions only — it is not to be read as any stronger object-history property (§5).
 
@@ -1671,11 +1701,11 @@ transaction-read dependence, the only backward-looking observation,
 is excluded outright. Two paths sharing a prefix reach the prefix's
 steps with the same context and reach the same judgments about them.
 
-### Transaction read results
+### Transaction read bindings
 
-A `Read` names a transaction-local result so later steps in the same transaction can reference fields from that result through `ValueSource::TransactionRead`.
+A `Read` binds a transaction-local observation under `bind` so later steps in the same transaction can reference fields from it through `ValueSource::TransactionRead`.
 
-A transaction-read result is an observation of transaction state, not a replay-stability guarantee.
+A transaction-read binding is an observation of transaction state, not a replay-stability guarantee. It exists only after the read, is visible only inside the same transaction execution, and never becomes a transaction artifact.
 
 Validation requires that a transaction-read source:
 
@@ -1778,7 +1808,7 @@ Reads the selected object instances.
 
 `fields` describes the read set visible to conflict analysis.
 
-The step names the transaction-local read result (§18) so later steps in the same transaction can use it as deterministic provenance.
+The step binds the transaction-local observation under `bind` (§18) so later steps in the same transaction can use it as deterministic provenance.
 
 #### `FieldSelection::all`
 
@@ -1914,22 +1944,15 @@ Where an idempotency, result-replay, or recoverability obligation depends on rep
 
 ### Transition side effects
 
-A transition may declare publication or request side effects associated with taking that transition.
+A transition may declare publication or request side effects associated with taking that transition. This is intentionally different from operation-owned effects: a state machine exists independently of any one operation and may be applied by several, so its side-effect contracts remain shared model-level declarations while operation-owned effects are execution-local and inline (§7).
 
 For replay semantics, these side effects are treated as **implicitly established effect-intent transaction artifacts** when the transition successfully commits. They are not direct external executions inside the application-state transaction.
 
-Therefore transition side effects commit logically with the transition as intents, enter the invocation artifact context, and are subject to the same retention/recovery rules as explicitly established `EffectIntent`s.
+Therefore transition side effects commit logically with the transition as intents, enter the invocation artifact context, and are subject to the same retention/recovery rules as explicitly established intents.
 
-An implicitly established intent needs a stable logical identity so a later `ExecuteEffectIntent` step can name it. That identity is supplied by an operation-level `EffectIntent` whose `effect` is the transition side effect. The operation declares the handle; the transition establishes the artifact.
+An implicitly established intent needs an operation-local binding so a later `ExecuteEffectIntent` step can name it. The application site supplies it directly: the `transition` step's `effect_intents` map binds one intent per side effect (below). No separate operation-level intent declaration exists, and no uniqueness or establishability check on such declarations is needed — the application site names the artifact.
 
-Two rules keep that identity well defined:
-
-1. **Uniqueness.** An operation may declare at most one `EffectIntent` for a given transition side effect. A transition establishes exactly one logical intent per side effect, so two competing declarations would leave no rule for deciding which one the commit fills.
-2. **Establishability.** An operation may declare such an intent only if one of its transactions applies the owning transition. Otherwise nothing in the operation could ever establish it, and the handle names an artifact that never enters the invocation artifact context.
-
-Neither rule constrains explicitly established intents. Two `EffectIntent`s may name the same operation-owned effect, because each is established by its own `EstablishEffectIntent` step and the two are therefore distinguishable.
-
-Conversely, a transition side effect must **not** be established explicitly, and must not be executed by a direct `ExecuteEffect` step. Establishment is the transition's, and execution is `ExecuteEffectIntent`'s.
+A transition side effect must **not** be established explicitly, and must not be executed by a direct `ExecuteEffect` step: its ID belongs to the state machine's declaration, so an inline site claiming it is a `DuplicateId`. Establishment is the transition's, and execution is `ExecuteEffectIntent`'s.
 
 In particular, consider:
 
@@ -1946,28 +1969,43 @@ If the invocation crashes after `T` commits but before `ExecuteEffectIntent E`, 
 
 This still does not imply exactly-once external execution. Effect-level idempotency/retry analysis remains necessary.
 
-### Transition effect values
+### Transition effect intents
 
-The state-machine transition owns the effect contract; the applying `transition` transaction step owns the concrete instance provenance. `StateTransition.effect_values` maps each side effect declared by the applied transition to the `Derivation` used to construct that side effect's instance when the transition is applied.
+The state-machine transition owns the effect contract; the applying `transition` transaction step owns the concrete instance provenance and the artifact binding. `StateTransition.effect_intents` maps each side effect declared by the applied transition — the map key is the side-effect ID — to a `TransitionEffectIntent`: the operation-local `bind` under which the intent artifact is established, and the `Derivation` used to construct that side effect's instance when the transition is applied.
+
+```yaml
+- kind: transition
+  machine: machine.order_lifecycle
+  transition: transition.order.mark_paid
+  subject: ...
+  effect_intents:
+    effect.order.paid:
+      bind: intent.order_paid
+      values:
+        kind: deterministic
+        from:
+          - source: input:input.apply_payment.captured
+            path: order_id
+```
 
 The mapping must be exact:
 
 ```text
 transition.side_effects.keys()
 ==
-state_transition.effect_values.keys()
+state_transition.effect_intents.keys()
 ```
 
-Missing derivations, extra derivations, and derivations keyed by another transition's effects are all structural validation errors. A transition without side effects declares an empty map. Unknown provenance must be declared explicitly as `unspecified`; the validator does not synthesize missing entries, preserving the distinction between provenance intentionally unspecified and a provenance declaration accidentally missing.
+Each entry supplies exactly one concrete derivation and one operation-local intent binding. Missing entries, extra entries, and entries keyed by another transition's effects are all structural validation errors (`TransitionEffectIntentsMismatch`). A transition without side effects declares an empty map. Unknown provenance must be declared explicitly as `unspecified`; the validator does not synthesize missing entries, preserving the distinction between provenance intentionally unspecified and a provenance declaration accidentally missing.
 
-Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step. It may therefore reference valid operation-level values, transaction outputs available at that point (§16), and preceding `transaction_read` results, subject to the usual read-before-use and field-selection rules (§18). It is not evaluated in a static state-machine-transition context, because its values belong to a concrete transaction application of the transition.
+Each derivation is evaluated in the enclosing transaction context at the point of the `transition` step, as are the side-effect contracts' own roots (§13). It may therefore reference valid operation-level values, transaction outputs available at that point (§16), and preceding `transaction_read` bindings, subject to the usual read-before-use and field-selection rules (§18). It is not evaluated in a static state-machine-transition context, because its values belong to a concrete transaction application of the transition.
 
 A successful transition transaction logically performs the following atomically:
 
 1. evaluate the state-transition guard;
 2. apply the state transition;
-3. construct each transition side-effect instance using its corresponding `effect_values` derivation;
-4. implicitly establish the corresponding effect-intent artifacts;
+3. construct each transition side-effect instance using its corresponding derivation;
+4. establish each bound effect-intent artifact;
 5. commit the transition state and established artifacts together.
 
 When the transaction declares `DeduplicatedBy { key }`, these derivations are evaluated only during the first successful keyed execution: a retry with the same transaction idempotency identity resolves `Commit(T,K)` and recovers the exact original artifacts without evaluating the derivations again, which is what lets transition effect values depend on transaction-local reads even though those reads may not be replay-stable. Without keyed deduplication no such recovery fact exists: the intents are established on first success like any other artifact, but nothing makes them replay-available, and obligations that need them settle unproven (§18).

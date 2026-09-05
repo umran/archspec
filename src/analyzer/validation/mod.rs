@@ -39,13 +39,13 @@ struct TransactionScope<'a> {
 }
 
 impl<'a> TransactionScope<'a> {
-    fn read(&self, result: &Id) -> Option<(usize, &'a Read)> {
+    fn read(&self, bind: &Id) -> Option<(usize, &'a Read)> {
         self.transaction
             .steps
             .iter()
             .enumerate()
             .find_map(|(position, step)| match step {
-                TransactionStep::Read(read) if &read.result == result => Some((position, read)),
+                TransactionStep::Read(read) if &read.bind == bind => Some((position, read)),
 
                 _ => None,
             })
@@ -102,6 +102,9 @@ impl<'a> ValueContext<'a> {
     }
 }
 
+/// The analyzer's derived program index: every lookup here is walked
+/// out of the operation programs, which remain the semantic source of
+/// truth. The index is analysis infrastructure only.
 struct ReferenceIndex<'a> {
     entries: BTreeMap<Id, ReferenceInfo<'a>>,
 
@@ -111,6 +114,14 @@ struct ReferenceIndex<'a> {
     /// applies the transition, so this determines what a value
     /// reference declared on that transition may observe.
     transition_appliers: BTreeMap<&'a Id, BTreeSet<&'a Id>>,
+
+    /// The contract of each operation-owned inline effect, by its
+    /// inline `effect_id` — direct execution sites and intent
+    /// establishment sites.
+    effect_contracts: BTreeMap<&'a Id, &'a Effect>,
+
+    /// The schema of each inline transaction-output binder, by binding.
+    output_schemas: BTreeMap<&'a Id, &'a Id>,
 
     /// The effect each result binding observes: the executed effect,
     /// or the effect of the executed intent.
@@ -132,18 +143,48 @@ impl<'a> ReferenceIndex<'a> {
         });
 
         let mut transition_appliers: BTreeMap<&Id, BTreeSet<&Id>> = BTreeMap::new();
+        let mut effect_contracts: BTreeMap<&Id, &Effect> = BTreeMap::new();
+        let mut output_schemas: BTreeMap<&Id, &Id> = BTreeMap::new();
+        let mut intent_effects: BTreeMap<&Id, &Id> = BTreeMap::new();
 
         for (operation_id, operation) in &model.operations {
-            for transaction in operation.transactions.values() {
-                for step in &transaction.steps {
-                    let TransactionStep::Transition(step) = step else {
-                        continue;
-                    };
+            for (_, step) in operation.program.steps_with_locations() {
+                match step {
+                    OperationStep::Transaction(transaction) => {
+                        for inner in &transaction.steps {
+                            match inner {
+                                TransactionStep::Transition(transition) => {
+                                    transition_appliers
+                                        .entry(&transition.transition)
+                                        .or_default()
+                                        .insert(operation_id);
 
-                    transition_appliers
-                        .entry(&step.transition)
-                        .or_default()
-                        .insert(operation_id);
+                                    for (effect_id, intent) in &transition.effect_intents {
+                                        intent_effects.insert(&intent.bind, effect_id);
+                                    }
+                                }
+
+                                TransactionStep::EstablishEffectIntent(establish) => {
+                                    effect_contracts
+                                        .insert(&establish.effect_id, &establish.effect);
+
+                                    intent_effects.insert(&establish.bind, &establish.effect_id);
+                                }
+
+                                TransactionStep::EstablishTransactionOutput(establish) => {
+                                    output_schemas.insert(&establish.bind, &establish.schema);
+                                }
+
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    OperationStep::ExecuteEffect(step) => {
+                        effect_contracts.insert(&step.effect_id, &step.effect);
+                    }
+
+                    _ => {}
                 }
             }
         }
@@ -154,16 +195,16 @@ impl<'a> ReferenceIndex<'a> {
             for (_, step) in operation.program.steps_with_locations() {
                 match step {
                     OperationStep::ExecuteEffect(step) => {
-                        if let Some(result) = &step.result {
-                            result_bindings.insert(result, &step.effect);
+                        if let Some(bind) = &step.bind {
+                            result_bindings.insert(bind, &step.effect_id);
                         }
                     }
 
                     OperationStep::ExecuteEffectIntent(step) => {
-                        if let (Some(result), Some(intent)) =
-                            (&step.result, operation.effect_intents.get(&step.intent))
+                        if let (Some(bind), Some(effect)) =
+                            (&step.bind, intent_effects.get(&step.intent))
                         {
-                            result_bindings.insert(result, &intent.effect);
+                            result_bindings.insert(bind, effect);
                         }
                     }
 
@@ -175,6 +216,8 @@ impl<'a> ReferenceIndex<'a> {
         Self {
             entries,
             transition_appliers,
+            effect_contracts,
+            output_schemas,
             result_bindings,
         }
     }
@@ -186,6 +229,16 @@ impl<'a> ReferenceIndex<'a> {
     /// The effect a result binding observes.
     fn binding_effect(&self, result: &Id) -> Option<&'a Id> {
         self.result_bindings.get(result).copied()
+    }
+
+    /// The contract of an operation-owned inline effect.
+    fn effect_contract(&self, effect: &Id) -> Option<&'a Effect> {
+        self.effect_contracts.get(effect).copied()
+    }
+
+    /// The schema an inline transaction-output binder declares.
+    fn output_schema(&self, bind: &Id) -> Option<&'a Id> {
+        self.output_schemas.get(bind).copied()
     }
 
     fn applies_transition(&self, operation: &Id, transition: &Id) -> bool {
@@ -247,8 +300,6 @@ pub fn validate(model: &Model) -> Vec<ValidationError> {
     errors.extend(validate_state_machines(model));
 
     errors.extend(validate_transactions(model, &index));
-
-    errors.extend(validate_effect_intents(model, &index));
 
     errors.extend(validate_result_bindings(model, &index));
 
@@ -464,7 +515,7 @@ fn validate_state_machines(model: &Model) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     for operation in model.operations.values() {
-        for (transaction_id, transaction) in &operation.transactions {
+        for (_, transaction) in operation.program.transactions() {
             for step in &transaction.steps {
                 let TransactionStep::Transition(step) = step else {
                     continue;
@@ -481,7 +532,7 @@ fn validate_state_machines(model: &Model) -> Vec<ValidationError> {
 
                 if &step.subject.object != expected_object {
                     errors.push(ValidationError::StateTransitionSubjectMismatch {
-                        transaction: transaction_id.clone(),
+                        transaction: transaction.id.clone(),
                         machine: step.machine.clone(),
                         expected_object: expected_object.clone(),
                         actual_object: step.subject.object.clone(),
@@ -498,13 +549,12 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
     let mut errors = Vec::new();
 
     for operation in model.operations.values() {
-        for (transaction_id, transaction) in &operation.transactions {
+        for (_, transaction) in operation.program.transactions() {
             for step in &transaction.steps {
                 match step {
                     TransactionStep::Read(read) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &read.target.object,
                             &mut errors,
@@ -514,7 +564,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                     TransactionStep::Write(write) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &write.target.object,
                             &mut errors,
@@ -524,7 +573,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                     TransactionStep::Insert(insert) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &insert.object,
                             &mut errors,
@@ -534,7 +582,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                     TransactionStep::Delete(delete) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &delete.target.object,
                             &mut errors,
@@ -544,7 +591,6 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                     TransactionStep::Lock(lock) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &lock.target.object,
                             &mut errors,
@@ -554,31 +600,21 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
                     TransactionStep::Transition(transition) => {
                         validate_transaction_object(
                             index,
-                            transaction_id,
                             transaction,
                             &transition.subject.object,
                             &mut errors,
                         );
 
-                        validate_transition_effect_values(
+                        validate_transition_effect_intents(
                             model,
-                            transaction_id,
+                            &transaction.id,
                             transition,
                             &mut errors,
                         );
                     }
 
-                    TransactionStep::EstablishEffectIntent(step) => {
-                        validate_established_intent(
-                            index,
-                            transaction_id,
-                            operation,
-                            &step.intent,
-                            &mut errors,
-                        );
-                    }
-
-                    TransactionStep::EstablishTransactionOutput(_) => {}
+                    TransactionStep::EstablishEffectIntent(_)
+                    | TransactionStep::EstablishTransactionOutput(_) => {}
                 }
             }
         }
@@ -587,45 +623,10 @@ fn validate_transactions(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valid
     errors
 }
 
-/// A transition side effect is established implicitly by a successful
-/// transition, so it must not also be established explicitly.
-fn validate_established_intent(
-    index: &ReferenceIndex<'_>,
-    transaction_id: &Id,
-    operation: &Operation,
-    intent_id: &Id,
-    errors: &mut Vec<ValidationError>,
-) {
-    let intent = operation
-        .effect_intents
-        .get(intent_id)
-        .expect("references already validated");
-
-    let info = index
-        .get(&intent.effect)
-        .expect("references already validated");
-
-    let Some(owner) = info.owner else {
-        return;
-    };
-
-    let owner_info = index.get(owner).expect("effect owner exists");
-
-    if owner_info.kind == ReferenceKind::Transition {
-        errors.push(
-            ValidationError::TransitionEffectIntentExplicitlyEstablished {
-                transaction: transaction_id.clone(),
-                intent: intent_id.clone(),
-                effect: intent.effect.clone(),
-            },
-        );
-    }
-}
-
-/// Applying a transition constructs one effect instance per declared
-/// side effect, so the step must supply exactly one value derivation
-/// for each of them — no more, no fewer.
-fn validate_transition_effect_values(
+/// Applying a transition establishes one bound intent per declared
+/// side effect, so the step must supply exactly one binding and one
+/// derivation for each of them — no more, no fewer.
+fn validate_transition_effect_intents(
     model: &Model,
     transaction_id: &Id,
     transition: &StateTransition,
@@ -642,13 +643,13 @@ fn validate_transition_effect_values(
         .expect("references already validated");
 
     let declared: BTreeSet<&Id> = declaration.side_effects.keys().collect();
-    let provided: BTreeSet<&Id> = transition.effect_values.keys().collect();
+    let provided: BTreeSet<&Id> = transition.effect_intents.keys().collect();
 
     if declared == provided {
         return;
     }
 
-    errors.push(ValidationError::TransitionEffectValuesMismatch {
+    errors.push(ValidationError::TransitionEffectIntentsMismatch {
         transaction: transaction_id.clone(),
         transition: transition.transition.clone(),
         missing: declared
@@ -660,59 +661,6 @@ fn validate_transition_effect_values(
             .map(|effect| (*effect).clone())
             .collect(),
     });
-}
-
-/// A transition establishes exactly one logical intent for each of its
-/// side effects, so an operation's handle on that artifact must be
-/// unambiguous and must actually be establishable.
-fn validate_effect_intents(model: &Model, index: &ReferenceIndex<'_>) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    for (operation_id, operation) in &model.operations {
-        let mut by_transition_effect: BTreeMap<&Id, Vec<&Id>> = BTreeMap::new();
-
-        for (intent_id, intent) in &operation.effect_intents {
-            let info = index
-                .get(&intent.effect)
-                .expect("references already validated");
-
-            let Some(owner) = info.owner else {
-                continue;
-            };
-
-            let owner_info = index.get(owner).expect("effect owner exists");
-
-            if owner_info.kind != ReferenceKind::Transition {
-                continue;
-            }
-
-            by_transition_effect
-                .entry(&intent.effect)
-                .or_default()
-                .push(intent_id);
-
-            if !index.applies_transition(operation_id, owner) {
-                errors.push(ValidationError::UnestablishableTransitionEffectIntent {
-                    operation: operation_id.clone(),
-                    intent: intent_id.clone(),
-                    effect: intent.effect.clone(),
-                    transition: owner.clone(),
-                });
-            }
-        }
-
-        for (effect, intents) in by_transition_effect {
-            if intents.len() > 1 {
-                errors.push(ValidationError::AmbiguousTransitionEffectIntent {
-                    operation: operation_id.clone(),
-                    effect: effect.clone(),
-                    intents: intents.into_iter().cloned().collect(),
-                });
-            }
-        }
-    }
-
-    errors
 }
 
 // Validate Field Paths
@@ -833,26 +781,8 @@ fn validate_field_paths(model: &Model, index: &ReferenceIndex<'_>) -> Vec<Valida
             );
         }
 
-        for (effect_id, effect) in &operation.effects {
-            validate_effect_paths(
-                model,
-                index,
-                effect_id,
-                ValueContext::operation(operation_id),
-                effect,
-                &mut errors,
-            );
-        }
-
-        for (transaction_id, transaction) in &operation.transactions {
-            validate_transaction_paths(
-                model,
-                index,
-                operation_id,
-                transaction_id,
-                transaction,
-                &mut errors,
-            );
+        for (_, transaction) in operation.program.transactions() {
+            validate_transaction_paths(model, index, operation_id, transaction, &mut errors);
         }
 
         validate_program_paths(model, index, operation_id, &operation.program, &mut errors);
@@ -960,19 +890,11 @@ fn validate_value_ref_path(
         }
 
         ValueSource::TransactionOutput(output_id) => {
-            let info = index.get(output_id).expect("references already validated");
+            let schema = index
+                .output_schema(output_id)
+                .expect("references already validated");
 
-            let operation_id = info.owner.expect("transaction output has an owner");
-
-            let output = model
-                .operations
-                .get(operation_id)
-                .expect("owner operation exists")
-                .transaction_outputs
-                .get(output_id)
-                .expect("transaction output exists");
-
-            validate_schema_path(model, subject, &output.schema, &value.path, errors);
+            validate_schema_path(model, subject, schema, &value.path, errors);
         }
 
         ValueSource::EffectResultOk(result_id) | ValueSource::EffectResultErr(result_id) => {
@@ -1169,11 +1091,11 @@ fn validate_transaction_paths(
     model: &Model,
     index: &ReferenceIndex<'_>,
     operation_id: &Id,
-    transaction_id: &Id,
     transaction: &Transaction,
     errors: &mut Vec<ValidationError>,
 ) {
     let operation = ValueContext::operation(operation_id);
+    let transaction_id = &transaction.id;
 
     // The commit key is evaluated for the invocation before the body
     // executes, so it may not observe transaction state.
@@ -1296,19 +1218,24 @@ fn validate_transaction_paths(
                     errors,
                 );
 
-                for values in transition.effect_values.values() {
+                for intent in transition.effect_intents.values() {
                     validate_derivation_paths(
                         model,
                         index,
                         transaction_id,
                         context,
-                        values,
+                        &intent.values,
                         errors,
                     );
                 }
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
+                // The inline effect contract's own references are
+                // evaluated in the enclosing transaction context at
+                // this step.
+                validate_effect_paths(model, index, &step.effect_id, context, &step.effect, errors);
+
                 validate_derivation_paths(
                     model,
                     index,
@@ -1384,7 +1311,6 @@ fn validate_predicate_paths(
 
 fn validate_transaction_object(
     index: &ReferenceIndex<'_>,
-    transaction_id: &Id,
     transaction: &Transaction,
     object: &Id,
     errors: &mut Vec<ValidationError>,
@@ -1393,7 +1319,7 @@ fn validate_transaction_object(
 
     let Some(data_model) = &transaction.data_model else {
         errors.push(ValidationError::TransactionMissingDataModel {
-            transaction: transaction_id.clone(),
+            transaction: transaction.id.clone(),
             object: object.clone(),
         });
 
@@ -1402,7 +1328,7 @@ fn validate_transaction_object(
 
     if info.owner != Some(data_model) {
         errors.push(ValidationError::TransactionObjectOutsideDataModel {
-            transaction: transaction_id.clone(),
+            transaction: transaction.id.clone(),
             data_model: data_model.clone(),
             object: object.clone(),
         });
@@ -1440,7 +1366,7 @@ fn validate_subscription_topic_membership(model: &Model, errors: &mut Vec<Valida
 
 fn validate_publication_topic_membership(model: &Model, errors: &mut Vec<ValidationError>) {
     for operation in model.operations.values() {
-        for (effect_id, effect) in &operation.effects {
+        for (effect_id, effect) in operation.program.effect_declarations() {
             if let Effect::Publication(publication) = effect {
                 validate_publication_membership(model, effect_id, publication, errors);
             }
@@ -1646,68 +1572,6 @@ fn validate_operation_references(
             validate_input_references(index, input_id, input, errors);
         }
 
-        for (effect_id, effect) in &operation.effects {
-            validate_effect_references(
-                model,
-                index,
-                effect_id,
-                ValueContext::operation(operation_id),
-                effect,
-                errors,
-            );
-        }
-
-        for (intent_id, intent) in &operation.effect_intents {
-            // Effect may be transition-owned.
-            expect_reference(
-                index,
-                intent_id,
-                &intent.effect,
-                ReferenceKind::Effect,
-                errors,
-            );
-        }
-
-        for (output_id, output) in &operation.transaction_outputs {
-            expect_reference(
-                index,
-                output_id,
-                &output.schema,
-                ReferenceKind::Schema,
-                errors,
-            );
-        }
-
-        for (transaction_id, transaction) in &operation.transactions {
-            if let Some(data_model) = &transaction.data_model {
-                expect_reference(
-                    index,
-                    transaction_id,
-                    data_model,
-                    ReferenceKind::DataModel,
-                    errors,
-                );
-            }
-
-            if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
-                validate_idempotency_key_references(
-                    index,
-                    transaction_id,
-                    ValueContext::operation(operation_id),
-                    key,
-                    errors,
-                );
-            }
-
-            validate_transaction_references(
-                index,
-                operation_id,
-                transaction_id,
-                transaction,
-                errors,
-            );
-        }
-
         validate_program_references(model, index, operation_id, &operation.program, errors);
 
         for requirement in &operation.requirements.serialization {
@@ -1836,12 +1700,36 @@ fn validate_input_references(
 }
 
 fn validate_transaction_references(
+    model: &Model,
     index: &ReferenceIndex<'_>,
     operation_id: &Id,
-    transaction_id: &Id,
     transaction: &Transaction,
     errors: &mut Vec<ValidationError>,
 ) {
+    let transaction_id = &transaction.id;
+
+    if let Some(data_model) = &transaction.data_model {
+        expect_reference(
+            index,
+            transaction_id,
+            data_model,
+            ReferenceKind::DataModel,
+            errors,
+        );
+    }
+
+    // The commit key is evaluated for the invocation before the body
+    // executes, so no transaction scope applies.
+    if let IdempotencyGuarantee::DeduplicatedBy { key } = &transaction.idempotency {
+        validate_idempotency_key_references(
+            index,
+            transaction_id,
+            ValueContext::operation(operation_id),
+            key,
+            errors,
+        );
+    }
+
     for (step_index, step) in transaction.steps.iter().enumerate() {
         let context = ValueContext::operation(operation_id).in_transaction(
             transaction_id,
@@ -1936,18 +1824,26 @@ fn validate_transaction_references(
                 // Side-effect instances are constructed when this step
                 // applies the transition, so their derivations are
                 // evaluated in the enclosing transaction context.
-                for values in transition.effect_values.values() {
-                    validate_derivation_references(index, transaction_id, context, values, errors);
+                for intent in transition.effect_intents.values() {
+                    validate_derivation_references(
+                        index,
+                        transaction_id,
+                        context,
+                        &intent.values,
+                        errors,
+                    );
                 }
             }
 
             TransactionStep::EstablishEffectIntent(step) => {
-                expect_owned_reference(
+                // The inline effect contract's references are evaluated
+                // in the enclosing transaction context at this step.
+                validate_effect_references(
+                    model,
                     index,
-                    transaction_id,
-                    &step.intent,
-                    ReferenceKind::EffectIntent,
-                    operation_id,
+                    &step.effect_id,
+                    context,
+                    &step.effect,
                     errors,
                 );
 
@@ -1961,12 +1857,11 @@ fn validate_transaction_references(
             }
 
             TransactionStep::EstablishTransactionOutput(step) => {
-                expect_owned_reference(
+                expect_reference(
                     index,
                     transaction_id,
-                    &step.output,
-                    ReferenceKind::TransactionOutput,
-                    operation_id,
+                    &step.schema,
+                    ReferenceKind::Schema,
                     errors,
                 );
 
@@ -1982,11 +1877,13 @@ fn validate_transaction_references(
     }
 }
 
-/// References made by the operation program, in the operation value
-/// context: a transition side effect is established as an intent and
-/// executed through `execute_effect_intent`, so a direct execution
-/// must name an operation-owned effect, and a `return` must name an
-/// operation-owned request input.
+/// References made by the operation program.
+///
+/// Inline declarations — transactions, direct effect contracts, intent
+/// establishment sites — are validated where they are declared; a
+/// `return` must name an operation-owned request input, and an intent
+/// execution must name an intent binding produced by this operation's
+/// program.
 fn validate_program_references(
     model: &Model,
     index: &ReferenceIndex<'_>,
@@ -1999,23 +1896,18 @@ fn validate_program_references(
     for (_, step) in program.steps_with_locations() {
         match step {
             OperationStep::Transaction(step) => {
-                expect_owned_reference(
-                    index,
-                    operation_id,
-                    &step.transaction,
-                    ReferenceKind::Transaction,
-                    operation_id,
-                    errors,
-                );
+                validate_transaction_references(model, index, operation_id, step, errors);
             }
 
             OperationStep::ExecuteEffect(step) => {
-                expect_owned_reference(
+                // The inline effect contract's references are evaluated
+                // in the operation context immediately before the step.
+                validate_effect_references(
+                    model,
                     index,
-                    operation_id,
+                    &step.effect_id,
+                    context,
                     &step.effect,
-                    ReferenceKind::Effect,
-                    operation_id,
                     errors,
                 );
 
@@ -2409,6 +2301,9 @@ fn visit_declarations<'a>(
         }
     }
 
+    // Inline declarations are visited at their program sites, so any
+    // two sites declaring one ID — two same-ID transactions, two
+    // producers of one binding — collide in the global namespace.
     for (operation_id, operation) in &model.operations {
         visit(operation_id, ReferenceKind::Operation, None);
 
@@ -2416,46 +2311,77 @@ fn visit_declarations<'a>(
             visit(input_id, ReferenceKind::Input, Some(operation_id));
         }
 
-        for effect_id in operation.effects.keys() {
-            visit(effect_id, ReferenceKind::Effect, Some(operation_id));
-        }
-
-        for intent_id in operation.effect_intents.keys() {
-            visit(intent_id, ReferenceKind::EffectIntent, Some(operation_id));
-        }
-
-        for output_id in operation.transaction_outputs.keys() {
-            visit(
-                output_id,
-                ReferenceKind::TransactionOutput,
-                Some(operation_id),
-            );
-        }
-
-        for (transaction_id, transaction) in &operation.transactions {
-            visit(
-                transaction_id,
-                ReferenceKind::Transaction,
-                Some(operation_id),
-            );
-
-            for step in &transaction.steps {
-                let TransactionStep::Read(read) = step else {
-                    continue;
-                };
-
-                visit(
-                    &read.result,
-                    ReferenceKind::TransactionRead,
-                    Some(transaction_id),
-                );
-            }
-        }
-
-        // A result binding is declared by the program step that binds it.
         for (_, step) in operation.program.steps_with_locations() {
-            if let Some(result) = step_result_binding(step) {
-                visit(result, ReferenceKind::EffectResult, Some(operation_id));
+            match step {
+                OperationStep::Transaction(transaction) => {
+                    visit(
+                        &transaction.id,
+                        ReferenceKind::Transaction,
+                        Some(operation_id),
+                    );
+
+                    for inner in &transaction.steps {
+                        match inner {
+                            TransactionStep::Read(read) => {
+                                visit(
+                                    &read.bind,
+                                    ReferenceKind::TransactionRead,
+                                    Some(&transaction.id),
+                                );
+                            }
+
+                            TransactionStep::EstablishEffectIntent(establish) => {
+                                visit(
+                                    &establish.effect_id,
+                                    ReferenceKind::Effect,
+                                    Some(operation_id),
+                                );
+
+                                visit(
+                                    &establish.bind,
+                                    ReferenceKind::EffectIntent,
+                                    Some(operation_id),
+                                );
+                            }
+
+                            TransactionStep::EstablishTransactionOutput(establish) => {
+                                visit(
+                                    &establish.bind,
+                                    ReferenceKind::TransactionOutput,
+                                    Some(operation_id),
+                                );
+                            }
+
+                            TransactionStep::Transition(transition) => {
+                                for intent in transition.effect_intents.values() {
+                                    visit(
+                                        &intent.bind,
+                                        ReferenceKind::EffectIntent,
+                                        Some(operation_id),
+                                    );
+                                }
+                            }
+
+                            _ => {}
+                        }
+                    }
+                }
+
+                OperationStep::ExecuteEffect(step) => {
+                    visit(&step.effect_id, ReferenceKind::Effect, Some(operation_id));
+
+                    if let Some(bind) = &step.bind {
+                        visit(bind, ReferenceKind::EffectResult, Some(operation_id));
+                    }
+                }
+
+                OperationStep::ExecuteEffectIntent(step) => {
+                    if let Some(bind) = &step.bind {
+                        visit(bind, ReferenceKind::EffectResult, Some(operation_id));
+                    }
+                }
+
+                _ => {}
             }
         }
     }
@@ -2464,8 +2390,8 @@ fn visit_declarations<'a>(
 /// The result binding an effect-executing step declares, if any.
 fn step_result_binding(step: &OperationStep) -> Option<&Id> {
     match step {
-        OperationStep::ExecuteEffect(step) => step.result.as_ref(),
-        OperationStep::ExecuteEffectIntent(step) => step.result.as_ref(),
+        OperationStep::ExecuteEffect(step) => step.bind.as_ref(),
+        OperationStep::ExecuteEffectIntent(step) => step.bind.as_ref(),
         _ => None,
     }
 }
@@ -2673,7 +2599,7 @@ fn object_schema<'a>(model: &'a Model, index: &ReferenceIndex<'_>, object: &Id) 
 
 fn effect_schema<'a>(
     model: &'a Model,
-    index: &ReferenceIndex<'_>,
+    index: &ReferenceIndex<'a>,
     effect_id: &Id,
 ) -> Option<&'a Id> {
     let info = index.get(effect_id).expect("references already validated");
@@ -2683,17 +2609,13 @@ fn effect_schema<'a>(
     let owner_info = index.get(owner).expect("effect owner exists");
 
     match owner_info.kind {
-        ReferenceKind::Operation => {
-            let effect = model.operations.get(owner)?.effects.get(effect_id)?;
+        ReferenceKind::Operation => match index.effect_contract(effect_id)? {
+            Effect::Publication(effect) => Some(&effect.schema),
 
-            match effect {
-                Effect::Publication(effect) => Some(&effect.schema),
+            Effect::Request(effect) => Some(&effect.schema),
 
-                Effect::Request(effect) => Some(&effect.schema),
-
-                Effect::External(_) => None,
-            }
-        }
+            Effect::External(_) => None,
+        },
 
         ReferenceKind::Transition => {
             for machine in model.state_machines.values() {
@@ -2724,7 +2646,7 @@ fn effect_schema<'a>(
 /// own, a publication has none.
 fn effect_result_type<'a>(
     model: &'a Model,
-    index: &ReferenceIndex<'_>,
+    index: &ReferenceIndex<'a>,
     effect_id: &Id,
 ) -> Option<&'a ResultType> {
     let info = index.get(effect_id)?;
@@ -2746,7 +2668,7 @@ fn effect_result_type<'a>(
     };
 
     match owner_info.kind {
-        ReferenceKind::Operation => match model.operations.get(owner)?.effects.get(effect_id)? {
+        ReferenceKind::Operation => match index.effect_contract(effect_id)? {
             Effect::Publication(_) => None,
             Effect::Request(request) => request_result(request),
             Effect::External(external) => external.result.as_ref(),
@@ -2854,7 +2776,6 @@ fn join(first: Fallthrough, second: Fallthrough) -> Fallthrough {
 struct ProgramValidator<'a> {
     model: &'a Model,
     operation_id: &'a Id,
-    operation: &'a Operation,
     errors: Vec<ValidationError>,
 
     /// One diagnostic per (step, declaration), however many references
@@ -2902,45 +2823,52 @@ impl<'a> ProgramValidator<'a> {
         mut state: Availability,
     ) -> Fallthrough {
         match step {
-            OperationStep::Transaction(step) => {
+            OperationStep::Transaction(body) => {
                 let consumer = ProgramUse::Transaction {
-                    transaction: step.transaction.clone(),
+                    transaction: body.id.clone(),
                 };
 
-                if let Some(body) = self.operation.transactions.get(&step.transaction) {
-                    // The commit key is evaluated for the invocation
-                    // before the body executes.
-                    if let IdempotencyGuarantee::DeduplicatedBy { key } = &body.idempotency {
-                        for root in &key.components {
+                // The commit key is evaluated for the invocation
+                // before the body executes.
+                if let IdempotencyGuarantee::DeduplicatedBy { key } = &body.idempotency {
+                    for root in &key.components {
+                        self.require(&state, root, location, &consumer);
+                    }
+                }
+
+                // References within the body to an output the body
+                // established at an earlier step are satisfied by
+                // that step, whatever the program guarantees at
+                // entry.
+                let mut established_here: BTreeSet<&Id> = BTreeSet::new();
+
+                for inner in &body.steps {
+                    for root in inner.roots() {
+                        if let ValueSource::TransactionOutput(output) = &root.source
+                            && established_here.contains(output)
+                        {
+                            continue;
+                        }
+
+                        self.require(&state, root, location, &consumer);
+                    }
+
+                    // A transition side effect's contract stays on the
+                    // state machine and is evaluated in the applying
+                    // transaction context, at this step.
+                    if let TransactionStep::Transition(transition) = inner {
+                        for root in transition_declaration_roots(self.model, transition) {
                             self.require(&state, root, location, &consumer);
                         }
                     }
 
-                    // References within the body to an output the body
-                    // established at an earlier step are satisfied by
-                    // that step, whatever the program guarantees at
-                    // entry.
-                    let mut established_here: BTreeSet<&Id> = BTreeSet::new();
-
-                    for inner in &body.steps {
-                        for root in inner.roots() {
-                            if let ValueSource::TransactionOutput(output) = &root.source
-                                && established_here.contains(output)
-                            {
-                                continue;
-                            }
-
-                            self.require(&state, root, location, &consumer);
-                        }
-
-                        if let TransactionStep::EstablishTransactionOutput(establish) = inner {
-                            established_here.insert(&establish.output);
-                        }
+                    if let TransactionStep::EstablishTransactionOutput(establish) = inner {
+                        established_here.insert(&establish.bind);
                     }
+                }
 
-                    for artifact in established_by(self.model, self.operation, body) {
-                        state.artifacts.insert(artifact.clone());
-                    }
+                for artifact in established_by(body) {
+                    state.artifacts.insert(artifact.clone());
                 }
 
                 Some(state)
@@ -2948,25 +2876,30 @@ impl<'a> ProgramValidator<'a> {
 
             OperationStep::ExecuteEffect(step) => {
                 let consumer = ProgramUse::Effect {
-                    effect: step.effect.clone(),
+                    effect: step.effect_id.clone(),
                 };
 
                 for root in step.values.roots() {
                     self.require(&state, root, location, &consumer);
                 }
 
-                for root in declaration_roots(self.model, self.operation, &step.effect) {
+                // The inline contract's own references are evaluated in
+                // the operation context immediately before the step.
+                for root in step.effect.roots() {
                     self.require(&state, root, location, &consumer);
                 }
 
-                if let Some(result) = &step.result {
-                    state.bound.insert(result.clone());
+                if let Some(bind) = &step.bind {
+                    state.bound.insert(bind.clone());
                 }
 
                 Some(state)
             }
 
             OperationStep::ExecuteEffectIntent(step) => {
+                // The captured instance and its contract were fixed at
+                // establishment; the execution consumes the definitely
+                // available binding alone.
                 if !state.artifacts.contains(&step.intent)
                     && self
                         .reported
@@ -2983,21 +2916,8 @@ impl<'a> ProgramValidator<'a> {
                         });
                 }
 
-                // The declaration of the underlying effect is evaluated
-                // wherever the effect executes, an intent site no less
-                // than a direct one.
-                if let Some(intent) = self.operation.effect_intents.get(&step.intent) {
-                    let consumer = ProgramUse::EffectIntent {
-                        intent: step.intent.clone(),
-                    };
-
-                    for root in declaration_roots(self.model, self.operation, &intent.effect) {
-                        self.require(&state, root, location, &consumer);
-                    }
-                }
-
-                if let Some(result) = &step.result {
-                    state.bound.insert(result.clone());
+                if let Some(bind) = &step.bind {
+                    state.bound.insert(bind.clone());
                 }
 
                 Some(state)
@@ -3135,78 +3055,56 @@ impl<'a> ProgramValidator<'a> {
     }
 }
 
-/// Every value reference an effect's declaration evaluates when the
-/// effect executes — an external deduplication key, the source and
-/// target of each propagation — for an operation-owned effect or a
-/// transition side effect.
-fn declaration_roots<'a>(
-    model: &'a Model,
-    operation: &'a Operation,
-    effect_id: &Id,
-) -> Vec<&'a ValueRef> {
-    if let Some(effect) = operation.effects.get(effect_id) {
-        return effect.roots();
-    }
+/// Every value reference the declarations of a transition step's side
+/// effects evaluate when the transition is applied: the source and
+/// target of each propagation. The contracts stay on the state
+/// machine; the applying transaction is where they are evaluated.
+fn transition_declaration_roots<'a>(model: &'a Model, step: &StateTransition) -> Vec<&'a ValueRef> {
+    let Some(transition) = model
+        .state_machines
+        .get(&step.machine)
+        .and_then(|machine| machine.transitions.get(&step.transition))
+    else {
+        return Vec::new();
+    };
 
-    for machine in model.state_machines.values() {
-        for transition in machine.transitions.values() {
-            if let Some(side_effect) = transition.side_effects.get(effect_id) {
-                let propagations = match side_effect {
-                    TransitionSideEffect::Publication(effect) => {
-                        &effect.idempotency_key_propagation
-                    }
-                    TransitionSideEffect::Request(effect) => &effect.idempotency_key_propagation,
-                };
+    let mut roots = Vec::new();
 
-                let mut roots = Vec::new();
+    for side_effect in transition.side_effects.values() {
+        let propagations = match side_effect {
+            TransitionSideEffect::Publication(effect) => &effect.idempotency_key_propagation,
+            TransitionSideEffect::Request(effect) => &effect.idempotency_key_propagation,
+        };
 
-                for propagation in propagations {
-                    roots.extend(propagation.source.components.iter());
-                    roots.extend(propagation.target.components.iter());
-                }
-
-                return roots;
-            }
+        for propagation in propagations {
+            roots.extend(propagation.source.components.iter());
+            roots.extend(propagation.target.components.iter());
         }
     }
 
-    Vec::new()
+    roots
 }
 
 /// The transaction artifacts a successful execution of the transaction
-/// establishes, or a re-encounter of its keyed commit recovers: its
-/// explicitly established outputs and intents, and the operation's
-/// intents for the side effects of every transition it applies.
-fn established_by<'a>(
-    model: &'a Model,
-    operation: &'a Operation,
-    body: &'a Transaction,
-) -> Vec<&'a Id> {
+/// establishes, or a re-encounter of its keyed commit recovers: the
+/// outputs it explicitly binds, the intents it explicitly binds, and
+/// the transition intents it binds.
+fn established_by(body: &Transaction) -> Vec<&Id> {
     let mut artifacts = Vec::new();
 
     for step in &body.steps {
         match step {
             TransactionStep::EstablishTransactionOutput(establish) => {
-                artifacts.push(&establish.output);
+                artifacts.push(&establish.bind);
             }
 
             TransactionStep::EstablishEffectIntent(establish) => {
-                artifacts.push(&establish.intent);
+                artifacts.push(&establish.bind);
             }
 
             TransactionStep::Transition(transition) => {
-                let Some(declaration) = model
-                    .state_machines
-                    .get(&transition.machine)
-                    .and_then(|machine| machine.transitions.get(&transition.transition))
-                else {
-                    continue;
-                };
-
-                for (intent_id, intent) in &operation.effect_intents {
-                    if declaration.side_effects.contains_key(&intent.effect) {
-                        artifacts.push(intent_id);
-                    }
+                for intent in transition.effect_intents.values() {
+                    artifacts.push(&intent.bind);
                 }
             }
 
@@ -3228,7 +3126,6 @@ fn validate_programs(model: &Model, _index: &ReferenceIndex<'_>) -> Vec<Validati
         let mut validator = ProgramValidator {
             model,
             operation_id,
-            operation,
             errors: Vec::new(),
             reported: BTreeSet::new(),
         };

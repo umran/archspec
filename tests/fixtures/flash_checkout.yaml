@@ -226,28 +226,10 @@ operations:
         result:
           ok: schema.CreateOrderResponse
           err: schema.RequestRejected
-    effects:
-      effect.create_order.publish_created:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.OrderCreated
-        idempotency_key_propagation:
-        - source:
-            components:
-            - source: input:input.create_order.request
-              path: idempotency_key
-          target:
-            components:
-            - source: effect:effect.create_order.publish_created
-              path: event_id
-    effect_intents:
-      intent.create_order.publish_created:
-        effect: effect.create_order.publish_created
-    transaction_outputs:
-      output.create_order:
-        schema: schema.CreateOrderResponse
-    transactions:
-      tx.create_order.new:
+    program:
+      steps:
+      - kind: transaction
+        id: tx.create_order.new
         data_model: data.checkout
         isolation: read_committed
         idempotency:
@@ -267,7 +249,21 @@ operations:
             - source: input:input.create_order.request
               path: amount
         - kind: establish_effect_intent
-          intent: intent.create_order.publish_created
+          bind: intent.create_order.publish_created
+          effect_id: effect.create_order.publish_created
+          effect:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.OrderCreated
+            idempotency_key_propagation:
+            - source:
+                components:
+                - source: input:input.create_order.request
+                  path: idempotency_key
+              target:
+                components:
+                - source: effect:effect.create_order.publish_created
+                  path: event_id
           values:
             kind: deterministic
             from:
@@ -286,16 +282,13 @@ operations:
         # status is the constant initial state, so the only provenance
         # root is the order id.
         - kind: establish_transaction_output
-          output: output.create_order
+          bind: output.create_order
+          schema: schema.CreateOrderResponse
           values:
             kind: deterministic
             from:
             - source: input:input.create_order.request
               path: order_id
-    program:
-      steps:
-      - kind: transaction
-        transaction: tx.create_order.new
       - kind: execute_effect_intent
         intent: intent.create_order.publish_created
       - kind: return
@@ -344,33 +337,17 @@ operations:
           lane_concurrency:
             kind: bounded
             value: 1
-    effects:
-      effect.reserve_inventory.publish_reserved:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.InventoryReserved
-        idempotency_key_propagation:
-        - source:
-            components:
-            - source: input:input.reserve_inventory.created
-              path: event_id
-          target:
-            components:
-            - source: effect:effect.reserve_inventory.publish_reserved
-              path: event_id
-    effect_intents:
-      intent.reserve_inventory.publish_reserved:
-        effect: effect.reserve_inventory.publish_reserved
-    transaction_outputs: {}
-    transactions:
-      tx.reserve_inventory:
+    program:
+      steps:
+      - kind: transaction
+        id: tx.reserve_inventory
         data_model: data.inventory
         isolation: read_committed
         idempotency:
           kind: not_deduplicated
         steps:
         - kind: read
-          result: read.reserve_inventory.stock
+          bind: read.reserve_inventory.stock
           target:
             object: object.stock
             predicate:
@@ -417,7 +394,21 @@ operations:
             - source: input:input.reserve_inventory.created
               path: quantity
         - kind: establish_effect_intent
-          intent: intent.reserve_inventory.publish_reserved
+          bind: intent.reserve_inventory.publish_reserved
+          effect_id: effect.reserve_inventory.publish_reserved
+          effect:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.InventoryReserved
+            idempotency_key_propagation:
+            - source:
+                components:
+                - source: input:input.reserve_inventory.created
+                  path: event_id
+              target:
+                components:
+                - source: effect:effect.reserve_inventory.publish_reserved
+                  path: event_id
           values:
             kind: deterministic
             from:
@@ -433,10 +424,6 @@ operations:
               path: quantity
             - source: input:input.reserve_inventory.created
               path: amount
-    program:
-      steps:
-      - kind: transaction
-        transaction: tx.reserve_inventory
       - kind: execute_effect_intent
         intent: intent.reserve_inventory.publish_reserved
       - kind: complete
@@ -481,59 +468,40 @@ operations:
           lane_concurrency:
             kind: bounded
             value: 1
-    effects:
-      effect.charge_payment.card:
-        kind: external
-        name: payment-provider.charge
-        idempotency:
-          kind: not_deduplicated
-        result:
-          ok: schema.ChargeAccepted
-          err: schema.ChargeDeclined
-      effect.charge_payment.publish_captured:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.PaymentCaptured
-        idempotency_key_propagation:
-        - source:
-            components:
-            - source: input:input.charge_payment.reserved
-              path: event_id
-          target:
-            components:
-            - source: effect:effect.charge_payment.publish_captured
-              path: event_id
-      # No modeled operation consumes PaymentFailed; the err arm exists
-      # to observe the provider's declined outcome.
-      effect.charge_payment.publish_failed:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.PaymentFailed
-        idempotency_key_propagation:
-        - source:
-            components:
-            - source: input:input.charge_payment.reserved
-              path: event_id
-          target:
-            components:
-            - source: effect:effect.charge_payment.publish_failed
-              path: event_id
-    effect_intents: {}
-    transaction_outputs: {}
-    transactions: {}
     program:
       steps:
       - kind: execute_effect
-        effect: effect.charge_payment.card
+        effect_id: effect.charge_payment.card
+        effect:
+          kind: external
+          name: payment-provider.charge
+          idempotency:
+            kind: not_deduplicated
+          result:
+            ok: schema.ChargeAccepted
+            err: schema.ChargeDeclined
         values:
           kind: unspecified
-        result: result.charge_payment.card
+        bind: result.charge_payment.card
       - kind: match_result
         result: result.charge_payment.card
         ok:
           steps:
           - kind: execute_effect
-            effect: effect.charge_payment.publish_captured
+            effect_id: effect.charge_payment.publish_captured
+            effect:
+              kind: publication
+              topic: topic.order_events
+              schema: schema.PaymentCaptured
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.charge_payment.reserved
+                    path: event_id
+                target:
+                  components:
+                  - source: effect:effect.charge_payment.publish_captured
+                    path: event_id
             values:
               kind: deterministic
               from:
@@ -546,8 +514,23 @@ operations:
           - kind: complete
         err:
           steps:
+          # No modeled operation consumes PaymentFailed; the err arm
+          # exists to observe the provider's declined outcome.
           - kind: execute_effect
-            effect: effect.charge_payment.publish_failed
+            effect_id: effect.charge_payment.publish_failed
+            effect:
+              kind: publication
+              topic: topic.order_events
+              schema: schema.PaymentFailed
+              idempotency_key_propagation:
+              - source:
+                  components:
+                  - source: input:input.charge_payment.reserved
+                    path: event_id
+                target:
+                  components:
+                  - source: effect:effect.charge_payment.publish_failed
+                    path: event_id
             values:
               kind: deterministic
               from:
@@ -589,18 +572,10 @@ operations:
         result:
           ok: schema.CancelOrderResponse
           err: schema.RequestRejected
-    effects:
-      effect.cancel_order.publish_cancelled:
-        kind: publication
-        topic: topic.order_events
-        schema: schema.OrderCancelled
-        idempotency_key_propagation: []
-    effect_intents:
-      intent.cancel_order.publish_cancelled:
-        effect: effect.cancel_order.publish_cancelled
-    transaction_outputs: {}
-    transactions:
-      tx.cancel_order:
+    program:
+      steps:
+      - kind: transaction
+        id: tx.cancel_order
         data_model: data.checkout
         isolation: read_committed
         # A transition transaction needs no keyed commit when nothing
@@ -621,18 +596,20 @@ operations:
               value:
                 source: input:input.cancel_order.request
                 path: order_id
-          effect_values: {}
+          effect_intents: {}
         - kind: establish_effect_intent
-          intent: intent.cancel_order.publish_cancelled
+          bind: intent.cancel_order.publish_cancelled
+          effect_id: effect.cancel_order.publish_cancelled
+          effect:
+            kind: publication
+            topic: topic.order_events
+            schema: schema.OrderCancelled
+            idempotency_key_propagation: []
           values:
             kind: deterministic
             from:
             - source: input:input.cancel_order.request
               path: order_id
-    program:
-      steps:
-      - kind: transaction
-        transaction: tx.cancel_order
       - kind: execute_effect_intent
         intent: intent.cancel_order.publish_cancelled
       - kind: return
@@ -669,13 +646,10 @@ operations:
           lane_concurrency:
             kind: bounded
             value: 1
-    effects: {}
-    effect_intents:
-      intent.apply_payment.order_paid:
-        effect: effect.order.paid
-    transaction_outputs: {}
-    transactions:
-      tx.apply_payment:
+    program:
+      steps:
+      - kind: transaction
+        id: tx.apply_payment
         data_model: data.checkout
         isolation: read_committed
         idempotency:
@@ -686,7 +660,7 @@ operations:
               path: event_id
         steps:
         - kind: read
-          result: read.apply_payment.order
+          bind: read.apply_payment.order
           target:
             object: object.order
             predicate:
@@ -710,18 +684,16 @@ operations:
               value:
                 source: input:input.apply_payment.captured
                 path: order_id
-          effect_values:
+          effect_intents:
             effect.order.paid:
-              kind: deterministic
-              from:
-              - source: transaction_read:read.apply_payment.order
-                path: order_id
-              - source: input:input.apply_payment.captured
-                path: event_id
-    program:
-      steps:
-      - kind: transaction
-        transaction: tx.apply_payment
+              bind: intent.apply_payment.order_paid
+              values:
+                kind: deterministic
+                from:
+                - source: transaction_read:read.apply_payment.order
+                  path: order_id
+                - source: input:input.apply_payment.captured
+                  path: event_id
       - kind: execute_effect_intent
         intent: intent.apply_payment.order_paid
       - kind: complete
@@ -761,11 +733,10 @@ operations:
         result:
           ok: schema.TransferStockResponse
           err: schema.RequestRejected
-    effects: {}
-    effect_intents: {}
-    transaction_outputs: {}
-    transactions:
-      tx.transfer_stock:
+    program:
+      steps:
+      - kind: transaction
+        id: tx.transfer_stock
         data_model: data.inventory
         isolation: read_committed
         idempotency:
@@ -816,7 +787,7 @@ operations:
           order:
             kind: unspecified
         - kind: read
-          result: read.transfer_stock.source_stock
+          bind: read.transfer_stock.source_stock
           target:
             object: object.stock
             predicate:
@@ -881,10 +852,6 @@ operations:
           - on_hand
           values:
             kind: unspecified
-    program:
-      steps:
-      - kind: transaction
-        transaction: tx.transfer_stock
       - kind: return
         request: input.transfer_stock.request
         outcome:

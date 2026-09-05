@@ -1,9 +1,13 @@
 import type {
-  Effect, Id, Model, Operation, OperationBlock, OperationStep, ResultType, TransitionSideEffect,
+  Effect, Id, Model, Operation, OperationBlock, OperationStep, ResultType, Transaction,
+  TransitionSideEffect,
 } from "../types/model";
 import { shortId } from "./ids";
 
-/** Where an id is declared, resolved once for the whole model. */
+/** Where an id is declared, resolved once for the whole model. Inline
+ *  declarations — transactions, effects, intent and output bindings —
+ *  are walked out of the operation programs, which are the source of
+ *  truth for every operation-owned execution occurrence. */
 export type IndexEntry =
   | { kind: "service" }
   | { kind: "operation" }
@@ -16,8 +20,13 @@ export type IndexEntry =
   | { kind: "transition"; machine: Id }
   | { kind: "input"; op: Id }
   | { kind: "effect"; op?: Id; machine?: Id; transition?: Id }
-  | { kind: "intent"; op: Id }
-  | { kind: "output"; op: Id }
+  /** An intent binding: `effect` is the captured effect occurrence,
+   *  `transaction` the inline transaction that establishes it, and
+   *  `via` the applied transition when the effect is transition-owned. */
+  | { kind: "intent"; op: Id; effect: Id; transaction: Id; via?: { machine: Id; transition: Id } }
+  /** A transaction-output binding with its declared schema and the
+   *  inline transaction that establishes it. */
+  | { kind: "output"; op: Id; schema: Id; transaction: Id }
   /** A result binding declared by a program step; `effect` is what it observes. */
   | { kind: "binding"; op: Id; effect: Id; location: string }
   | { kind: "transaction"; op: Id };
@@ -61,6 +70,31 @@ export function walkProgram(block: OperationBlock, parent: StepHop[] = []): Loca
   return out;
 }
 
+/** Every inline transaction of an operation's program, in program order. */
+export function operationTransactions(op: Operation): Transaction[] {
+  return walkProgram(op.program).flatMap(({ step }) => (step.kind === "transaction" ? [step] : []));
+}
+
+/** The inline transaction with the given stable id. */
+export function findTransaction(op: Operation, id: Id): Transaction | null {
+  return operationTransactions(op).find((tx) => tx.id === id) ?? null;
+}
+
+/** Every operation-owned inline effect declaration with its id: direct
+ *  execution sites and intent establishment sites, in program order. */
+export function operationEffects(op: Operation): [Id, Effect][] {
+  const out: [Id, Effect][] = [];
+  for (const { step } of walkProgram(op.program)) {
+    if (step.kind === "execute_effect") out.push([step.effect_id, step.effect]);
+    else if (step.kind === "transaction") {
+      for (const inner of step.steps) {
+        if (inner.kind === "establish_effect_intent") out.push([inner.effect_id, inner.effect]);
+      }
+    }
+  }
+  return out;
+}
+
 export function buildIndex(model: Model): ModelIndex {
   const index: ModelIndex = new Map();
   const put = (id: Id, entry: IndexEntry) => {
@@ -85,16 +119,46 @@ export function buildIndex(model: Model): ModelIndex {
   for (const [opId, op] of Object.entries(model.operations)) {
     put(opId, { kind: "operation" });
     for (const id of Object.keys(op.inputs)) put(id, { kind: "input", op: opId });
-    for (const id of Object.keys(op.effects)) put(id, { kind: "effect", op: opId });
-    for (const id of Object.keys(op.effect_intents)) put(id, { kind: "intent", op: opId });
-    for (const id of Object.keys(op.transaction_outputs)) put(id, { kind: "output", op: opId });
-    for (const id of Object.keys(op.transactions)) put(id, { kind: "transaction", op: opId });
+
+    // Inline declarations, walked out of the program: transactions,
+    // effect occurrences, and the intent/output bindings their
+    // producing sites introduce.
+    for (const { step } of walkProgram(op.program)) {
+      if (step.kind === "execute_effect") {
+        put(step.effect_id, { kind: "effect", op: opId });
+      } else if (step.kind === "transaction") {
+        put(step.id, { kind: "transaction", op: opId });
+        for (const inner of step.steps) {
+          if (inner.kind === "establish_effect_intent") {
+            put(inner.effect_id, { kind: "effect", op: opId });
+            put(inner.bind, { kind: "intent", op: opId, effect: inner.effect_id, transaction: step.id });
+          } else if (inner.kind === "establish_transaction_output") {
+            put(inner.bind, { kind: "output", op: opId, schema: inner.schema, transaction: step.id });
+          } else if (inner.kind === "transition") {
+            for (const [effectId, intent] of Object.entries(inner.effect_intents)) {
+              put(intent.bind, {
+                kind: "intent",
+                op: opId,
+                effect: effectId,
+                transaction: step.id,
+                via: { machine: inner.machine, transition: inner.transition },
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // Result bindings second: an intent execution's observed effect
+    // resolves through the intent binding registered above.
     for (const { location, step } of walkProgram(op.program)) {
-      if (step.kind === "execute_effect" && step.result) {
-        put(step.result, { kind: "binding", op: opId, effect: step.effect, location });
-      } else if (step.kind === "execute_effect_intent" && step.result) {
-        const effect = op.effect_intents[step.intent]?.effect;
-        if (effect) put(step.result, { kind: "binding", op: opId, effect, location });
+      if (step.kind === "execute_effect" && step.bind) {
+        put(step.bind, { kind: "binding", op: opId, effect: step.effect_id, location });
+      } else if (step.kind === "execute_effect_intent" && step.bind) {
+        const intent = index.get(step.intent);
+        if (intent?.kind === "intent") {
+          put(step.bind, { kind: "binding", op: opId, effect: intent.effect, location });
+        }
       }
     }
   }
@@ -119,8 +183,9 @@ export function effectDef(model: Model, index: ModelIndex, effectId: Id): Effect
   const owner = index.get(effectId);
   if (!owner || owner.kind !== "effect") return null;
   if (owner.op !== undefined) {
-    const effect = model.operations[owner.op]?.effects[effectId];
-    return effect ? { effect, owner } : null;
+    const op = model.operations[owner.op];
+    const found = op ? operationEffects(op).find(([id]) => id === effectId) : undefined;
+    return found ? { effect: found[1], owner } : null;
   }
   if (owner.machine !== undefined && owner.transition !== undefined) {
     const effect =
@@ -163,34 +228,21 @@ export function effectResultType(model: Model, index: ModelIndex, effectId: Id):
   }
 }
 
-/** The transaction that establishes an artifact: an output or intent by
- *  an explicit establishing step, or an intent implicitly established by
- *  the transaction whose transition owns the intent's effect. */
-export function establishingTransaction(model: Model, operation: Operation, artifact: Id): Id | null {
-  for (const [txId, tx] of Object.entries(operation.transactions)) {
-    for (const step of tx.steps) {
-      if (step.kind === "establish_transaction_output" && step.output === artifact) return txId;
-      if (step.kind === "establish_effect_intent" && step.intent === artifact) return txId;
-    }
-  }
-  const intent = operation.effect_intents[artifact];
-  if (!intent) return null;
-  for (const [txId, tx] of Object.entries(operation.transactions)) {
-    for (const step of tx.steps) {
-      if (step.kind !== "transition") continue;
-      const transition = model.state_machines[step.machine]?.transitions[step.transition];
-      if (transition && intent.effect in transition.side_effects) return txId;
-    }
-  }
-  return null;
-}
-
-/** Operations that execute an effect through a declared intent. */
+/** Operations that bind an intent capturing an effect, with the binding:
+ *  transition applications binding a transition-owned side effect, and
+ *  explicit establishment sites capturing an operation-owned one. */
 export function intentExecutors(model: Model, effectId: Id): { op: Id; intent: Id }[] {
   const out: { op: Id; intent: Id }[] = [];
   for (const [opId, op] of Object.entries(model.operations)) {
-    for (const [intentId, intent] of Object.entries(op.effect_intents)) {
-      if (intent.effect === effectId) out.push({ op: opId, intent: intentId });
+    for (const tx of operationTransactions(op)) {
+      for (const inner of tx.steps) {
+        if (inner.kind === "establish_effect_intent" && inner.effect_id === effectId) {
+          out.push({ op: opId, intent: inner.bind });
+        } else if (inner.kind === "transition") {
+          const intent = inner.effect_intents[effectId];
+          if (intent) out.push({ op: opId, intent: intent.bind });
+        }
+      }
     }
   }
   return out;
