@@ -50,24 +50,30 @@
 //!
 //! ## Effect results and decisions
 //!
-//! A bound effect result is replay-stable when the outgoing instance
-//! is class-fixed and the contract returns one result for it: a
-//! request whose target proves its result replay-consistent for the
-//! targeted input. Stable outgoing values do not by themselves prove a
-//! stable returned result (§31), and no declared fact makes an
-//! external boundary's result replay-consistent, so an external result
-//! is never stable in V1. A decision replays — every attempt in a class
-//! takes the same arm — when the matched result is stable, or the
-//! branch condition is deterministic over stable roots (§30).
+//! A bound effect result is judged per observed variant (Amendment B).
+//! A request result is replay-stable — in both variants at once — when
+//! the outgoing instance is class-fixed and the target proves its
+//! result replay-consistent for the targeted input; stable outgoing
+//! values do not by themselves prove a stable returned result (§31).
+//! An external result is replay-stable when the boundary declares
+//! `deduplicated_by` over a class-fixed key — equal keys identify one
+//! logical external interaction whose terminal result is fixed — and
+//! the observed variant is terminal: `Ok` by definition, `Err` only
+//! under a declared `terminal` disposition. A retryable `Err` is an
+//! attempt-level, nonterminal outcome, and an unspecified disposition
+//! provides no usable fact; neither is promoted by idempotency alone.
+//! A decision replays — every attempt in a class takes the same arm —
+//! when the matched result is stable in the variant of the arm taken,
+//! or the branch condition is deterministic over stable roots (§30).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    Derivation, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey, Input, MessageIdentity,
-    MessageSelector, Model, Operation, RequestIdentity, StepLocation, Transaction, TransactionStep,
-    ValueRef, ValueSource,
+    Derivation, ErrorDisposition, ExternalEffect, FieldPath, Id, IdempotencyGuarantee,
+    IdempotencyKey, Input, MessageIdentity, MessageSelector, Model, Operation, RequestIdentity,
+    ResultVariant, StepLocation, Transaction, TransactionStep, ValueRef, ValueSource,
 };
 
 use super::paths::{Decision, DecisionTaken, Path, PathStep, Terminal};
@@ -120,6 +126,18 @@ pub enum StabilityRule {
     /// the class observes equally: the instance is class-fixed and the
     /// target returns one result for it.
     ReplayConsistentResult { result: Id, effect: Id },
+
+    /// A reference into a terminal external result that every attempt
+    /// in the class observes equally: the boundary deduplicates by a
+    /// class-fixed key, so equal keys identify one logical external
+    /// interaction whose terminal result is fixed, and the referenced
+    /// variant is terminal — `Ok` by definition, `Err` by declared
+    /// disposition.
+    DeduplicatedExternalResult {
+        result: Id,
+        effect: Id,
+        variant: ResultVariant,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +375,17 @@ pub enum ResultStabilityRule {
         requirement: usize,
         instance: InstanceStability,
     },
+
+    /// The external boundary declares `deduplicated_by` over a key
+    /// that is class-fixed through the cited roots, so same-class
+    /// attempts address one logical external interaction, whose
+    /// terminal result the guarantee fixes — and the observed variant
+    /// is terminal: `Ok` by definition, `Err` by the contract's
+    /// declared `terminal` disposition (Amendment B).
+    ExternalTerminalResult {
+        variant: ResultVariant,
+        key: Vec<StableRoot>,
+    },
 }
 
 /// Why a bound result is not established to be observed equally by
@@ -380,21 +409,74 @@ pub enum ResultGap {
     /// this analysis.
     TargetResultUnproven { operation: Id, input: Id },
 
-    /// No declared fact makes an external boundary's returned result
-    /// replay-consistent (§31).
-    ExternalResultUndeclared,
+    /// The external boundary explicitly does not deduplicate, so the
+    /// `deduplicated_by` terminal-result guarantee is unavailable.
+    /// This does not say repeated executions return different results;
+    /// only that no fact fixes them.
+    ExternalNotDeduplicated,
+
+    /// No deduplication fact is declared for the external boundary,
+    /// so nothing identifies same-key executions as one logical
+    /// interaction with one terminal result.
+    ExternalDeduplicationUnknown,
+
+    /// The declared external deduplication key is not replay-stable,
+    /// so attempts may address different logical external
+    /// interactions.
+    ExternalDeduplicationKeyUnstable { roots: Vec<UnstableRoot> },
+
+    /// The observed `Err` is declared retryable: an attempt-level,
+    /// nonterminal outcome. It does not establish the logical
+    /// interaction's terminal result, so a later attempt may observe a
+    /// different result.
+    ExternalErrorRetryable,
+
+    /// The observed `Err` carries no declared disposition: no usable
+    /// fact says whether it terminally resolves the logical
+    /// interaction.
+    ExternalErrorDispositionUnspecified,
 
     /// The effect contract yields no synchronous result.
     NoResultContract,
 }
 
+/// The replay judgments of one bound result, per observed variant.
+/// Stability is variant-sensitive (Amendment B): a deduplicated
+/// external boundary's terminal `Ok` is stable while the same
+/// binding's retryable `Err` is not. A request result carries one
+/// judgment in both variants — the target's replay-consistent
+/// requirement covers variant and payload together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundResult {
+    pub ok: ResultReplay,
+    pub err: ResultReplay,
+}
+
+impl BoundResult {
+    /// One judgment in both variants.
+    fn both(replay: ResultReplay) -> Self {
+        Self {
+            ok: replay.clone(),
+            err: replay,
+        }
+    }
+
+    /// The judgment for the observed variant.
+    pub fn variant(&self, variant: ResultVariant) -> &ResultReplay {
+        match variant {
+            ResultVariant::Ok => &self.ok,
+            ResultVariant::Err => &self.err,
+        }
+    }
+}
+
 /// What a path has made available so far: every established artifact
-/// with its replay route, and every bound result with its replay
-/// judgment.
+/// with its replay route, and every bound result with its per-variant
+/// replay judgments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathContext {
     pub artifacts: BTreeMap<Id, ArtifactReplay>,
-    pub results: BTreeMap<Id, ResultReplay>,
+    pub results: BTreeMap<Id, BoundResult>,
 }
 
 /// Why every attempt in the class takes the same arm of a decision.
@@ -485,7 +567,7 @@ pub enum TracedStep<'a> {
         contract: Option<EffectContract<'a>>,
         before: PathContext,
         instance: Result<InstanceStability, InstanceGap>,
-        result: Option<(&'a Id, ResultReplay)>,
+        result: Option<(&'a Id, Box<BoundResult>)>,
     },
 
     Decision {
@@ -848,25 +930,42 @@ impl<'a> ReplayAnalysis<'a> {
             },
 
             ValueSource::EffectResultOk(result) | ValueSource::EffectResultErr(result) => {
+                let variant = match &root.source {
+                    ValueSource::EffectResultOk(_) => ResultVariant::Ok,
+                    _ => ResultVariant::Err,
+                };
+
                 match context.results.get(result) {
                     None => Err(StabilityGap::ResultNotInContext {
                         result: result.clone(),
                     }),
 
-                    Some(ResultReplay::Unstable { effect, gap }) => {
-                        Err(StabilityGap::ResultUnstable {
-                            result: result.clone(),
-                            effect: effect.clone(),
-                            gap: Box::new(gap.clone()),
-                        })
-                    }
+                    Some(bound) => match bound.variant(variant) {
+                        ResultReplay::Unstable { effect, gap } => {
+                            Err(StabilityGap::ResultUnstable {
+                                result: result.clone(),
+                                effect: effect.clone(),
+                                gap: Box::new(gap.clone()),
+                            })
+                        }
 
-                    Some(ResultReplay::Stable { effect, .. }) => {
-                        Ok(StabilityRule::ReplayConsistentResult {
-                            result: result.clone(),
-                            effect: effect.clone(),
-                        })
-                    }
+                        ResultReplay::Stable { effect, rule } => Ok(match rule {
+                            ResultStabilityRule::ReplayConsistentTarget { .. } => {
+                                StabilityRule::ReplayConsistentResult {
+                                    result: result.clone(),
+                                    effect: effect.clone(),
+                                }
+                            }
+
+                            ResultStabilityRule::ExternalTerminalResult { .. } => {
+                                StabilityRule::DeduplicatedExternalResult {
+                                    result: result.clone(),
+                                    effect: effect.clone(),
+                                    variant,
+                                }
+                            }
+                        }),
+                    },
                 }
             }
         }?;
@@ -1008,11 +1107,11 @@ impl<'a> ReplayAnalysis<'a> {
         let before = context.clone();
 
         let result = result.map(|binding| {
-            let replay = self.result_replay(site.effect(), contract, &instance);
+            let replay = self.result_replay(&before, site.effect(), contract, &instance);
 
             context.results.insert(binding.clone(), replay.clone());
 
-            (binding, replay)
+            (binding, Box::new(replay))
         });
 
         steps.push(TracedStep::Effect {
@@ -1080,19 +1179,23 @@ impl<'a> ReplayAnalysis<'a> {
     }
 
     /// Whether same-class attempts observe one result from an effect
-    /// execution: the instance must be class-fixed, and the contract
-    /// must return one result for it — which only a request into a
-    /// target proving its result replay-consistent establishes (§31,
-    /// §32).
+    /// execution, judged per variant. A request result requires a
+    /// class-fixed instance and a target proving its result
+    /// replay-consistent (§31, §32), and is then stable in both
+    /// variants at once. An external result is judged by
+    /// `external_result_replay`.
     fn result_replay(
         &self,
+        context: &PathContext,
         effect: &Id,
         contract: Option<EffectContract<'_>>,
         instance: &Result<InstanceStability, InstanceGap>,
-    ) -> ResultReplay {
-        let unstable = |gap| ResultReplay::Unstable {
-            effect: effect.clone(),
-            gap,
+    ) -> BoundResult {
+        let unstable = |gap| {
+            BoundResult::both(ResultReplay::Unstable {
+                effect: effect.clone(),
+                gap,
+            })
         };
 
         let request = match contract {
@@ -1100,8 +1203,8 @@ impl<'a> ReplayAnalysis<'a> {
                 return unstable(ResultGap::NoResultContract);
             }
 
-            Some(EffectContract::External(_)) => {
-                return unstable(ResultGap::ExternalResultUndeclared);
+            Some(EffectContract::External(external)) => {
+                return self.external_result_replay(context, effect, external);
             }
 
             Some(EffectContract::Request(request)) => request,
@@ -1155,13 +1258,89 @@ impl<'a> ReplayAnalysis<'a> {
             });
         }
 
-        ResultReplay::Stable {
+        BoundResult::both(ResultReplay::Stable {
             effect: effect.clone(),
             rule: ResultStabilityRule::ReplayConsistentTarget {
                 operation: operation.clone(),
                 input: input.clone(),
                 requirement,
                 instance,
+            },
+        })
+    }
+
+    /// The Amendment B judgment of an external result, per variant.
+    ///
+    /// `deduplicated_by` over a class-fixed key makes equal-key
+    /// executions one logical external interaction whose terminal
+    /// result is fixed, so a terminal variant is replay-stable: `Ok`
+    /// by definition, `Err` under a declared `terminal` disposition.
+    /// A retryable `Err` is attempt-level and nonterminal; an
+    /// unspecified disposition provides no usable fact. The outgoing
+    /// instance is not consulted: result identity follows the key
+    /// alone, exactly as the boundary's duplicate-work collapse does.
+    fn external_result_replay(
+        &self,
+        context: &PathContext,
+        effect: &Id,
+        external: &ExternalEffect,
+    ) -> BoundResult {
+        let unstable = |gap| {
+            BoundResult::both(ResultReplay::Unstable {
+                effect: effect.clone(),
+                gap,
+            })
+        };
+
+        let Some(result) = &external.result else {
+            return unstable(ResultGap::NoResultContract);
+        };
+
+        let key = match &external.idempotency {
+            IdempotencyGuarantee::DeduplicatedBy { key } => key,
+
+            IdempotencyGuarantee::NotDeduplicated => {
+                return unstable(ResultGap::ExternalNotDeduplicated);
+            }
+
+            IdempotencyGuarantee::Unspecified => {
+                return unstable(ResultGap::ExternalDeduplicationUnknown);
+            }
+        };
+
+        let roots: Vec<&ValueRef> = key.components.iter().collect();
+
+        let (stable, unstable_roots) = self.roots_stability(context, &roots);
+
+        if !unstable_roots.is_empty() {
+            return unstable(ResultGap::ExternalDeduplicationKeyUnstable {
+                roots: unstable_roots,
+            });
+        }
+
+        let terminal = |variant| ResultReplay::Stable {
+            effect: effect.clone(),
+            rule: ResultStabilityRule::ExternalTerminalResult {
+                variant,
+                key: stable.clone(),
+            },
+        };
+
+        BoundResult {
+            ok: terminal(ResultVariant::Ok),
+
+            err: match result.err.disposition {
+                ErrorDisposition::Terminal => terminal(ResultVariant::Err),
+
+                ErrorDisposition::Retryable => ResultReplay::Unstable {
+                    effect: effect.clone(),
+                    gap: ResultGap::ExternalErrorRetryable,
+                },
+
+                ErrorDisposition::Unspecified => ResultReplay::Unstable {
+                    effect: effect.clone(),
+                    gap: ResultGap::ExternalErrorDispositionUnspecified,
+                },
             },
         }
     }
@@ -1181,24 +1360,31 @@ impl<'a> ReplayAnalysis<'a> {
                     arm: *arm,
                 };
 
+                // The arm taken on this path fixes the observed
+                // variant, so the decision rests on that variant's
+                // judgment: a stable terminal `Ok` re-selects the ok
+                // arm even where the same binding's `Err` would not
+                // replay (Amendment B §15).
                 let replay = match context.results.get(*result) {
                     None => Err(DecisionGap::ResultNotInContext {
                         result: (*result).clone(),
                     }),
 
-                    Some(ResultReplay::Unstable { effect, gap }) => {
-                        Err(DecisionGap::ResultUnstable {
+                    Some(bound) => match bound.variant(*arm) {
+                        ResultReplay::Unstable { effect, gap } => {
+                            Err(DecisionGap::ResultUnstable {
+                                result: (*result).clone(),
+                                effect: effect.clone(),
+                                gap: gap.clone(),
+                            })
+                        }
+
+                        ResultReplay::Stable { effect, rule } => Ok(DecisionRule::StableResult {
                             result: (*result).clone(),
                             effect: effect.clone(),
-                            gap: gap.clone(),
-                        })
-                    }
-
-                    Some(ResultReplay::Stable { effect, rule }) => Ok(DecisionRule::StableResult {
-                        result: (*result).clone(),
-                        effect: effect.clone(),
-                        rule: rule.clone(),
-                    }),
+                            rule: rule.clone(),
+                        }),
+                    },
                 };
 
                 (taken, replay)

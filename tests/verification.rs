@@ -21,14 +21,15 @@ use archspec::{
     parser::yaml,
     spec::{
         Arm, Branch, CompletionRequirement, Condition, Derivation, DispatchRouting,
-        EstablishTransactionOutput, ExecuteEffect, FieldPath, Id, IdempotencyGuarantee,
-        IdempotencyKey, IdempotencyRequirement, Input, LaneConcurrency, Literal, MatchResult,
-        MessageIdentity, MessageSelector, Model, ObjectSelector, OperationBlock,
-        OperationConcurrency, OperationStep, RecoverabilityRequirement, RequestIdentity,
-        RequestInput, ResultOutcome, ResultReplayRequirement, ResultType, ResultVariant, Return,
-        RunTransaction, Schema, SchemaFragment, SelectorPredicate, SelectorValue,
-        SerializationRequirement, SubscriptionInput, TopicOrdering, Transaction,
-        TransactionIsolation, TransactionOutput, TransactionStep, ValueRef, ValueSource, Write,
+        ErrorDisposition, ErrorResultType, EstablishTransactionOutput, ExecuteEffect,
+        ExternalEffect, FieldPath, Id, IdempotencyGuarantee, IdempotencyKey,
+        IdempotencyRequirement, Input, LaneConcurrency, Literal, MatchResult, MessageIdentity,
+        MessageSelector, Model, ObjectSelector, OperationBlock, OperationConcurrency,
+        OperationStep, RecoverabilityRequirement, RequestIdentity, RequestInput, ResultOutcome,
+        ResultReplayRequirement, ResultType, ResultVariant, Return, RunTransaction, Schema,
+        SchemaFragment, SelectorPredicate, SelectorValue, SerializationRequirement,
+        SubscriptionInput, TopicOrdering, Transaction, TransactionIsolation, TransactionOutput,
+        TransactionStep, ValueRef, ValueSource, Write,
     },
 };
 
@@ -2329,10 +2330,11 @@ fn flash_checkout_idempotency_verdicts() {
 
     // charge_payment: the capture publication is safe, but the card
     // charge is explicitly not deduplicated — the model admits charging
-    // the card twice — and the branch on the provider's result is not
-    // established to replay, so the decline publication, which reads
-    // that result, is not class-fixed either. Each fact is reported
-    // once, however many paths run through its step.
+    // the card twice — so no same-key terminal result is fixed either:
+    // the match on the provider's result is not established to replay,
+    // and the decline publication, which reads that result, is not
+    // class-fixed. Each fact is reported once, however many paths run
+    // through its step.
     let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
 
     let IdempotencyVerdict::Unproven { obstacles } = &verdict else {
@@ -2347,7 +2349,7 @@ fn flash_checkout_idempotency_verdicts() {
                 IdempotencyObstacle::PathDecisionUnstable {
                     decision: verification::DecisionTaken::Match { result, arm: ResultVariant::Ok, .. },
                     gap: DecisionGap::ResultUnstable {
-                        gap: ResultGap::ExternalResultUndeclared,
+                        gap: ResultGap::ExternalNotDeduplicated,
                         ..
                     },
                     ..
@@ -2412,9 +2414,11 @@ fn declared_external_deduplication_completes_the_charge_proof() {
 
     assert!(validation::validate(&model).is_empty());
 
-    // The boundary now collapses duplicate charges, but nothing says a
-    // repeated charge returns the same result, so the branch on it
-    // remains the obstacle.
+    // The boundary now collapses duplicate charges and fixes its
+    // terminal result — but the decline's disposition is unspecified,
+    // so nothing says an observed error terminally resolved the
+    // charge: the err arm of the match, and the decline publication
+    // reading that error, remain the obstacles. The ok arm replays.
     let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
 
     assert!(
@@ -2424,7 +2428,17 @@ fn declared_external_deduplication_completes_the_charge_proof() {
                 if matches!(
                     &obstacles[..],
                     [
-                        IdempotencyObstacle::PathDecisionUnstable { .. },
+                        IdempotencyObstacle::PathDecisionUnstable {
+                            decision: verification::DecisionTaken::Match {
+                                arm: ResultVariant::Err,
+                                ..
+                            },
+                            gap: DecisionGap::ResultUnstable {
+                                gap: ResultGap::ExternalErrorDispositionUnspecified,
+                                ..
+                            },
+                            ..
+                        },
                         IdempotencyObstacle::EffectInstanceRootUnstable { .. },
                     ]
                 )
@@ -2492,6 +2506,308 @@ fn unstable_external_deduplication_key_is_an_obstacle() {
         IdempotencyObstacle::ExternalDeduplicationKeyUnstable { roots, .. }
             if matches!(roots[0].gap, StabilityGap::MutableSubjectState { .. })
     ));
+}
+
+#[test]
+fn a_terminal_error_disposition_completes_the_branching_charge_proof() {
+    let mut model = load_flash_checkout();
+
+    let Some(archspec::spec::Effect::External(card)) = model
+        .operations
+        .get_mut(&id("operation.charge_payment"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.charge_payment.card"))
+    else {
+        panic!("card charge should be an external effect");
+    };
+
+    card.idempotency = IdempotencyGuarantee::DeduplicatedBy {
+        key: ikey("input.charge_payment.reserved", &[&["event_id"]]),
+    };
+
+    card.result.as_mut().unwrap().err.disposition = ErrorDisposition::Terminal;
+
+    assert!(validation::validate(&model).is_empty());
+
+    // The provider deduplicates by a class-fixed key, which fixes each
+    // charge's terminal result, and a decline terminally resolves it:
+    // both arms of the match replay, the decline publication's payload
+    // is class-fixed, and the whole branching program proves — no
+    // linearization needed.
+    let verdict = idempotency_verdict(&model, "operation.charge_payment", 0);
+
+    let IdempotencyVerdict::Proven {
+        proof: IdempotencyProof::RetrySafePaths { paths },
+    } = &verdict
+    else {
+        panic!("expected charge_payment proven, found {verdict:?}");
+    };
+
+    assert_eq!(paths.len(), 2);
+
+    for (path, variant) in paths.iter().zip([ResultVariant::Ok, ResultVariant::Err]) {
+        assert!(
+            matches!(
+                &path.decisions[..],
+                [verification::DecisionReplay {
+                    decision: verification::DecisionTaken::Match { arm, .. },
+                    rule: DecisionRule::StableResult {
+                        rule: verification::ResultStabilityRule::ExternalTerminalResult {
+                            variant: cited,
+                            key,
+                        },
+                        ..
+                    },
+                }] if *arm == variant
+                    && *cited == variant
+                    && matches!(key[0].rule, StabilityRule::KeyComponent)
+            ),
+            "{path:#?}"
+        );
+    }
+}
+
+/// The external substrate of the Amendment B result-replay tests:
+/// `transfer_stock` charges an external provider that deduplicates by
+/// the governing `sku` key, matches the result, and returns each
+/// terminal variant's payload from the corresponding bound result.
+fn charge_transfer_externally(model: &mut Model, disposition: ErrorDisposition) {
+    let operation = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap();
+
+    operation.effects.insert(
+        id("effect.transfer_stock.charge"),
+        archspec::spec::Effect::External(ExternalEffect {
+            name: "payments.charge".into(),
+            idempotency: IdempotencyGuarantee::DeduplicatedBy {
+                key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            },
+            result: Some(ResultType {
+                ok: id("schema.ChargeAccepted"),
+                err: ErrorResultType {
+                    schema: id("schema.ChargeDeclined"),
+                    disposition,
+                },
+            }),
+        }),
+    );
+
+    operation.program.steps = vec![
+        execute(
+            "effect.transfer_stock.charge",
+            deterministic(vec![input_key("input.transfer_stock.request", &["sku"])]),
+            Some("result.transfer_stock.charge"),
+        ),
+        OperationStep::MatchResult(MatchResult {
+            result: id("result.transfer_stock.charge"),
+            ok: block(vec![return_ok(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultOk(id("result.transfer_stock.charge")),
+                    path: path(&["authorization_id"]),
+                }]),
+            )]),
+            err: block(vec![return_err(
+                "input.transfer_stock.request",
+                deterministic(vec![ValueRef {
+                    source: ValueSource::EffectResultErr(id("result.transfer_stock.charge")),
+                    path: path(&["reason"]),
+                }]),
+            )]),
+        }),
+    ];
+
+    operation
+        .requirements
+        .idempotency
+        .push(IdempotencyRequirement {
+            key: ikey("input.transfer_stock.request", &[&["sku"]]),
+            result: ResultReplayRequirement::ReplayConsistent,
+        });
+}
+
+#[test]
+fn an_idempotent_external_terminal_result_proves_result_replay() {
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // The external key is class-fixed, so same-class attempts address
+    // one logical charge whose terminal result the strengthened
+    // `deduplicated_by` fixes; `Ok` is terminal by definition and the
+    // decline is declared terminal, so both returning paths replay
+    // their decision and derive their payload from a stable terminal
+    // result. The external boundary no longer destroys request-result
+    // replayability.
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Proven {
+        proof: ResultReplayProof::ClassFixedResult { returns },
+    } = &verdict
+    else {
+        panic!("expected a class-fixed result, found {verdict:?}");
+    };
+
+    assert_eq!(returns.len(), 2);
+
+    for (returned, variant) in returns.iter().zip([ResultVariant::Ok, ResultVariant::Err]) {
+        assert_eq!(returned.variant, variant);
+
+        assert!(matches!(
+            &returned.decisions[..],
+            [verification::DecisionReplay {
+                rule: DecisionRule::StableResult {
+                    rule: verification::ResultStabilityRule::ExternalTerminalResult {
+                        variant: cited,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }] if *cited == variant
+        ));
+
+        assert!(matches!(
+            &returned.derivation[..],
+            [StableRoot {
+                rule: StabilityRule::DeduplicatedExternalResult { result, effect, variant: cited },
+                ..
+            }] if result == &id("result.transfer_stock.charge")
+                && effect == &id("effect.transfer_stock.charge")
+                && *cited == variant
+        ));
+    }
+}
+
+#[test]
+fn a_retryable_external_error_is_not_terminal_result_evidence() {
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Retryable);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // A retryable decline conclusively ends one attempt without
+    // terminally resolving the charge, so external idempotency does
+    // not fix it: the err arm is not established to replay, and the
+    // err payload is not a stable root. The ok path contributes no
+    // obstacle — its terminal is fixed.
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    assert!(
+        matches!(
+            &obstacles[..],
+            [
+                ResultReplayObstacle::PathDecisionUnstable {
+                    decision: verification::DecisionTaken::Match {
+                        arm: ResultVariant::Err,
+                        ..
+                    },
+                    gap: DecisionGap::ResultUnstable {
+                        gap: ResultGap::ExternalErrorRetryable,
+                        ..
+                    },
+                    ..
+                },
+                ResultReplayObstacle::ResultDerivationRootUnstable { roots, .. },
+            ] if matches!(
+                &roots[0].gap,
+                StabilityGap::ResultUnstable { gap, .. }
+                    if matches!(**gap, ResultGap::ExternalErrorRetryable)
+            )
+        ),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn an_unspecified_error_disposition_leaves_the_error_unknown() {
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Unspecified);
+
+    assert!(validation::validate(&model).is_empty());
+
+    // `unspecified` is epistemic: no usable fact says whether the
+    // observed error terminally resolved the charge, so nothing is
+    // promoted — and nothing is condemned.
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::ExternalErrorDispositionUnspecified,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{obstacles:#?}"
+    );
+}
+
+#[test]
+fn an_undeduplicated_external_result_gains_no_stability() {
+    let mut model = load_flash_checkout();
+
+    charge_transfer_externally(&mut model, ErrorDisposition::Terminal);
+
+    let Some(archspec::spec::Effect::External(charge)) = model
+        .operations
+        .get_mut(&id("operation.transfer_stock"))
+        .unwrap()
+        .effects
+        .get_mut(&id("effect.transfer_stock.charge"))
+    else {
+        panic!("the charge should be an external effect");
+    };
+
+    charge.idempotency = IdempotencyGuarantee::Unspecified;
+
+    assert!(validation::validate(&model).is_empty());
+
+    // Without `deduplicated_by`, nothing identifies same-key
+    // executions as one logical interaction, so no terminal result is
+    // fixed — a declared terminal disposition alone proves nothing,
+    // and even the ok arm does not replay.
+    let verdict = result_replay_verdict(&model, "operation.transfer_stock", 0);
+
+    let ResultReplayVerdict::Unproven { obstacles } = &verdict else {
+        panic!("expected an unproven verdict, found {verdict:?}");
+    };
+
+    assert!(
+        obstacles.iter().any(|obstacle| matches!(
+            obstacle,
+            ResultReplayObstacle::PathDecisionUnstable {
+                decision: verification::DecisionTaken::Match {
+                    arm: ResultVariant::Ok,
+                    ..
+                },
+                gap: DecisionGap::ResultUnstable {
+                    gap: ResultGap::ExternalDeduplicationUnknown,
+                    ..
+                },
+                ..
+            }
+        )),
+        "{obstacles:#?}"
+    );
 }
 
 #[test]
@@ -3033,7 +3349,10 @@ fn no_admitted_path_is_vacuously_idempotent() {
             identity: RequestIdentity::Unspecified,
             result: ResultType {
                 ok: id("schema.CancelOrderResponse"),
-                err: id("schema.RequestRejected"),
+                err: ErrorResultType {
+                    schema: id("schema.RequestRejected"),
+                    disposition: ErrorDisposition::Unspecified,
+                },
             },
         }),
     );

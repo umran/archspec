@@ -11,7 +11,7 @@ use archspec::{
     analyzer::{
         report::{self, Status},
         validation,
-        verification::{self, DecisionGap, IdempotencyObstacle, IdempotencyVerdict, ResultGap},
+        verification::{self, IdempotencyVerdict},
     },
     parser::yaml,
     spec::{Id, Model},
@@ -42,88 +42,43 @@ fn video_streaming_example_is_valid() {
 }
 
 #[test]
-fn video_streaming_example_proves_everything_but_the_external_branch() {
+fn video_streaming_example_proves_everything() {
     let model = load("video_streaming.yaml");
 
     let verification = verification::verify(&model);
 
     // The transcoder branches on the engine's result. The engine
-    // deduplicates renders by video_id, but no declared fact says a
-    // repeated render returns the same result, so a retry is not
-    // established to take the same arm — and a retried upload, whose
-    // cascade reaches the transcoder, inherits the gap.
-    let transcode = verification
-        .idempotency
-        .iter()
-        .find(|check| check.operation == Id("operation.transcode_video".into()))
-        .expect("transcode_video declares idempotency");
+    // deduplicates renders by video_id — one logical render per video,
+    // whose terminal result the guarantee fixes — and a rejected
+    // source is a terminal error, so a retried transcode observes the
+    // same terminal result and takes the same arm. That closes what
+    // was the model's one gap before error dispositions existed: the
+    // transcoder's idempotency, and the upload's cascade through it,
+    // now prove.
+    for operation in ["operation.transcode_video", "operation.complete_upload"] {
+        let check = verification
+            .idempotency
+            .iter()
+            .find(|check| check.operation == Id(operation.into()))
+            .expect("the operation declares idempotency");
 
-    let IdempotencyVerdict::Unproven { obstacles } = &transcode.verdict else {
-        panic!(
-            "expected transcode_video unproven, found {:?}",
-            transcode.verdict
+        assert!(
+            matches!(check.verdict, IdempotencyVerdict::Proven { .. }),
+            "expected {operation} proven:\n{:#?}",
+            check.verdict
         );
-    };
-
-    assert!(
-        matches!(
-            &obstacles[..],
-            [IdempotencyObstacle::PathDecisionUnstable {
-                gap: DecisionGap::ResultUnstable {
-                    gap: ResultGap::ExternalResultUndeclared,
-                    ..
-                },
-                ..
-            }]
-        ),
-        "expected only the external-result decision obstacle:\n{obstacles:#?}"
-    );
-
-    let upload = verification
-        .idempotency
-        .iter()
-        .find(|check| check.operation == Id("operation.complete_upload".into()))
-        .expect("complete_upload declares idempotency");
-
-    assert!(
-        matches!(
-            &upload.verdict,
-            IdempotencyVerdict::Unproven { obstacles }
-                if matches!(
-                    &obstacles[..],
-                    [IdempotencyObstacle::PublicationConsumerRequirementUnproven { operation, .. }]
-                        if operation == &Id("operation.transcode_video".into())
-                )
-        ),
-        "expected complete_upload unproven only through its cascade:\n{:#?}",
-        upload.verdict
-    );
+    }
 
     let report = report::obligations(&model, &verification);
 
     assert_eq!(report.obligations.len(), 15);
 
-    let unknown: Vec<&str> = report
+    let unproven: Vec<&str> = report
         .obligations
         .iter()
-        .filter(|obligation| obligation.status == Status::Unknown)
+        .filter(|obligation| obligation.status != Status::Proven)
         .map(|obligation| obligation.id.as_str())
         .collect();
 
-    assert_eq!(
-        unknown,
-        [
-            "oblig.operation.complete_upload.idempotency.0",
-            "oblig.operation.transcode_video.idempotency.0",
-        ]
-    );
-
-    assert_eq!(
-        report
-            .obligations
-            .iter()
-            .filter(|obligation| obligation.status == Status::Proven)
-            .count(),
-        13
-    );
+    assert_eq!(unproven, [""; 0], "every obligation should prove");
 }

@@ -1962,6 +1962,26 @@ established to replay in V1, and a value derived from one is never
 replay-stable. Publications have no result (`ResultGap::
 NoResultContract`).
 
+> **Superseded (2026-09-05,
+> `CONSEQO_REVISION_V3_AMENDMENT_B_EXTERNAL_IDEMPOTENCY_RETRYABLE_ERRORS.md`).**
+> Amendment B strengthens `deduplicated_by` itself rather than adding
+> a separate guarantee: for a result-bearing external effect, equal
+> evaluated keys identify one logical interaction whose *terminal*
+> result is fixed, and `ResultType.err` gained a declared disposition
+> (`unspecified` | `terminal` | `retryable`). A bound external result
+> is now judged per variant: stable when the effect is
+> `deduplicated_by` over a class-fixed key and the observed variant is
+> terminal (`Ok` by definition, `Err` under `disposition: terminal`);
+> a retryable or unspecified `Err`, an undeduplicated boundary, or an
+> unstable key remains a gap
+> (`ResultGap::{ExternalNotDeduplicated, ExternalDeduplicationUnknown,
+> ExternalDeduplicationKeyUnstable, ExternalErrorRetryable,
+> ExternalErrorDispositionUnspecified}` replaced
+> `ExternalResultUndeclared`). The duplicate-answer boundary of the
+> paragraph above does not conform to the strengthened guarantee
+> unless it abstracts the duplicate response back into the original
+> result.
+
 **Result replay** (`analyzer::verification::result_replay`, replacing
 the response-replay checker): per admitted path that ends at `return`
 for the triggering input, every decision must replay

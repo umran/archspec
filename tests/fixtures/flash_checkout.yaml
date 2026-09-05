@@ -5,10 +5,10 @@
 # The model keeps four deliberate gaps, and the checker reports each:
 # tx.reserve_inventory is not deduplicated and its write depends on a
 # read, so reserve_inventory is neither idempotent nor recoverable;
-# the card charge is explicitly not deduplicated and nothing makes the
-# provider's returned result replay-consistent, so charge_payment's
-# branch on it is not established to replay; and create_order's
-# idempotency is unknown through the cascade those consumers start.
+# the card charge is explicitly not deduplicated, so no same-key
+# terminal result is fixed and charge_payment's branch on it is not
+# established to replay; and create_order's idempotency is unknown
+# through the cascade those consumers start.
 revision: 1
 services:
   service.checkout:
